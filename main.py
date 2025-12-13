@@ -5,6 +5,7 @@ from libcst.display import dump
 import polars as pl
 
 from column_context import Allow, Exclude
+from cst.visitors.get_column_context import GetColumnContext
 
 def main():
     df = pl.DataFrame({
@@ -28,8 +29,23 @@ def main():
 
     func_node = cst.parse_statement(dedent_measure_source)
 
-    print(func_node)
-    print(dump(func_node))
+    # print(func_node)
+    # print(dump(func_node))
+
+    # Create visitor to get the column context and traverse the tree
+    column_context_visitor = GetColumnContext(function_name='revenue_by_item')
+    func_node.visit(column_context_visitor)
+
+    print(f"Function: {column_context_visitor.function_name}")
+    print(f"\nAllow() calls found: {len(column_context_visitor.allow_calls)}")
+    for i, call in enumerate(column_context_visitor.allow_calls, 1):
+        print(f"  {i}. Positional args: {call['positional']}")
+        print(f"     use= keyword args: {call['use']}")
+
+    print(f"\nExclude() calls found: {len(column_context_visitor.exclude_calls)}")
+    for i, call in enumerate(column_context_visitor.exclude_calls, 1):
+        print(f"  {i}. Positional args: {call['positional']}")
+        print(f"     use= keyword args: {call['use']}")
 
 
 if __name__ == "__main__":
