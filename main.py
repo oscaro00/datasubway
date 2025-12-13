@@ -4,6 +4,8 @@ import libcst as cst
 from libcst.display import dump
 import polars as pl
 
+from column_context import Allow, Exclude
+
 def main():
     df = pl.DataFrame({
         'item_id' : [1, 2, 1, 3, 2, 3, 2, 1],
@@ -14,10 +16,11 @@ def main():
     def revenue_by_item():
         return (
             df
-            .group_by('item_id')
+            .group_by(Allow('*', use=['item_id']))
             .agg(
                 pl.col('revenue').sum().alias('total_revenue')
             )
+            .order_by(Exclude('*', use=['item_id']))
         )
     
     measure_source = inspect.getsource(revenue_by_item)
