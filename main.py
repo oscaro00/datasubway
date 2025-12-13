@@ -5,7 +5,7 @@ import libcst as cst
 import polars as pl
 
 from column_context import Allow, Exclude
-from cst.visitors.get_column_context import GetColumnContext
+# from cst.visitors.get_column_context import GetColumnContext
 from cst.transformers.replace_context_with_columns import transform_function
 
 def main():
@@ -19,18 +19,6 @@ def main():
         'groupings' : ['df.store_id'],
         'orderings' : ['df.store_id']
     }
-
-    allow_test = Allow('*', include='df.item_id', context=[query_context['groupings']])
-    print(allow_test.get_columns())
-    print(allow_test.get_include())
-    print(allow_test.get_context())
-    print(allow_test.get_relevant_columns())
-
-    exclude_test = Exclude('*', include=['df.item_id'], context=query_context['orderings'])
-    print(exclude_test.get_columns())
-    print(allow_test.get_include())
-    print(allow_test.get_context())
-    print(exclude_test.get_relevant_columns())
 
     def revenue_by_item():
         return (
