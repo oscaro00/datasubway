@@ -1,11 +1,12 @@
 import inspect
 import textwrap
 import libcst as cst
-from libcst.display import dump
+# from libcst.display import dump
 import polars as pl
 
 from column_context import Allow, Exclude
 from cst.visitors.get_column_context import GetColumnContext
+from cst.transformers.replace_context_with_columns import transform_function
 
 def main():
     df = pl.DataFrame({
@@ -14,14 +15,31 @@ def main():
         'revenue' : [3, 6, 2, 7, 2, 7, 2, 5]
     })
 
+    query_context = {
+        'groupings' : ['df.store_id'],
+        'orderings' : ['df.store_id']
+    }
+
+    allow_test = Allow('*', include='df.item_id', context=[query_context['groupings']])
+    print(allow_test.get_columns())
+    print(allow_test.get_include())
+    print(allow_test.get_context())
+    print(allow_test.get_relevant_columns())
+
+    exclude_test = Exclude('*', include=['df.item_id'], context=query_context['orderings'])
+    print(exclude_test.get_columns())
+    print(allow_test.get_include())
+    print(allow_test.get_context())
+    print(exclude_test.get_relevant_columns())
+
     def revenue_by_item():
         return (
             df
-            .group_by(Allow('*', use=['item_id']))
+            .group_by(Allow('*', include='df.item_id', context=[query_context['groupings']]))
             .agg(
                 pl.col('revenue').sum().alias('total_revenue')
             )
-            .order_by(Exclude('*', use=['item_id']))
+            .sort(Exclude('*', include=['df.item_id'], context=query_context['orderings']))
         )
     
     measure_source = inspect.getsource(revenue_by_item)
@@ -29,23 +47,31 @@ def main():
 
     func_node = cst.parse_statement(dedent_measure_source)
 
+
     # print(func_node)
     # print(dump(func_node))
 
-    # Create visitor to get the column context and traverse the tree
-    column_context_visitor = GetColumnContext(function_name='revenue_by_item')
-    func_node.visit(column_context_visitor)
+    # Test the transformer
+    transformed = transform_function(
+        source_code=dedent_measure_source,
+        function_name='revenue_by_item',
+        runtime_context={'query_context': query_context},
+        use_polars_col=False
+    )
+    print("Transformed code:")
+    print(transformed)
 
-    print(f"Function: {column_context_visitor.function_name}")
-    print(f"\nAllow() calls found: {len(column_context_visitor.allow_calls)}")
-    for i, call in enumerate(column_context_visitor.allow_calls, 1):
-        print(f"  {i}. Positional args: {call['positional']}")
-        print(f"     use= keyword args: {call['use']}")
+    # Create namespace with required variables
+    exec_namespace = {'df': df, 'pl': pl}
 
-    print(f"\nExclude() calls found: {len(column_context_visitor.exclude_calls)}")
-    for i, call in enumerate(column_context_visitor.exclude_calls, 1):
-        print(f"  {i}. Positional args: {call['positional']}")
-        print(f"     use= keyword args: {call['use']}")
+    # Execute the transformed code (defines the function in exec_namespace)
+    exec(transformed, exec_namespace)
+
+    # Call the function
+    result = exec_namespace['revenue_by_item']()
+
+    print("Result:")
+    print(result)
 
 
 if __name__ == "__main__":
