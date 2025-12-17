@@ -21,7 +21,7 @@ Example:
         return df.group_by(['item_id'])
 """
 
-from typing import Dict, Any, Union, Optional
+from typing import Dict, Any, Union, Optional, Literal
 import libcst as cst
 import libcst.matchers as m
 from column_context import Allow, Exclude
@@ -42,7 +42,7 @@ class ReplaceContextWithColumns(cst.CSTTransformer):
         self,
         function_name: str,
         runtime_context: Optional[Dict[str, Any]] = None,
-        use_polars_col: bool = False
+        output_type: Literal['tbl_col', 'col', 'polar_col'] = 'tbl_col'
     ):
         """
         Initialize the transformer.
@@ -50,12 +50,12 @@ class ReplaceContextWithColumns(cst.CSTTransformer):
         Args:
             function_name: Name of the function to transform (other functions unchanged)
             runtime_context: Dict of runtime variables (e.g., {'query_context': {...}})
-            use_polars_col: If True, generate pl.col() calls; if False, string literals
+            output_type: tbl_col for table.column, col for column name, polar_col for pl.col(column)
         """
         super().__init__()
         self.function_name = function_name
         self.runtime_context = runtime_context or {}
-        self.use_polars_col = use_polars_col
+        self.output_type = output_type
         self.current_function: Optional[str] = None
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
@@ -113,10 +113,10 @@ class ReplaceContextWithColumns(cst.CSTTransformer):
             instance = eval(call_code, eval_globals)
 
             # Get resolved columns and create appropriate list
-            if self.use_polars_col:
+            if self.output_type == 'polar_col':
                 return self._create_polars_list(instance)
             else:
-                return self._create_string_list(instance)
+                return self._create_string_list(instance, self.output_type)
 
         except (NameError, KeyError, AttributeError) as e:
             # Missing runtime context variable - leave unchanged
@@ -127,7 +127,7 @@ class ReplaceContextWithColumns(cst.CSTTransformer):
             # Could add logging here for debugging
             return updated_node
 
-    def _create_string_list(self, instance: Union[Allow, Exclude]) -> cst.List:
+    def _create_string_list(self, instance: Union[Allow, Exclude], output_type: Literal['tbl_col', 'col', 'polar_col']) -> cst.List:
         """
         Create a List node with string literals.
 
@@ -139,7 +139,7 @@ class ReplaceContextWithColumns(cst.CSTTransformer):
         Returns:
             CST List node with string elements
         """
-        columns = instance.get_relevant_columns()
+        columns = instance.get_relevant_columns(output_type=output_type)
 
         elements = [
             cst.Element(value=cst.SimpleString(repr(col)))
@@ -164,7 +164,7 @@ class ReplaceContextWithColumns(cst.CSTTransformer):
             This relies on the string representation of polars Expr objects
             which has the format: col("column_name")
         """
-        exprs = instance.get_relevant_columns(polars_col=True)
+        exprs = instance.get_relevant_columns(output_type='polar_col')
 
         elements = []
         for expr in exprs:
@@ -189,7 +189,7 @@ def transform_function(
     source_code: str,
     function_name: str,
     runtime_context: Optional[Dict[str, Any]] = None,
-    use_polars_col: bool = False
+    output_type: Literal['tbl_col', 'col', 'polar_col'] = 'tbl_col'
 ) -> str:
     """
     Transform a function's Allow/Exclude calls to column lists.
@@ -198,7 +198,7 @@ def transform_function(
         source_code: Python source code containing the function
         function_name: Name of function to transform
         runtime_context: Dict of runtime variables accessible to Allow/Exclude
-        use_polars_col: If True, generate pl.col() calls instead of strings
+        output_type: tbl_col for table.column, col for column name, polar_col for pl.col(column)
 
     Returns:
         Transformed source code as string
@@ -224,7 +224,7 @@ def transform_function(
     transformer = ReplaceContextWithColumns(
         function_name=function_name,
         runtime_context=runtime_context,
-        use_polars_col=use_polars_col
+        output_type='tbl_col'
     )
     new_module = module.visit(transformer)
     return new_module.code

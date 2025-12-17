@@ -6,7 +6,7 @@ import polars as pl
 
 from column_context import Allow, Exclude
 # from cst.visitors.get_column_context import GetColumnContext
-from cst.transformers.replace_context_with_columns import transform_function
+from cst.transformers.replace_context_with_table_columns import transform_function
 
 def main():
     df = pl.DataFrame({
@@ -33,8 +33,7 @@ def main():
     measure_source = inspect.getsource(revenue_by_item)
     dedent_measure_source = textwrap.dedent(measure_source)
 
-    func_node = cst.parse_statement(dedent_measure_source)
-
+    # func_node = cst.parse_statement(dedent_measure_source)
 
     # print(func_node)
     # print(dump(func_node))
@@ -44,22 +43,22 @@ def main():
         source_code=dedent_measure_source,
         function_name='revenue_by_item',
         runtime_context={'query_context': query_context},
-        use_polars_col=False
+        output_type='tbl_col'
     )
     print("Transformed code:")
     print(transformed)
 
-    # Create namespace with required variables
-    exec_namespace = {'df': df, 'pl': pl}
+    # # Create namespace with required variables
+    # exec_namespace = {'df': df, 'pl': pl}
 
-    # Execute the transformed code (defines the function in exec_namespace)
-    exec(transformed, exec_namespace)
+    # # Execute the transformed code (defines the function in exec_namespace)
+    # exec(transformed, exec_namespace)
 
-    # Call the function
-    result = exec_namespace['revenue_by_item']()
+    # # Call the function
+    # result = exec_namespace['revenue_by_item']()
 
-    print("Result:")
-    print(result)
+    # print("Result:")
+    # print(result)
 
 
 if __name__ == "__main__":

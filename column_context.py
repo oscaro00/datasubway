@@ -1,4 +1,4 @@
-from typing import Self, Set, List, Dict, Union
+from typing import Self, Set, List, Dict, Union, Literal
 import re
 import polars as pl
 
@@ -58,16 +58,22 @@ class Allow:
     def get_context(self: Self, polars_col: bool = False) -> Union[List[str], List[pl.Expr]]:
         return [pl.col(column) if polars_col else column for column in self.context_columns]
     
-    def get_relevant_columns(self: Self, polars_col: bool = False) -> Union[List[str], List[pl.Expr]]:
-        relevant_columns = [col for _, col in self.include_columns]
+    def get_relevant_columns(self: Self, output_type: Literal['tbl_col', 'col', 'polar_col'] = 'tbl_col') -> Union[List[str], List[pl.Expr]]:
+        relevant_columns = self.include_columns
 
         for tbl_col in self.context_columns:
             tbl, col = tbl_col
             
-            if {('*', ''), (tbl, '*'), tbl_col}.intersection(self.table_columns):
-                relevant_columns.append(col)
+            if not {('*', ''), (tbl, '*'), (tbl, col)}.intersection(self.table_columns):
+                relevant_columns.append((tbl, col))
         
-        return [pl.col(column) if polars_col else column for column in relevant_columns]
+        match output_type:
+            case 'tbl_col':
+                return [f'{tbl}.{col}' for tbl, col in relevant_columns]
+            case 'col':
+                return [col for col in relevant_columns]
+            case 'polar_col':
+                return [pl.col(col) for col in relevant_columns]
 
 
 class Exclude:
@@ -100,16 +106,22 @@ class Exclude:
     def get_context(self: Self, polars_col: bool = False) -> Union[List[str], List[pl.Expr]]:
         return [pl.col(column) if polars_col else column for column in self.context_columns]
 
-    def get_relevant_columns(self: Self, polars_col: bool = False) -> Union[List[str], List[pl.Expr]]:
-        relevant_columns = [col for _, col in self.include_columns]
+    def get_relevant_columns(self: Self, output_type: Literal['tbl_col', 'col', 'polar_col'] = 'tbl_col') -> Union[List[str], List[pl.Expr]]:
+        relevant_columns = self.include_columns
 
         for tbl_col in self.context_columns:
             tbl, col = tbl_col
             
             if not {('*', ''), (tbl, '*'), (tbl, col)}.intersection(self.table_columns):
-                relevant_columns.append(col)
+                relevant_columns.append((tbl, col))
         
-        return [pl.col(column) if polars_col else column for column in relevant_columns]
+        match output_type:
+            case 'tbl_col':
+                return [f'{tbl}.{col}' for tbl, col in relevant_columns]
+            case 'col':
+                return [col for col in relevant_columns]
+            case 'polar_col':
+                return [pl.col(col) for col in relevant_columns]
 
 
 
