@@ -6,7 +6,7 @@ import polars as pl
 
 from column_context import Allow, Exclude
 # from cst.visitors.get_column_context import GetColumnContext
-from cst.transformers.replace_context_with_table_columns import transform_function
+from cst.transformers.replace_context_with_table_columns import resolve_table_columns
 
 def main():
     df = pl.DataFrame({
@@ -16,18 +16,38 @@ def main():
     })
 
     query_context = {
-        'groupings' : ['df.store_id'],
-        'orderings' : ['df.store_id']
+        'group' : ['df.store_id'],
+        'sort' : [('df.store_id', 'asc')]
     }
 
     def revenue_by_item():
         return (
             df
-            .group_by(Allow('*', include='df.item_id', context=[query_context['groupings']]))
+            .group_by(Allow('*', include='df.item_id', context=[query_context['group']]))
             .agg(
-                pl.col('revenue').sum().alias('total_revenue')
+                pl.col('df.revenue').sum().alias('total_revenue')
             )
-            .sort(Exclude('*', include=['df.item_id'], context=query_context['orderings']))
+            .sort(Exclude('*', include=['df.item_id'], context=query_context['sort']))
+        )
+    
+    query_context2 = {
+        'filter' : {
+            'AND': [
+                ('df.item_id', '=', 3),
+                ('df.store_id', 'IN', [1, 2, 3])
+            ]
+        },
+        'sort' : [('df.store_id', 'desc')]
+    }
+    
+    def revenue_from_expensive_items():
+        return (
+            df
+            .filter(Allow('*', include=(pl.col('df.revenue') >= 5), context=query_context2['filter']))
+            .group_by(Allow('*', context=query_context['group']))
+            .agg(
+                pl.col('df.revenue').sum().alias('total_revenue')
+            )
         )
     
     measure_source = inspect.getsource(revenue_by_item)
@@ -39,7 +59,7 @@ def main():
     # print(dump(func_node))
 
     # Test the transformer
-    transformed = transform_function(
+    transformed = resolve_table_columns(
         source_code=dedent_measure_source,
         function_name='revenue_by_item',
         runtime_context={'query_context': query_context},

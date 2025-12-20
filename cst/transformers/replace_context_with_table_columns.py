@@ -27,7 +27,7 @@ import libcst.matchers as m
 from column_context import Allow, Exclude
 
 
-class ReplaceContextWithColumns(cst.CSTTransformer):
+class ReplaceContextWithTableColumns(cst.CSTTransformer):
     """
     Transforms Allow() and Exclude() calls into resolved column lists.
 
@@ -185,7 +185,7 @@ class ReplaceContextWithColumns(cst.CSTTransformer):
         return cst.List(elements=elements)
 
 
-def transform_function(
+def resolve_table_columns(
     source_code: str,
     function_name: str,
     runtime_context: Optional[Dict[str, Any]] = None,
@@ -221,7 +221,7 @@ def transform_function(
             return df.group_by(['item_id', 'store_id'])
     """
     module = cst.parse_module(source_code)
-    transformer = ReplaceContextWithColumns(
+    transformer = ReplaceContextWithTableColumns(
         function_name=function_name,
         runtime_context=runtime_context,
         output_type='tbl_col'
