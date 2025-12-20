@@ -17,7 +17,7 @@ def main():
 
     query_context = {
         'group' : ['df.store_id'],
-        'sort' : [('df.store_id', 'asc')]
+        'sort' : [('df.store_id', 'desc')]
     }
 
     def revenue_by_item():
@@ -27,9 +27,22 @@ def main():
             .agg(
                 pl.col('df.revenue').sum().alias('total_revenue')
             )
-            .sort(Exclude('*', include=['df.item_id'], context=query_context['sort']))
+            .sort(Exclude('*', include=['df.item_id'], context=query_context['sort']), descending=[False])
         )
     
+    measure_source = inspect.getsource(revenue_by_item)
+    dedent_measure_source = textwrap.dedent(measure_source)
+
+    # Test the transformer
+    transformed = resolve_table_columns(
+        source_code=dedent_measure_source,
+        function_name='revenue_by_item',
+        runtime_context={'query_context': query_context},
+        output_type='polar_col'
+    )
+    print("Transformed code:")
+    print(transformed)
+
     query_context2 = {
         'filter' : {
             'AND': [
@@ -37,6 +50,7 @@ def main():
                 ('df.store_id', 'IN', [1, 2, 3])
             ]
         },
+        'group' : ['df.store_id'],
         'sort' : [('df.store_id', 'desc')]
     }
     
@@ -44,29 +58,66 @@ def main():
         return (
             df
             .filter(Allow('*', include=(pl.col('df.revenue') >= 5), context=query_context2['filter']))
-            .group_by(Allow('*', context=query_context['group']))
+            .group_by(Allow('*', context=query_context2['group']))
             .agg(
                 pl.col('df.revenue').sum().alias('total_revenue')
             )
+            .sort(Allow('*', context=query_context2['sort']))
         )
     
-    measure_source = inspect.getsource(revenue_by_item)
+    measure_source = inspect.getsource(revenue_from_expensive_items)
     dedent_measure_source = textwrap.dedent(measure_source)
+
+    # Test the transformer
+    transformed = resolve_table_columns(
+        source_code=dedent_measure_source,
+        function_name='revenue_from_expensive_items',
+        runtime_context={'query_context2': query_context2},
+        output_type='polar_col'
+    )
+    print("Transformed code:")
+    print(transformed)
+
+
+    query_context3 = {
+        'filter' : {
+            'AND': [
+                ('df.item_id', '=', 3),
+                ('df.store_id', 'IN', [1, 2, 3])
+            ]
+        },
+        'group' : ['df.store_id']
+    }
+
+    def revenue_no_filter():
+        return {
+            df
+            .filter(Exclude('*', context=query_context3['filter']))
+            .group_by(Allow('*', context=query_context3['group']))
+            .agg(
+                pl.col('df.revenue').sum().alias('total_revenue')
+            )
+        }
+    
+    measure_source = inspect.getsource(revenue_no_filter)
+    dedent_measure_source = textwrap.dedent(measure_source)
+
+    # Test the transformer
+    transformed = resolve_table_columns(
+        source_code=dedent_measure_source,
+        function_name='revenue_no_filter',
+        runtime_context={'query_context3': query_context3},
+        output_type='polar_col'
+    )
+    print("Transformed code:")
+    print(transformed)
 
     # func_node = cst.parse_statement(dedent_measure_source)
 
     # print(func_node)
     # print(dump(func_node))
 
-    # Test the transformer
-    transformed = resolve_table_columns(
-        source_code=dedent_measure_source,
-        function_name='revenue_by_item',
-        runtime_context={'query_context': query_context},
-        output_type='tbl_col'
-    )
-    print("Transformed code:")
-    print(transformed)
+    
 
     # # Create namespace with required variables
     # exec_namespace = {'df': df, 'pl': pl}
