@@ -3,10 +3,6 @@ from pathlib import Path
 import polars as pl
 
 
-# TODO create a measure decorator to add measure to a specific data model
-# The measure decorator should eventually be where the measure validation occurs (must end with group_by() and agg())
-
-
 class DataModel:
 
     def __init__(self: Self, tables: Dict[str, pl.LazyFrame], joins: List[Dict[str, Any]], pre_aggregations: Dict[str, Any], pre_agg_directory: Optional[Path]) -> Self:
