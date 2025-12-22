@@ -1,6 +1,7 @@
 from typing import Self, Dict, List, Any, Optional, Union, Literal
 from pathlib import Path
 import polars as pl
+import libcst as cst
 
 
 class DataModel:
@@ -468,17 +469,309 @@ class DataModel:
                 return [pl.col(col_name).unique().alias(f'{output_col_name}-unique-set')]
 
             case _:
-                raise ValueError(f"Unsupported aggregation function: {agg_func}") 
+                raise ValueError(f"Unsupported aggregation function: {agg_func}")
 
-    def table(self: Self, original_table: str, needed_columns: List[str], allow_pre_aggs: bool = True):
+    def _build_pre_agg_cst(self: Self, pre_agg_name: str) -> cst.BaseExpression:
         """
-        This method should be inserted into measures using libcst in place of LazyFrames at the beginning of polars method chains.
-        The method will return an object cst based on the cases below
+        Build CST node for: pl.scan_parquet(self.pre_agg_directory / 'pre_agg_name.parquet')
 
-        If allow_pre_aggs is true, then search for the smallest pre_aggregation that has the necessary columns.
-        This process will involve using libcst to update aggregations to work with pre aggregated columns.
-
-        If a pre aggregation does not exist or allow_pre_aggs is false, then return a lazy frame.
-        This lazy frame may potentially need other tables to be joined on
+        This format allows later transformers to detect pre-agg usage by checking
+        if the code contains self.pre_agg_directory.
         """
-        pass
+        return cst.Call(
+            func=cst.Attribute(
+                value=cst.Name("pl"),
+                attr=cst.Name("scan_parquet")
+            ),
+            args=[
+                cst.Arg(
+                    value=cst.BinaryOperation(
+                        left=cst.Attribute(
+                            value=cst.Name("self"),
+                            attr=cst.Name("pre_agg_directory")
+                        ),
+                        operator=cst.Divide(),  # / operator
+                        right=cst.SimpleString(f"'{pre_agg_name}.parquet'")
+                    )
+                )
+            ]
+        )
+
+    def _build_table_access_cst(self: Self, table_name: str) -> cst.BaseExpression:
+        """
+        Build CST node for: self.tables['table_name']
+        """
+        return cst.Subscript(
+            value=cst.Attribute(
+                value=cst.Name("self"),
+                attr=cst.Name("tables")
+            ),
+            slice=[
+                cst.SubscriptElement(
+                    slice=cst.Index(
+                        value=cst.SimpleString(f"'{table_name}'")
+                    )
+                )
+            ]
+        )
+
+    def _build_join_chain_cst(
+        self: Self,
+        base_table: str,
+        join_specs: List[Dict]
+    ) -> cst.BaseExpression:
+        """
+        Build CST node for inline join chain:
+        self.tables['base'].join(self.tables['t2'], left_on=['col1'], right_on=['col2'], how='inner')
+
+        Args:
+            base_table: Starting table name
+            join_specs: List of join specifications from join_lookup
+
+        Returns:
+            CST node representing the chained join expression
+        """
+        # Start with base table access
+        result = self._build_table_access_cst(base_table)
+
+        # Chain each join
+        for join_spec in join_specs:
+            right_table = join_spec['right']
+            left_on = join_spec['left_on']
+            right_on = join_spec['right_on']
+            how = join_spec['how']
+
+            # Build join call
+            result = cst.Call(
+                func=cst.Attribute(
+                    value=result,
+                    attr=cst.Name("join")
+                ),
+                args=[
+                    # First arg: self.tables['right_table']
+                    cst.Arg(value=self._build_table_access_cst(right_table)),
+                    # left_on keyword arg
+                    cst.Arg(
+                        keyword=cst.Name("left_on"),
+                        value=cst.List([
+                            cst.Element(value=cst.SimpleString(f"'{col}'"))
+                            for col in left_on
+                        ])
+                    ),
+                    # right_on keyword arg
+                    cst.Arg(
+                        keyword=cst.Name("right_on"),
+                        value=cst.List([
+                            cst.Element(value=cst.SimpleString(f"'{col}'"))
+                            for col in right_on
+                        ])
+                    ),
+                    # how keyword arg
+                    cst.Arg(
+                        keyword=cst.Name("how"),
+                        value=cst.SimpleString(f"'{how}'")
+                    )
+                ]
+            )
+
+        return result
+
+    def _normalize_column_name(self: Self, col: str, table: str) -> str:
+        """Add table prefix to column if not present."""
+        if '.' in col:
+            return col
+        return f"{table}.{col}"
+
+    def _columns_match(self: Self, col1: str, col2: str) -> bool:
+        """Check if two columns refer to same column (ignoring table prefix)."""
+        clean1 = col1.split('.')[-1]
+        clean2 = col2.split('.')[-1]
+        return clean1 == clean2
+
+    def _find_matching_pre_agg(
+        self: Self,
+        group_by_cols: List[str],
+        agg_cols: Dict[str, str],
+        original_table: str
+    ) -> Optional[Dict]:
+        """
+        Find the smallest pre-agg that satisfies measure requirements.
+
+        Matching criteria (ALL must be true):
+        1. Pre-agg group_by must equal or be superset of measure group_by
+        2. Pre-agg must contain all required aggregation columns
+        3. Pre-agg aggregation functions must exactly match
+
+        Returns:
+            Pre-agg metadata dict or None
+        """
+        for pre_agg in self.pre_agg_metadata:  # Already sorted by row_count
+            # Check 1: Pre-agg group_by must be superset (comparing without table prefixes)
+            # All measure group_by columns must have a match in pre-agg group_by
+            all_group_by_match = True
+            for measure_col in group_by_cols:
+                found_match = False
+                for pre_col in pre_agg['group_by']:
+                    if self._columns_match(measure_col, pre_col):
+                        found_match = True
+                        break
+                if not found_match:
+                    all_group_by_match = False
+                    break
+
+            if not all_group_by_match:
+                continue
+
+            # Check 2 & 3: Aggregation columns and functions must match
+            pre_agg_aggs = pre_agg['aggregations']
+            all_match = True
+
+            for col, agg_func in agg_cols.items():
+                # Find matching column in pre-agg
+                found_match = False
+                for pre_col, pre_func in pre_agg_aggs.items():
+                    if self._columns_match(col, pre_col):
+                        if pre_func == agg_func:
+                            found_match = True
+                            break
+
+                if not found_match:
+                    all_match = False
+                    break
+
+            if not all_match:
+                continue
+
+            # All checks passed!
+            return pre_agg
+
+        return None
+
+    def _get_join_specs_for_columns(
+        self: Self,
+        columns: List[str],
+        base_table: str
+    ) -> List[Dict]:
+        """
+        Determine join specs needed for given columns.
+
+        Similar to _resolve_tables_for_pre_agg but returns join specs instead
+        of executing joins. More lenient:
+        - Columns without table prefix assumed to be from base_table
+        - Only joins tables that are explicitly referenced
+
+        Args:
+            columns: List of columns (may include table prefixes)
+            base_table: Primary table to start from
+
+        Returns:
+            List of join specifications to build join chain, or empty list if single table
+
+        Raises:
+            ValueError: If joins don't exist or tables not found
+        """
+        # Extract unique table names
+        tables_needed = {base_table}
+
+        for col in columns:
+            if '.' in col:
+                table_name = col.split('.')[0]
+                if table_name in self.tables:
+                    tables_needed.add(table_name)
+                else:
+                    raise ValueError(f"Column '{col}' references unknown table '{table_name}'")
+
+        # Single table - no joins needed
+        if len(tables_needed) == 1:
+            return []
+
+        # Multiple tables - collect all join specs
+        all_join_specs = []
+        remaining_tables = tables_needed - {base_table}
+
+        for target_table in remaining_tables:
+            if base_table not in self.join_lookup:
+                raise ValueError(f"No joins defined from '{base_table}'")
+
+            if target_table not in self.join_lookup[base_table]:
+                raise ValueError(
+                    f"No join path from '{base_table}' to '{target_table}'. "
+                    f"Available: {list(self.join_lookup[base_table].keys())}"
+                )
+
+            join_info = self.join_lookup[base_table][target_table]
+            all_join_specs.extend(join_info['join_specs'])
+
+        return all_join_specs
+
+    def table(
+        self: Self,
+        original_table: str,
+        group_by_cols: List[str],
+        agg_cols: Dict[str, str],
+        allow_pre_aggs: bool = True
+    ) -> cst.BaseExpression:
+        """
+        Return CST node representing LazyFrame source code for use in measures.
+
+        This method is called by libcst transformers to replace dm.table() calls
+        with the actual LazyFrame source code. Routes to pre-aggregated tables
+        when available, otherwise builds source code for tables with joins.
+
+        Args:
+            original_table: Primary table name (e.g., 'sales')
+            group_by_cols: Columns used in .group_by() (with/without prefix)
+            agg_cols: Dict mapping column -> agg function
+                      e.g., {'revenue': 'sum', 'quantity': 'mean'}
+            allow_pre_aggs: Whether to search for pre-aggregations
+
+        Returns:
+            libcst.BaseExpression node representing one of:
+            - pl.scan_parquet(self.pre_agg_directory / 'pre_agg_name.parquet')
+            - self.tables['sales'].join(self.tables['products'], ...)
+            - self.tables['sales']
+
+        Raises:
+            KeyError: If original_table doesn't exist
+            ValueError: If columns invalid or joins don't exist
+        """
+        # Validate inputs
+        if original_table not in self.tables:
+            raise KeyError(
+                f"Table '{original_table}' not found. "
+                f"Available: {list(self.tables.keys())}"
+            )
+
+        if not agg_cols:
+            raise ValueError("agg_cols cannot be empty")
+
+        # Try pre-aggregation if allowed
+        if allow_pre_aggs and self.pre_agg_metadata:
+            matching_pre_agg = self._find_matching_pre_agg(
+                group_by_cols, agg_cols, original_table
+            )
+
+            if matching_pre_agg:
+                pre_agg_path = Path(matching_pre_agg['path'])
+
+                # Verify file exists
+                if not pre_agg_path.exists():
+                    import warnings
+                    warnings.warn(
+                        f"Pre-agg file not found: {pre_agg_path}. "
+                        f"Falling back to source tables."
+                    )
+                else:
+                    # Return CST for pre-agg scan
+                    return self._build_pre_agg_cst(matching_pre_agg['name'])
+
+        # Fallback: Build CST for tables with joins
+        all_columns = group_by_cols + list(agg_cols.keys())
+        join_specs = self._get_join_specs_for_columns(all_columns, original_table)
+
+        if not join_specs:
+            # Single table - no joins needed
+            return self._build_table_access_cst(original_table)
+        else:
+            # Multiple tables - build join chain
+            return self._build_join_chain_cst(original_table, join_specs)
