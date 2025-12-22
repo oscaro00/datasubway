@@ -1,4 +1,4 @@
-from typing import Self, Dict, List
+from typing import Self, Dict, List, Any, Optional
 from pathlib import Path
 import polars as pl
 
@@ -9,7 +9,7 @@ import polars as pl
 
 class DataModel:
 
-    def __init__(self: Self, tables: Dict[pl.LazyFrame], joins: Dict, pre_aggregations: Dict, pre_agg_directory: Path) -> Self:
+    def __init__(self: Self, tables: Dict[str, pl.LazyFrame], joins: List[Dict[str, Any]], pre_aggregations: Dict[str, Any], pre_agg_directory: Optional[Path]) -> Self:
         """
         Expected join format:
         [
@@ -63,7 +63,7 @@ class DataModel:
             if not isinstance(val, pl.LazyFrame):
                 raise TypeError('Table values must be lazy frame objects')
 
-    def _build_graph_from_joins(self: Self) -> Dict:
+    def _build_graph_from_joins(self: Self) -> Dict[str, List[Dict[str, Any]]]:
         """Convert join list to directed adjacency list representation.
 
         Returns:
@@ -102,33 +102,49 @@ class DataModel:
 
         return graph
 
-    def _detect_cycles(self: Self, graph: Dict) -> None:
+    def _detect_cycles(self: Self, graph: Dict[str, List[Dict[str, Any]]]) -> None:
         """Detect cycles in the directed graph using DFS with color marking.
+
+        Note: Bidirectional edges (A <-> B) are allowed and not considered cycles.
+        Only cycles involving 3 or more nodes are detected.
 
         Args:
             graph: Adjacency list representation of join graph
 
         Raises:
-            ValueError: If a cycle is detected in the join graph
+            ValueError: If a cycle (3+ nodes) is detected in the join graph
         """
         # Color states: WHITE (0) = unvisited, GRAY (1) = in progress, BLACK (2) = done
         WHITE, GRAY, BLACK = 0, 1, 2
         color = {node: WHITE for node in graph.keys()}
 
-        def dfs(node: str, path: List[str]) -> None:
-            """Recursive DFS to detect cycles."""
+        def dfs(node: str, path: List[str], parent: Optional[str] = None) -> None:
+            """Recursive DFS to detect cycles.
+
+            Args:
+                node: Current node being visited
+                path: Current path from root
+                parent: Parent node in DFS tree (to allow bidirectional edges)
+            """
             color[node] = GRAY
             path.append(node)
 
             for edge in graph[node]:
                 neighbor = edge['target']
                 if color[neighbor] == GRAY:
-                    # Found a back edge - cycle detected
+                    # Found a back edge
+                    # Allow ONLY bidirectional edges (2-node cycles: A -> B -> A)
+                    # Detect self-loops (A -> A) and longer cycles (A -> B -> C -> A)
                     cycle_start = path.index(neighbor)
-                    cycle_path = path[cycle_start:] + [neighbor]
-                    raise ValueError(f"Cycle detected in join graph: {' -> '.join(cycle_path)}")
+                    cycle_length = len(path) - cycle_start
+
+                    if cycle_length != 2:  # Allow only 2-node cycles (bidirectional edges)
+                        cycle_path = path[cycle_start:] + [neighbor]
+                        raise ValueError(f"Cycle detected in join graph: {' -> '.join(cycle_path)}")
+                    # else: it's a 2-node cycle (bidirectional edge), which is allowed
+
                 elif color[neighbor] == WHITE:
-                    dfs(neighbor, path)
+                    dfs(neighbor, path, node)
 
             path.pop()
             color[node] = BLACK
@@ -136,9 +152,9 @@ class DataModel:
         # Run DFS from each unvisited node (handles disconnected components)
         for node in graph.keys():
             if color[node] == WHITE:
-                dfs(node, [])
+                dfs(node, [], None)
 
-    def _find_all_paths_bfs(self: Self, graph: Dict, source: str) -> Dict:
+    def _find_all_paths_bfs(self: Self, graph: Dict[str, List[Dict[str, Any]]], source: str) -> Dict[str, Dict[str, Any]]:
         """Find all reachable tables from source using BFS.
 
         Args:
