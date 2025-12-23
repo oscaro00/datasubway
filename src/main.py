@@ -75,23 +75,134 @@ def main():
     def total_revenue(qc):
         return (
             data_model.tables['sales']
-            .filter(Allow('*'), context=qc['filter'])
+            .filter(Allow('*', context=qc['filter']))
             .group_by(Allow('*', context=qc['group']))
             .agg(
                 pl.col('sales.revenue').sum().alias('total_revenue')
             )
         )
-    
+
     @measure(data_model)
     def average_revenue(qc):
         return (
             data_model.tables['sales']
-            .filter(Allow('*'), context=qc['filter'])
+            .filter(Allow('*', context=qc['filter']))
             .group_by(Allow('*', context=qc['group']))
             .agg(
                 pl.col('sales.revenue').mean().alias('average_revenue')
             )
         )
+
+    # ===================================================================
+    # Demonstration: Measure Source Code Transformations
+    # ===================================================================
+
+    print("\n" + "="*70)
+    print("=== Demonstration: Measure Source Code Transformations ===")
+    print("="*70 + "\n")
+
+    # Define example query contexts
+    query_contexts = [
+        {
+            'name': 'Simple grouping by product',
+            'context': {
+                'group': ['products.product_name'],
+                'filter': None
+            }
+        },
+        {
+            'name': 'Simple grouping by geography',
+            'context': {
+                'group': ['geography.geography_name'],
+                'filter': None
+            }
+        },
+        {
+            'name': 'Multi-dimensional grouping (product + geography)',
+            'context': {
+                'group': ['products.product_name', 'geography.geography_name'],
+                'filter': None
+            }
+        },
+        {
+            'name': 'Filter only (revenue > 50)',
+            'context': {
+                'group': [],
+                'filter': ('sales.revenue', '>', 50)
+            }
+        },
+        {
+            'name': 'Complex filter with OR logic',
+            'context': {
+                'group': [],
+                'filter': {
+                    'OR': [
+                        ('sales.revenue', '>', 70),
+                        ('sales.store_id', '=', 1)
+                    ]
+                }
+            }
+        },
+        {
+            'name': 'Combined: group by product + filter high revenue',
+            'context': {
+                'group': ['products.product_name'],
+                'filter': {
+                    'AND': [
+                        ('sales.revenue', '>', 50),
+                        ('sales.revenue', '<=', 80)
+                    ]
+                }
+            }
+        },
+        {
+            'name': 'Empty context (no grouping or filtering)',
+            'context': {
+                'group': [],
+                'filter': None
+            }
+        }
+    ]
+
+    # Extract source code for both measures
+    total_revenue_source = textwrap.dedent(inspect.getsource(total_revenue))
+    average_revenue_source = textwrap.dedent(inspect.getsource(average_revenue))
+
+    measures = [
+        ('total_revenue', total_revenue_source),
+        ('average_revenue', average_revenue_source)
+    ]
+
+    # Transform and display each combination
+    for qc_info in query_contexts:
+        qc_name = qc_info['name']
+        qc = qc_info['context']
+
+        print(f"\n{'─'*70}")
+        print(f"Query Context: {qc_name}")
+        print(f"{'─'*70}")
+        print(f"Group by: {qc['group'] if qc['group'] else 'None'}")
+        print(f"Filter:   {qc['filter'] if qc['filter'] else 'None'}")
+        print()
+
+        for measure_name, measure_source in measures:
+            print(f"\n📊 Measure: {measure_name}")
+            print("─" * 70)
+
+            # Transform the source code
+            transformed = resolve_table_columns(
+                source_code=measure_source,
+                function_name=measure_name,
+                runtime_context={'qc': qc},
+                output_type='polar_col'
+            )
+
+            print(transformed)
+            print()
+
+    print("\n" + "="*70)
+    print("=== End of Demonstration ===")
+    print("="*70 + "\n")
 
     # func_node = cst.parse_statement(dedent_measure_source)
 

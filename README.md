@@ -42,3 +42,12 @@ The purpose of this library is to define a data model using python focusing on t
 - Pre aggregations need a smarter way of handling filters
     - Either the filters of the pre agg need to match the measure or the relevant columns exist to do filtering
 - Pre aggregations need to store more information for operations like means -> sum of values and count to make subsequent calculations correct
+
+
+
+## TO DO
+
+- Add allow_pre_aggs to query context and use that when putting table() calls in measures
+- Add libcst transformers to remove empty polars methods and convert agg() to select() when group_by() is empty
+- Add libcst transformers to get accurate calculations if the table source is a pre aggregation
+- Add execution context for logging and to execute and get results (probably add query() method that accepts query context and gets explain, query source, or the resulting data)
