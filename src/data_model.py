@@ -3,6 +3,10 @@ from pathlib import Path
 import polars as pl
 import libcst as cst
 
+# Type aliases for aggregation functions
+AggFuncLiteral = Literal['sum', 'mean', 'min', 'max', 'count', 'len', 'null_count', 'first', 'last', 'n_unique', 'std', 'var']
+AggFuncType = Union[AggFuncLiteral, List[AggFuncLiteral]]
+
 
 class DataModel:
 
@@ -24,12 +28,17 @@ class DataModel:
             'pre_agg1_name' : {
                 'group_by' : ['tbl1.col10', 'col11'],
                 'aggregations' : {
-                    'tbl1.col1' : 'sum',
-                    'tbl1.col2' : 'max',
-                    'tbl2.col3' : 'min'
+                    'tbl1.col1' : 'sum',           # Single function
+                    'tbl1.col2' : ['max', 'min'],  # Multiple functions
+                    'tbl2.col3' : 'mean'
                 }
             }
         }
+
+        Note: Aggregation values can be either:
+        - A single function string (e.g., 'sum', 'max', 'mean')
+        - A list of function strings (e.g., ['sum', 'max', 'mean'])
+        Both formats are supported and will be normalized internally.
 
         Expected data in pre_agg_metadata:
         - name, file path, last modified timestamp, group by columns, aggregated columns with type of aggregation, row count (sort key)
@@ -189,6 +198,11 @@ class DataModel:
             for edge in graph[current]:
                 neighbor = edge['target']
 
+                # Check if neighbor is in current path (would create cycle)
+                # Skip cycles to avoid false "multiple paths" errors
+                if neighbor in path:
+                    continue
+
                 if neighbor in visited:
                     # Check if this creates a multiple path situation
                     if neighbor in result:
@@ -290,17 +304,24 @@ class DataModel:
 
             # Extract configuration
             group_by_cols = pre_agg_config['group_by']
-            aggregations = pre_agg_config['aggregations']  # {'col': 'agg_func', ...}
+            aggregations = pre_agg_config['aggregations']  # {'col': 'func' or ['func1', 'func2'], ...}
+            normalized_aggs = self._normalize_aggregations(aggregations)
 
             # Build list of all expressions using _get_pre_agg_calculation
             all_exprs = []
-            for col_name, agg_func in aggregations.items():
-                exprs = self._get_pre_agg_calculation(col_name, agg_func)
-                all_exprs.extend(exprs)
+            for col_name, agg_funcs in normalized_aggs.items():
+                if not agg_funcs:
+                    raise ValueError(
+                        f"Pre-aggregation '{pre_agg_name}' has empty aggregation list for column '{col_name}'. "
+                        f"Provide at least one aggregation function."
+                    )
+                for agg_func in agg_funcs:
+                    exprs = self._get_pre_agg_calculation(col_name, agg_func)
+                    all_exprs.extend(exprs)
 
             # Determine which tables are needed and build base LazyFrame
             # Pass aggregation columns first (to use first agg column's table as base)
-            agg_columns = list(aggregations.keys())
+            agg_columns = list(normalized_aggs.keys())
             all_columns = agg_columns + group_by_cols
             base_lf = self._resolve_tables_for_pre_agg(all_columns, base_table_hint=agg_columns[0])
 
@@ -320,7 +341,7 @@ class DataModel:
                 'path': str(output_path),
                 'last_modified': datetime.now(),
                 'group_by': group_by_cols,
-                'aggregations': aggregations,
+                'aggregations': normalized_aggs,
                 'row_count': row_count
             })
 
@@ -588,6 +609,34 @@ class DataModel:
         clean2 = col2.split('.')[-1]
         return clean1 == clean2
 
+    def _normalize_aggregations(
+        self: Self,
+        aggregations: Dict[str, AggFuncType]
+    ) -> Dict[str, List[AggFuncLiteral]]:
+        """Normalize aggregations dict to always use lists.
+
+        Converts both formats to a consistent internal representation:
+        - 'col': 'sum' -> 'col': ['sum']
+        - 'col': ['sum', 'max'] -> 'col': ['sum', 'max']
+
+        Args:
+            aggregations: Dict mapping column names to agg functions (string or list)
+
+        Returns:
+            Dict mapping column names to lists of agg functions
+
+        Example:
+            >>> self._normalize_aggregations({'revenue': 'sum', 'price': ['min', 'max']})
+            {'revenue': ['sum'], 'price': ['min', 'max']}
+        """
+        normalized = {}
+        for col_name, agg_func in aggregations.items():
+            if isinstance(agg_func, list):
+                normalized[col_name] = agg_func
+            else:
+                normalized[col_name] = [agg_func]
+        return normalized
+
     def _find_matching_pre_agg(
         self: Self,
         group_by_cols: List[str],
@@ -623,15 +672,16 @@ class DataModel:
                 continue
 
             # Check 2 & 3: Aggregation columns and functions must match
-            pre_agg_aggs = pre_agg['aggregations']
+            pre_agg_aggs = pre_agg['aggregations']  # Now always Dict[str, List[str]]
             all_match = True
 
             for col, agg_func in agg_cols.items():
                 # Find matching column in pre-agg
                 found_match = False
-                for pre_col, pre_func in pre_agg_aggs.items():
+                for pre_col, pre_funcs in pre_agg_aggs.items():
                     if self._columns_match(col, pre_col):
-                        if pre_func == agg_func:
+                        # pre_funcs is now always a list, check if query's function is in it
+                        if agg_func in pre_funcs:
                             found_match = True
                             break
 

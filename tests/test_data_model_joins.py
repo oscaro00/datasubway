@@ -270,6 +270,56 @@ class TestDataModelJoins:
                 pre_agg_directory=None
             )
 
+    def test_bidirectional_cycle_not_multiple_paths(self):
+        """Test that paths differing only by bidirectional cycles are not flagged as multiple paths.
+
+        This reproduces the main.py scenario where:
+        - sales -> stores (direct)
+        - sales -> stores -> geography (transitive)
+        - stores <-> geography (bidirectional, creates potential cycle)
+
+        The path sales -> stores -> geography -> stores should be skipped,
+        not treated as a second path to stores.
+        """
+        tables = {
+            'sales': pl.LazyFrame({'sale_id': [1], 'store_id': [1], 'product_id': [1]}),
+            'stores': pl.LazyFrame({'store_id': [1], 'geography_id': [1]}),
+            'geography': pl.LazyFrame({'geography_id': [1], 'name': ['East']}),
+            'products': pl.LazyFrame({'product_id': [1], 'name': ['Widget']})
+        }
+
+        joins = [
+            {
+                'left': 'sales', 'right': 'products',
+                'left_on': ['product_id'], 'right_on': ['product_id'],
+                'how': 'inner', 'direction': 'both'
+            },
+            {
+                'left': 'sales', 'right': 'stores',
+                'left_on': ['store_id'], 'right_on': ['store_id'],
+                'how': 'left', 'direction': 'right2left'
+            },
+            {
+                'left': 'stores', 'right': 'geography',
+                'left_on': ['geography_id'], 'right_on': ['geography_id'],
+                'how': 'inner', 'direction': 'both'
+            }
+        ]
+
+        # Should NOT raise error (previously raised "Multiple paths from sales to stores")
+        dm = DataModel(tables=tables, joins=joins, pre_aggregations={}, pre_agg_directory=None)
+
+        # Verify paths exist
+        assert 'sales' in dm.join_lookup
+        assert 'stores' in dm.join_lookup['sales']
+        assert 'geography' in dm.join_lookup['sales']
+
+        # Path to stores should be direct (not through geography cycle)
+        assert dm.join_lookup['sales']['stores']['path'] == ['sales', 'stores']
+
+        # Path to geography should be through stores
+        assert dm.join_lookup['sales']['geography']['path'] == ['sales', 'stores', 'geography']
+
     def test_direction_right2left_only(self, simple_tables):
         """Test that right2left direction only allows one-way traversal."""
         joins = [
