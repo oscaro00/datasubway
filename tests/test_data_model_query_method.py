@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 from data_model import DataModel
 from decorators import measure
-from column_context import Allow, Exclude
+from column_context import Allow
 
 
 class TestDataModelQueryMethod:
@@ -50,7 +50,7 @@ class TestDataModelQueryMethod:
         @measure(dm)
         def total_revenue(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
             )
@@ -58,7 +58,7 @@ class TestDataModelQueryMethod:
         @measure(dm)
         def total_quantity(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('quantity').sum())
             )
@@ -66,7 +66,7 @@ class TestDataModelQueryMethod:
         @measure(dm)
         def item_count(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.len().alias('count'))
             )
@@ -284,7 +284,7 @@ class TestDataModelQueryMethod:
         @measure(dm)
         def test_measure(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .filter([])
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
@@ -304,7 +304,7 @@ class TestDataModelQueryMethod:
         @measure(dm)
         def test_measure(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
             )
@@ -387,7 +387,7 @@ class TestDataModelQueryMethod:
         @measure(dm)
         def lazy_measure(qc):
             # Returns LazyFrame
-            return dm.tables['sales'].group_by('item_id').agg(pl.col('revenue').sum())
+            return dm.table('sales').group_by('item_id').agg(pl.col('revenue').sum())
 
         result = dm.query(
             query_context={'measure': ['lazy_measure']},
@@ -429,7 +429,7 @@ class TestDataModelQueryMethod:
         @measure(dm)
         def filtered_revenue(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .filter(Allow('*', context=qc.get('filter')))
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())

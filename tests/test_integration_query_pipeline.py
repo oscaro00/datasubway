@@ -109,7 +109,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def revenue_by_item(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
             )
@@ -130,7 +130,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def revenue_by_item(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum().alias('total_revenue'))
             )
@@ -138,7 +138,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def quantity_by_item(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('quantity').sum().alias('total_quantity'))
             )
@@ -163,7 +163,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def filtered_revenue(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .filter(Allow('*', context=qc.get('filter')))
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
@@ -188,7 +188,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def revenue_excluding_store(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Exclude('store_id', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
             )
@@ -212,7 +212,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def revenue_with_empty_filter(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .filter([])  # Empty filter
                 .drop([])    # Empty drop
                 .group_by(Allow('*', context=qc.get('group', [])))
@@ -235,7 +235,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def total_revenue(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
             )
@@ -335,7 +335,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def total_revenue(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum().alias('sum_revenue'))
             )
@@ -343,7 +343,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def avg_quantity(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('quantity').mean().alias('avg_qty'))
             )
@@ -351,7 +351,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def max_cost(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('cost').max().alias('max_cost'))
             )
@@ -376,7 +376,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def filtered_revenue(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .filter(Allow('*', context=qc.get('filter')))
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
@@ -407,7 +407,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def total_revenue(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum().alias('total_rev'))
             )
@@ -415,7 +415,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def total_quantity(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('quantity').sum().alias('total_qty'))
             )
@@ -442,7 +442,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def complex_measure(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .filter([])  # Should be removed
                 .filter(Allow('*', context=qc.get('filter')))
                 .group_by(Allow('*', context=qc.get('group', [])))
@@ -475,7 +475,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def simple_measure(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
             )
@@ -496,7 +496,7 @@ class TestIntegrationQueryPipeline:
         @measure(dm)
         def revenue_by_item(qc):
             return (
-                dm.tables['sales']
+                dm.table('sales')
                 .group_by(Allow('*', context=qc.get('group', [])))
                 .agg(pl.col('revenue').sum())
             )

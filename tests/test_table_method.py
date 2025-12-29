@@ -209,14 +209,16 @@ class TestTableMethod:
                 agg_cols={'revenue': 'sum'}
             )
 
-    def test_table_raises_on_empty_agg_cols(self, datamodel_no_pre_agg):
-        """Test that table() raises ValueError for empty agg_cols."""
-        with pytest.raises(ValueError, match="agg_cols cannot be empty"):
-            datamodel_no_pre_agg.table(
-                'sales',
-                group_by_cols=['item_id'],
-                agg_cols={}
-            )
+    def test_table_allows_empty_agg_cols(self, datamodel_no_pre_agg):
+        """Test that table() allows empty agg_cols (e.g., for pl.len())."""
+        result = datamodel_no_pre_agg.table(
+            'sales',
+            group_by_cols=['item_id'],
+            agg_cols={}
+        )
+        # Should return a CST node without raising
+        assert result is not None
+        assert isinstance(result, cst.BaseExpression)
 
     def test_table_raises_on_missing_join_path(self, simple_tables):
         """Test that table() raises ValueError when join path doesn't exist."""

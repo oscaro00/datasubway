@@ -797,9 +797,6 @@ class DataModel:
                 f"Available: {list(self.tables.keys())}"
             )
 
-        if not agg_cols:
-            raise ValueError("agg_cols cannot be empty")
-
         # Try pre-aggregation if allowed
         if allow_pre_aggs and self.pre_agg_metadata:
             matching_pre_agg = self._find_matching_pre_agg(
