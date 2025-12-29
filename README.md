@@ -47,7 +47,13 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## TO DO
 
-- Add allow_pre_aggs to query context and use that when putting table() calls in measures
+- Add allow_pre_aggs key that accepts a boolean to query_context.py and use that parameter when putting table() calls in measures
+  - table() calls are put in measures when dealing with pre aggregations in data_model.py
 - Add libcst transformers to remove empty polars methods and convert agg() to select() when group_by() is empty
-- Add libcst transformers to get accurate calculations if the table source is a pre aggregation
-- Add execution context for logging and to execute and get results (probably add query() method that accepts query context and gets explain, query source, or the resulting data)
+  - This occurs after pre aggregations have been added in table() calls in data_model.py
+  - Polars methods that have empty lists should be removed. If a group_by() call has an empty list, then the subsequent agg() call must be switched to select() with the same arguments (This only applies to the very next agg() call. There could be later agg() calls that do not need to be changed).
+- Add libcst transformers to get accurate calculations if the table source is a pre aggregation.
+  - When reading from pre aggregations rather than the source tables, different columns will be written. As a result, calculations have to be modified with a libcst transformer to get the correct data. Refer to _get_pre_agg_calculation() in data_model.py for how pre aggregations are written; this change basically requires the code to follow how this pre aggregations are written to make sure data is read correctly.
+- Add query() method to DataModel class that accepts query_context parameter and output_type parameter
+  - The output_type parameter accepts the strings "explain", "query", and "data". Explain shows the polars .explain() output. Query shows the source query as a string. Data calls polars' .collect() to get the data.
+  - The query method applies all of the necessary libcst transformations to get a runable polars query.

@@ -3,6 +3,8 @@ from pathlib import Path
 import polars as pl
 import libcst as cst
 
+from query_context import QueryContext
+
 # Type aliases for aggregation functions
 AggFuncLiteral = Literal['sum', 'mean', 'min', 'max', 'count', 'len', 'null_count', 'first', 'last', 'n_unique', 'std', 'var']
 AggFuncType = Union[AggFuncLiteral, List[AggFuncLiteral]]
@@ -825,3 +827,193 @@ class DataModel:
         else:
             # Multiple tables - build join chain
             return self._build_join_chain_cst(original_table, join_specs)
+
+    def query(
+        self: Self,
+        query_context: Dict[str, Any],
+        output_type: Literal['explain', 'query', 'data'] = 'data'
+    ) -> Union[str, Dict[str, str], pl.DataFrame]:
+        """
+        Execute measures with query context and return results.
+
+        This method orchestrates the entire query pipeline:
+        1. Validates inputs and query context
+        2. Extracts and transforms measure source code
+        3. Applies libcst transformations in correct order
+        4. Executes transformed code
+        5. Combines multiple measures via join
+        6. Returns result based on output_type
+
+        Args:
+            query_context: Query context dictionary with required 'measure' key
+                          and optional 'filter', 'group', 'sort', 'limit', 'offset', 'allow_pre_aggs'
+            output_type: Type of output to return:
+                - 'explain': Polars query plan as string
+                - 'query': Transformed source code (string or dict if multiple measures)
+                - 'data': Executed data as DataFrame
+
+        Returns:
+            - str: If output_type is 'explain'
+            - str or Dict[str, str]: If output_type is 'query'
+            - pl.DataFrame: If output_type is 'data'
+
+        Raises:
+            KeyError: If measure names not registered
+            ValueError: If query_context invalid or output_type invalid
+
+        Example:
+            >>> dm = DataModel(...)
+            >>>
+            >>> result = dm.query(
+            ...     {'measure': ['revenue_by_store'], 'group': ['store_id']},
+            ...     output_type='data'
+            ... )
+        """
+        import inspect
+        import textwrap
+        from query_context.query_context import QueryContext
+
+        # Validate output_type
+        if output_type not in ['explain', 'query', 'data']:
+            raise ValueError(
+                f"output_type must be 'explain', 'query', or 'data', got: {output_type}"
+            )
+
+        # Validate and wrap query context
+        qc = QueryContext(query_context)
+
+        # Extract measure names
+        measure_names = qc.context['measure']
+
+        # Validate all measures exist
+        for measure_name in measure_names:
+            if measure_name not in self.measures:
+                raise KeyError(
+                    f"Measure '{measure_name}' not registered. "
+                    f"Available: {list(self.measures.keys())}"
+                )
+
+        # Process each measure
+        transformed_codes = {}
+        lazy_frames = []
+
+        for measure_name in measure_names:
+            code, lazy_frame = self._process_single_measure(measure_name, qc)
+            transformed_codes[measure_name] = code
+            lazy_frames.append(lazy_frame)
+
+        # Handle 'query' output type
+        if output_type == 'query':
+            if len(measure_names) == 1:
+                return transformed_codes[measure_names[0]]
+            else:
+                return transformed_codes
+
+        # Combine multiple measures
+        group_by_cols = qc.context.get('group')
+        result = self._combine_measure_results(lazy_frames, group_by_cols)
+
+        # Return based on output_type
+        if output_type == 'explain':
+            return result.explain()
+
+        # output_type == 'data'
+        return result.collect()
+
+    def _process_single_measure(
+        self: Self,
+        measure_name: str,
+        query_context: QueryContext
+    ) -> tuple[str, pl.LazyFrame]:
+        """
+        Process one measure through transformation pipeline and execution.
+
+        Args:
+            measure_name: Name of measure to process
+            query_context: QueryContext instance
+
+        Returns:
+            Tuple of (transformed_code, lazy_frame)
+        """
+        import inspect
+        import textwrap
+        from cst.transformers.replace_context_with_table_columns import resolve_table_columns
+        from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
+        from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
+
+        # Extract source code
+        measure_func = self.measures[measure_name]
+        source_code = textwrap.dedent(inspect.getsource(measure_func))
+
+        # Apply transformation pipeline
+        current_code = source_code
+
+        # 1. Resolve Allow/Exclude to column lists
+        current_code = resolve_table_columns(
+            source_code=current_code,
+            function_name=measure_name,
+            runtime_context={'qc': query_context.context},
+            output_type='polar_col'
+        )
+
+        # 2. Remove empty polars methods
+        current_code = remove_empty_polars_methods(
+            source_code=current_code,
+            function_name=measure_name
+        )
+
+        # 3. Transform pre-agg expressions (only if using pre-agg)
+        if 'self.pre_agg_directory' in current_code:
+            current_code = transform_pre_agg_expressions(
+                source_code=current_code,
+                function_name=measure_name
+            )
+
+        # Execute transformed code
+        exec_namespace = {
+            'pl': pl,
+            'self': self,
+            'dm': self,
+            'qc': query_context.context
+        }
+
+        exec(current_code, exec_namespace)
+        measure_func = exec_namespace[measure_name]
+        lazy_frame = measure_func(query_context.context)
+
+        if not isinstance(lazy_frame, pl.LazyFrame):
+            raise ValueError(
+                f"Measure '{measure_name}' must return pl.LazyFrame, "
+                f"got: {type(lazy_frame)}"
+            )
+
+        return current_code, lazy_frame
+
+    def _combine_measure_results(
+        self: Self,
+        measure_results: List[pl.LazyFrame],
+        group_by_cols: Optional[List[str]]
+    ) -> pl.LazyFrame:
+        """
+        Combine multiple measure results via outer join or cross join.
+
+        Args:
+            measure_results: List of LazyFrames from different measures
+            group_by_cols: Columns to join on (from query_context['group']), or None
+
+        Returns:
+            Combined LazyFrame
+        """
+        if len(measure_results) == 1:
+            return measure_results[0]
+
+        result = measure_results[0]
+        for subsequent in measure_results[1:]:
+            if group_by_cols:
+                # Outer join on group by columns
+                result = result.join(subsequent, on=group_by_cols, how='outer')
+            else:
+                # Cross join (cartesian product) when no group by
+                result = result.join(subsequent, how='cross')
+
+        return result

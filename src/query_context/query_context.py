@@ -40,8 +40,8 @@ class QueryContext:
 
     def validate_context(self) -> None:
         for key, val in self.context.items():
-            if key not in ['measure', 'filter', 'group', 'having', 'sort', 'limit', 'offset']:
-                raise KeyError(f"key: {key} not in ['measure', 'filter', 'group', 'having', 'sort', 'limit', 'offset']")
+            if key not in ['measure', 'filter', 'group', 'having', 'sort', 'limit', 'offset', 'allow_pre_aggs']:
+                raise KeyError(f"key: {key} not in ['measure', 'filter', 'group', 'having', 'sort', 'limit', 'offset', 'allow_pre_aggs']")
             
             match key:
                 case 'measure':
@@ -56,6 +56,10 @@ class QueryContext:
                     except (TypeError, ValueError) as e:
                         raise ValueError(f"Invalid filter: {e}") from e
 
+                case 'allow_pre_aggs':
+                    if not isinstance(val, bool):
+                        raise TypeError('allow_pre_aggs must be a boolean')
+
                 # TODO: add other validations here (maybe make this its own method)
 
     def set_default_limit_offset(self) -> None:
@@ -64,6 +68,15 @@ class QueryContext:
 
         if 'offset' not in self.context.keys():
             self.context['offset'] = 0
+
+    def get_allow_pre_aggs(self) -> bool:
+        """
+        Get allow_pre_aggs flag, defaulting to True if not specified.
+
+        Returns:
+            Boolean indicating whether pre-aggregations should be used
+        """
+        return self.context.get('allow_pre_aggs', True)
 
     def get_filter_columns(self) -> List[str]:
         """
