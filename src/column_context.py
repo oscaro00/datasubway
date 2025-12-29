@@ -220,17 +220,17 @@ class Allow:
         return None
 
     def _group_to_polars(self, group_list: List[str]) -> List[pl.Expr]:
-        """Convert ['df.col1', 'df.col2'] → [pl.col('col1'), pl.col('col2')] (strips table prefix)"""
-        return [pl.col(column.split('.')[-1] if '.' in column else column) for column in group_list]
+        """Convert ['df.col1', 'df.col2'] → [pl.col('df.col1'), pl.col('df.col2')] (preserves table prefix)"""
+        return [pl.col(column) for column in group_list]
 
     def _sort_to_polars(self, sort_list: List[Tuple[str, str]]) -> List[pl.Expr]:
         """
-        Convert [('df.col', 'desc')] → [pl.col('col')] (strips table prefix)
+        Convert [('df.col', 'desc')] → [pl.col('df.col')] (preserves table prefix)
 
         Note: Polars .sort() doesn't support .desc()/.asc() on expressions.
         Direction info is lost - use with separate descending parameter.
         """
-        return [pl.col(column.split('.')[-1] if '.' in column else column) for column, direction in sort_list]
+        return [pl.col(column) for column, direction in sort_list]
 
     def _filter_to_polars(self, filter_expr: Any) -> pl.Expr:
         """
@@ -576,17 +576,17 @@ class Exclude:
         return None
 
     def _group_to_polars(self, group_list: List[str]) -> List[pl.Expr]:
-        """Convert ['df.col1', 'df.col2'] → [pl.col('col1'), pl.col('col2')] (strips table prefix)"""
-        return [pl.col(column.split('.')[-1] if '.' in column else column) for column in group_list]
+        """Convert ['df.col1', 'df.col2'] → [pl.col('df.col1'), pl.col('df.col2')] (preserves table prefix)"""
+        return [pl.col(column) for column in group_list]
 
     def _sort_to_polars(self, sort_list: List[Tuple[str, str]]) -> List[pl.Expr]:
         """
-        Convert [('df.col', 'desc')] → [pl.col('col')] (strips table prefix)
+        Convert [('df.col', 'desc')] → [pl.col('df.col')] (preserves table prefix)
 
         Note: Polars .sort() doesn't support .desc()/.asc() on expressions.
         Direction info is lost - use with separate descending parameter.
         """
-        return [pl.col(column.split('.')[-1] if '.' in column else column) for column, direction in sort_list]
+        return [pl.col(column) for column, direction in sort_list]
 
     def _filter_to_polars(self, filter_expr: Any) -> pl.Expr:
         """

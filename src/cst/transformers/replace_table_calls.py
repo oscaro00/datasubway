@@ -137,9 +137,9 @@ class ReplaceTableCalls(cst.CSTTransformer):
         if node.func.attr.value != 'table':
             return False
 
-        # Check if it's called on 'dm' or 'self'
+        # Check if it's called on 'dm', 'self', or 'data_model'
         if isinstance(node.func.value, cst.Name):
-            return node.func.value.value in ['dm', 'self']
+            return node.func.value.value in ['dm', 'self', 'data_model']
 
         return False
 

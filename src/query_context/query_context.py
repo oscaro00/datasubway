@@ -50,11 +50,12 @@ class QueryContext:
                             raise TypeError('Measures must be strings')
 
                 case 'filter':
-                    # Validate filter structure
-                    try:
-                        filter_obj = Filter(val)
-                    except (TypeError, ValueError) as e:
-                        raise ValueError(f"Invalid filter: {e}") from e
+                    # Validate filter structure (skip if None)
+                    if val is not None:
+                        try:
+                            filter_obj = Filter(val)
+                        except (TypeError, ValueError) as e:
+                            raise ValueError(f"Invalid filter: {e}") from e
 
                 case 'allow_pre_aggs':
                     if not isinstance(val, bool):
@@ -68,6 +69,12 @@ class QueryContext:
 
         if 'offset' not in self.context.keys():
             self.context['offset'] = 0
+
+        if 'filter' not in self.context.keys():
+            self.context['filter'] = None
+
+        if 'group' not in self.context.keys():
+            self.context['group'] = []
 
     def get_allow_pre_aggs(self) -> bool:
         """
@@ -85,7 +92,7 @@ class QueryContext:
         Returns:
             List of column names in 'table_name.column_name' format
         """
-        if 'filter' not in self.context:
+        if 'filter' not in self.context or self.context['filter'] is None:
             return []
 
         filter_obj = Filter(self.context['filter'])

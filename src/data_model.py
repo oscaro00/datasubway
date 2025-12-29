@@ -872,8 +872,6 @@ class DataModel:
             ...     output_type='data'
             ... )
         """
-        import inspect
-        import textwrap
         from query_context.query_context import QueryContext
 
         # Validate output_type
@@ -946,6 +944,7 @@ class DataModel:
         from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
         from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
         from cst.transformers.replace_table_calls import replace_table_calls
+        from column_context import Allow, Exclude
 
         # Extract source code
         measure_func = self.measures[measure_name]
@@ -960,14 +959,7 @@ class DataModel:
         # Apply transformation pipeline
         current_code = source_code
 
-        # 1. Replace dm.table() calls with actual LazyFrame code
-        current_code = replace_table_calls(
-            source_code=current_code,
-            function_name=measure_name,
-            runtime_context={'dm': self, 'self': self, 'qc': query_context.context}
-        )
-
-        # 2. Resolve Allow/Exclude to column lists
+        # 1. Resolve Allow/Exclude to column lists (PRESERVING table prefixes)
         current_code = resolve_table_columns(
             source_code=current_code,
             function_name=measure_name,
@@ -975,13 +967,35 @@ class DataModel:
             output_type='polar_col'
         )
 
-        # 3. Remove empty polars methods
+        # 2. Inject parameters into table() calls based on method chain analysis
+        from cst.transformers.inject_table_parameters import inject_table_parameters
+        current_code = inject_table_parameters(
+            source_code=current_code,
+            function_name=measure_name,
+            runtime_context={'qc': query_context.context}
+        )
+
+        # 3. Replace dm.table() calls with actual LazyFrame code (joins)
+        current_code = replace_table_calls(
+            source_code=current_code,
+            function_name=measure_name,
+            runtime_context={'dm': self, 'self': self, 'data_model': self, 'qc': query_context.context}
+        )
+
+        # 4. Strip table prefixes from pl.col() calls for Polars execution
+        from cst.transformers.strip_table_prefixes import strip_table_prefixes
+        current_code = strip_table_prefixes(
+            source_code=current_code,
+            function_name=measure_name
+        )
+
+        # 5. Remove empty polars methods
         current_code = remove_empty_polars_methods(
             source_code=current_code,
             function_name=measure_name
         )
 
-        # 4. Transform pre-agg expressions (only if using pre-agg)
+        # 6. Transform pre-agg expressions (only if using pre-agg)
         if 'self.pre_agg_directory' in current_code:
             current_code = transform_pre_agg_expressions(
                 source_code=current_code,
@@ -993,6 +1007,9 @@ class DataModel:
             'pl': pl,
             'self': self,
             'dm': self,
+            'data_model': self,
+            'Allow': Allow,
+            'Exclude': Exclude,
             'qc': query_context.context
         }
 
