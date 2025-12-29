@@ -47,13 +47,12 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## TO DO
 
-- Add allow_pre_aggs key that accepts a boolean to query_context.py and use that parameter when putting table() calls in measures
-  - table() calls are put in measures when dealing with pre aggregations in data_model.py
-- Add libcst transformers to remove empty polars methods and convert agg() to select() when group_by() is empty
-  - This occurs after pre aggregations have been added in table() calls in data_model.py
-  - Polars methods that have empty lists should be removed. If a group_by() call has an empty list, then the subsequent agg() call must be switched to select() with the same arguments (This only applies to the very next agg() call. There could be later agg() calls that do not need to be changed).
-- Add libcst transformers to get accurate calculations if the table source is a pre aggregation.
-  - When reading from pre aggregations rather than the source tables, different columns will be written. As a result, calculations have to be modified with a libcst transformer to get the correct data. Refer to _get_pre_agg_calculation() in data_model.py for how pre aggregations are written; this change basically requires the code to follow how this pre aggregations are written to make sure data is read correctly.
-- Add query() method to DataModel class that accepts query_context parameter and output_type parameter
-  - The output_type parameter accepts the strings "explain", "query", and "data". Explain shows the polars .explain() output. Query shows the source query as a string. Data calls polars' .collect() to get the data.
-  - The query method applies all of the necessary libcst transformations to get a runable polars query.
+- Complex measure testing with a more complete example
+  - Checking that pre aggregation calculations work correctly
+- Ability to show the steps of a measure being transformed by the transformers
+- Logging solution
+- HTMX UI/TUI for displaying pre agg metadata and rewriting files
+  - Could also display logs
+- Roll based access control?
+  - Might make more sense for this to be a user implemented feature because it involves auth
+- Add optional AI dependency to get chat bot functionality working
