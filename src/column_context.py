@@ -139,11 +139,17 @@ class Allow:
             self.context_columns = []
 
     def _parse_column(self, column: str) -> Tuple[str, str]:
-        """Parse 'table.column' into (table, column) tuple."""
+        """
+        Parse 'table.column' into (table, column) tuple.
+
+        Format matches extract_table_columns():
+        - 'table.column' → ('table', 'column')
+        - 'column' → ('column', '')
+        """
         if '.' in column:
             parts = column.split('.', 1)
             return (parts[0], parts[1])
-        return ('', column)
+        return (column, '')
 
     def _should_include_column(self, tbl_col: Tuple[str, str]) -> bool:
         """
@@ -214,31 +220,33 @@ class Allow:
         return None
 
     def _group_to_polars(self, group_list: List[str]) -> List[pl.Expr]:
-        """Convert ['df.col1', 'df.col2'] → [pl.col('df.col1'), pl.col('df.col2')]"""
-        return [pl.col(column) for column in group_list]
+        """Convert ['df.col1', 'df.col2'] → [pl.col('col1'), pl.col('col2')] (strips table prefix)"""
+        return [pl.col(column.split('.')[-1] if '.' in column else column) for column in group_list]
 
     def _sort_to_polars(self, sort_list: List[Tuple[str, str]]) -> List[pl.Expr]:
         """
-        Convert [('df.col', 'desc')] → [pl.col('df.col')]
+        Convert [('df.col', 'desc')] → [pl.col('col')] (strips table prefix)
 
         Note: Polars .sort() doesn't support .desc()/.asc() on expressions.
         Direction info is lost - use with separate descending parameter.
         """
-        return [pl.col(column) for column, direction in sort_list]
+        return [pl.col(column.split('.')[-1] if '.' in column else column) for column, direction in sort_list]
 
     def _filter_to_polars(self, filter_expr: Any) -> pl.Expr:
         """
         Convert FilterExpression to Polars boolean expression.
 
         Examples:
-            ('df.col', '=', 1) → pl.col('df.col') == 1
+            ('df.col', '=', 1) → pl.col('col') == 1
             {'AND': [cond1, cond2]} → cond1_expr & cond2_expr
             {'OR': [cond1, cond2]} → cond1_expr | cond2_expr
         """
         # Simple condition (tuple)
         if isinstance(filter_expr, tuple):
             column, operator, value = filter_expr
-            col_expr = pl.col(column)
+            # Strip table prefix from column name (e.g., 'sales.item_id' → 'item_id')
+            column_name = column.split('.')[-1] if '.' in column else column
+            col_expr = pl.col(column_name)
 
             if operator not in OPERATOR_MAP:
                 raise ValueError(f"Unsupported operator: {operator}")
@@ -487,11 +495,17 @@ class Exclude:
             self.context_columns = []
 
     def _parse_column(self, column: str) -> Tuple[str, str]:
-        """Parse 'table.column' into (table, column) tuple."""
+        """
+        Parse 'table.column' into (table, column) tuple.
+
+        Format matches extract_table_columns():
+        - 'table.column' → ('table', 'column')
+        - 'column' → ('column', '')
+        """
         if '.' in column:
             parts = column.split('.', 1)
             return (parts[0], parts[1])
-        return ('', column)
+        return (column, '')
 
     def _should_include_column(self, tbl_col: Tuple[str, str]) -> bool:
         """
@@ -562,31 +576,33 @@ class Exclude:
         return None
 
     def _group_to_polars(self, group_list: List[str]) -> List[pl.Expr]:
-        """Convert ['df.col1', 'df.col2'] → [pl.col('df.col1'), pl.col('df.col2')]"""
-        return [pl.col(column) for column in group_list]
+        """Convert ['df.col1', 'df.col2'] → [pl.col('col1'), pl.col('col2')] (strips table prefix)"""
+        return [pl.col(column.split('.')[-1] if '.' in column else column) for column in group_list]
 
     def _sort_to_polars(self, sort_list: List[Tuple[str, str]]) -> List[pl.Expr]:
         """
-        Convert [('df.col', 'desc')] → [pl.col('df.col')]
+        Convert [('df.col', 'desc')] → [pl.col('col')] (strips table prefix)
 
         Note: Polars .sort() doesn't support .desc()/.asc() on expressions.
         Direction info is lost - use with separate descending parameter.
         """
-        return [pl.col(column) for column, direction in sort_list]
+        return [pl.col(column.split('.')[-1] if '.' in column else column) for column, direction in sort_list]
 
     def _filter_to_polars(self, filter_expr: Any) -> pl.Expr:
         """
         Convert FilterExpression to Polars boolean expression.
 
         Examples:
-            ('df.col', '=', 1) → pl.col('df.col') == 1
+            ('df.col', '=', 1) → pl.col('col') == 1
             {'AND': [cond1, cond2]} → cond1_expr & cond2_expr
             {'OR': [cond1, cond2]} → cond1_expr | cond2_expr
         """
         # Simple condition (tuple)
         if isinstance(filter_expr, tuple):
             column, operator, value = filter_expr
-            col_expr = pl.col(column)
+            # Strip table prefix from column name (e.g., 'sales.item_id' → 'item_id')
+            column_name = column.split('.')[-1] if '.' in column else column
+            col_expr = pl.col(column_name)
 
             if operator not in OPERATOR_MAP:
                 raise ValueError(f"Unsupported operator: {operator}")

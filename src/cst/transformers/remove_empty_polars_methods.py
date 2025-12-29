@@ -67,7 +67,7 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
         Main transformation logic.
 
         Handles three cases:
-        1. Empty .group_by() → Remove and set flag
+        1. Empty .group_by() → Remove
         2. .agg() after empty .group_by() → Convert to .select()
         3. Other empty methods → Remove
 
@@ -80,28 +80,38 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
         if self.current_function != self.function_name:
             return updated_node
 
-        # Check if this is an empty group_by method
+        # Check if this is .agg() preceded by empty .group_by()
+        if self._is_agg_method(updated_node):
+            # Check the ORIGINAL node's chain (before transformations)
+            if (isinstance(original_node.func, cst.Attribute) and
+                isinstance(original_node.func.value, cst.Call)):
+                prev_call = original_node.func.value
+                if self._is_group_by_method(prev_call) and self._is_empty_method_call(prev_call):
+                    # Remove empty group_by and convert agg to select
+                    # Get the chain before group_by (which may have been cleaned already)
+                    if isinstance(updated_node.func, cst.Attribute) and isinstance(updated_node.func.value, cst.Call):
+                        # Use the updated chain (which has empty methods removed)
+                        chain_before_groupby = updated_node.func.value.func.value
+                    elif isinstance(prev_call.func, cst.Attribute):
+                        chain_before_groupby = prev_call.func.value
+                    else:
+                        return updated_node
+
+                    # Return .select() with the cleaned chain
+                    return updated_node.with_changes(
+                        func=updated_node.func.with_changes(
+                            value=chain_before_groupby,
+                            attr=cst.Name('select')
+                        )
+                    )
+            return updated_node
+
+        # Remove empty group_by methods
         if self._is_group_by_method(updated_node) and self._is_empty_method_call(updated_node):
-            self.last_method_was_empty_group_by = True
             # Remove this call by returning the chain before it
             if isinstance(updated_node.func, cst.Attribute):
                 return updated_node.func.value
             return updated_node
-
-        # Check if this is agg after empty group_by
-        if self._is_agg_method(updated_node) and self.last_method_was_empty_group_by:
-            # Convert .agg() to .select()
-            self.last_method_was_empty_group_by = False
-            if isinstance(updated_node.func, cst.Attribute):
-                return updated_node.with_changes(
-                    func=updated_node.func.with_changes(
-                        attr=cst.Name('select')
-                    )
-                )
-            return updated_node
-
-        # Reset tracking for other methods
-        self.last_method_was_empty_group_by = False
 
         # Remove other empty method calls
         if self._is_empty_method_call(updated_node):
@@ -122,6 +132,16 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
         """
         # Must be method call (has Attribute func)
         if not isinstance(node.func, cst.Attribute):
+            return False
+
+        # Only check specific polars DataFrame methods
+        method_name = node.func.attr.value
+        polars_dataframe_methods = {
+            'filter', 'select', 'drop', 'with_columns', 'rename',
+            'sort', 'group_by', 'dynamic_group_by', 'rolling',
+            'drop_nulls', 'unique', 'explode'
+        }
+        if method_name not in polars_dataframe_methods:
             return False
 
         # Must have exactly one argument
@@ -197,7 +217,21 @@ def remove_empty_polars_methods(
         >>> result = remove_empty_polars_methods(code, 'my_measure')
         >>> # Result: df.select(pl.col('x').sum())
     """
-    module = cst.parse_module(source_code)
-    transformer = RemoveEmptyPolarsMethods(function_name)
-    new_module = module.visit(transformer)
-    return new_module.code
+    # Apply transformer multiple times until code stabilizes
+    # This handles cases with multiple consecutive empty methods
+    current_code = source_code
+    max_iterations = 10  # Safety limit to prevent infinite loops
+
+    for _ in range(max_iterations):
+        module = cst.parse_module(current_code)
+        transformer = RemoveEmptyPolarsMethods(function_name)
+        new_module = module.visit(transformer)
+        new_code = new_module.code
+
+        # If no changes were made, we're done
+        if new_code == current_code:
+            break
+
+        current_code = new_code
+
+    return current_code

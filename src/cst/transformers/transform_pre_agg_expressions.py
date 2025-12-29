@@ -76,39 +76,46 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         self.current_function = None
         return updated_node
 
-    def visit_Call(self, node: cst.Call) -> None:
-        """Track when entering .agg() method."""
-        if self._is_agg_method(node):
-            self.inside_agg += 1
-
     def leave_Call(
         self,
         original_node: cst.Call,
         updated_node: cst.Call
     ) -> Union[cst.Call, cst.BaseExpression]:
         """
-        Transform aggregation expressions if inside .agg() and using pre-agg.
+        Transform aggregation expressions in .agg() calls when using pre-agg.
 
         Returns:
             Transformed call node or expression
         """
-        # Check if leaving an agg method
-        was_inside_agg = self.inside_agg > 0
-        if self._is_agg_method(original_node):
-            self.inside_agg -= 1
-
-        # Only transform if in target function, using pre-agg, and inside agg
+        # Only transform in target function and when using pre-agg
         if (self.current_function != self.function_name or
-            not self.uses_pre_agg or
-            self.inside_agg == 0):
+            not self.uses_pre_agg):
             return updated_node
 
-        # Don't transform the .agg() call itself, only its contents
-        if self._is_agg_method(original_node):
-            return updated_node
+        # If this is an .agg() call, transform its arguments
+        if self._is_agg_method(updated_node):
+            return self._transform_agg_call(updated_node)
 
-        # Transform aggregation expressions
-        return self._transform_expression(updated_node)
+        return updated_node
+
+    def _transform_agg_call(self, node: cst.Call) -> cst.Call:
+        """
+        Transform all aggregation expressions in .agg() arguments.
+
+        Args:
+            node: The .agg() call node
+
+        Returns:
+            .agg() call with transformed arguments
+        """
+        new_args = []
+
+        for arg in node.args:
+            # Transform each argument expression
+            new_expr = self._transform_expression(arg.value)
+            new_args.append(arg.with_changes(value=new_expr))
+
+        return node.with_changes(args=new_args)
 
     def _is_agg_method(self, node: cst.Call) -> bool:
         """Check if this is an .agg() method call."""
@@ -121,14 +128,21 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         node: Union[cst.Call, cst.BaseExpression]
     ) -> cst.BaseExpression:
         """
-        Transform a single aggregation expression.
+        Transform a single aggregation expression recursively.
 
         Handles:
         - pl.col('col').sum() → pl.col('col-sum').sum()
         - pl.col('col').mean() → pl.col('col-mean-sum').sum() / pl.col('col-mean-count').sum()
         - Expressions with .alias()
+        - Nested expressions like (pl.col('x').sum() * 2).alias('y')
         """
         if not isinstance(node, cst.Call):
+            # For non-call nodes, check if they have children to transform
+            if isinstance(node, cst.BinaryOperation):
+                return node.with_changes(
+                    left=self._transform_expression(node.left),
+                    right=self._transform_expression(node.right)
+                )
             return node
 
         # Check if this matches pl.col('name').agg_func()
@@ -138,6 +152,15 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         # Check if this matches pl.col('name').agg_func().alias('name')
         if self._is_aliased_agg_expression(node):
             return self._transform_aliased_agg(node)
+
+        # For other calls (like .alias() with complex expressions),
+        # recursively transform their arguments
+        if isinstance(node.func, cst.Attribute):
+            # Transform the value (chain before this call)
+            if isinstance(node.func.value, (cst.Call, cst.BinaryOperation)):
+                new_value = self._transform_expression(node.func.value)
+                new_func = node.func.with_changes(value=new_value)
+                return node.with_changes(func=new_func)
 
         return node
 
@@ -198,6 +221,10 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         # Strip table prefix from column name (pre-aggs don't have it)
         clean_col = col_name.split('.')[-1] if '.' in col_name else col_name
 
+        # Check if column already has a pre-agg suffix - if so, don't transform again
+        if self._has_pre_agg_suffix(clean_col):
+            return node
+
         match agg_func:
             case 'sum':
                 return self._build_simple_transform(node, clean_col, 'sum')
@@ -220,6 +247,25 @@ class TransformPreAggExpressions(cst.CSTTransformer):
             case _:
                 # Unsupported aggregation - leave unchanged
                 return node
+
+    def _has_pre_agg_suffix(self, col_name: str) -> bool:
+        """
+        Check if column name already has a pre-agg suffix.
+
+        Args:
+            col_name: Column name to check
+
+        Returns:
+            True if column has a pre-agg suffix
+        """
+        pre_agg_suffixes = [
+            '-sum', '-min', '-max', '-count', '-first', '-last',
+            '-null_count', '-unique-set',
+            '-mean-sum', '-mean-count',
+            '-std-sum', '-std-sumsq', '-std-count',
+            '-var-sum', '-var-sumsq', '-var-count'
+        ]
+        return any(col_name.endswith(suffix) for suffix in pre_agg_suffixes)
 
     def _transform_aliased_agg(self, node: cst.Call) -> cst.Call:
         """

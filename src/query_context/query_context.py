@@ -1,6 +1,6 @@
 from typing import Dict, Self, List
 import polars as pl
-from filter_context import Filter
+from query_context.filter_context import Filter
 
 class QueryContext:
     """

@@ -409,17 +409,19 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
         Build pl.col('column') CST node.
 
         Args:
-            column: Column name (e.g., 'df.item_id')
+            column: Column name (e.g., 'df.item_id' or 'item_id')
 
         Returns:
-            CST Call node representing pl.col('column')
+            CST Call node representing pl.col('item_id') (table prefix stripped)
         """
+        # Strip table prefix if present (e.g., 'sales.item_id' → 'item_id')
+        column_name = column.split('.')[-1] if '.' in column else column
         return cst.Call(
             func=cst.Attribute(
                 value=cst.Name('pl'),
                 attr=cst.Name('col')
             ),
-            args=[cst.Arg(value=cst.SimpleString(repr(column)))]
+            args=[cst.Arg(value=cst.SimpleString(repr(column_name)))]
         )
 
     def _build_value_cst(self, value: Any) -> cst.BaseExpression:

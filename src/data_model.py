@@ -3,7 +3,7 @@ from pathlib import Path
 import polars as pl
 import libcst as cst
 
-from query_context import QueryContext
+from query_context.query_context import QueryContext
 
 # Type aliases for aggregation functions
 AggFuncLiteral = Literal['sum', 'mean', 'min', 'max', 'count', 'len', 'null_count', 'first', 'last', 'n_unique', 'std', 'var']
@@ -327,8 +327,9 @@ class DataModel:
             all_columns = agg_columns + group_by_cols
             base_lf = self._resolve_tables_for_pre_agg(all_columns, base_table_hint=agg_columns[0])
 
-            # Execute aggregation
-            result = base_lf.group_by(group_by_cols).agg(all_exprs)
+            # Execute aggregation (strip table prefixes from group_by columns)
+            group_by_col_names = [col.split('.')[-1] if '.' in col else col for col in group_by_cols]
+            result = base_lf.group_by(group_by_col_names).agg(all_exprs)
 
             # Write to parquet
             output_path = self.pre_agg_directory / f'{pre_agg_name}.parquet'
@@ -438,50 +439,52 @@ class DataModel:
         Returns:
             List of pl.Expr with proper aliases for storage (table prefix stripped)
         """
-        # Extract just column name (strip table prefix if present) for output
+        # Extract just column name (strip table prefix if present)
         output_col_name = col_name.split('.')[-1] if '.' in col_name else col_name
+        # Use output_col_name for both column reference and alias
+        col_ref = output_col_name
 
         match agg_func:
             # Simple aggregations (no decomposition needed)
             case 'sum':
-                return [pl.col(col_name).sum().alias(f'{output_col_name}-sum')]
+                return [pl.col(col_ref).sum().alias(f'{output_col_name}-sum')]
 
             case 'min':
-                return [pl.col(col_name).min().alias(f'{output_col_name}-min')]
+                return [pl.col(col_ref).min().alias(f'{output_col_name}-min')]
 
             case 'max':
-                return [pl.col(col_name).max().alias(f'{output_col_name}-max')]
+                return [pl.col(col_ref).max().alias(f'{output_col_name}-max')]
 
             case 'count' | 'len':
                 return [pl.len().alias(f'{output_col_name}-count')]
 
             case 'null_count':
-                return [pl.col(col_name).null_count().alias(f'{output_col_name}-null_count')]
+                return [pl.col(col_ref).null_count().alias(f'{output_col_name}-null_count')]
 
             case 'first':
-                return [pl.col(col_name).first().alias(f'{output_col_name}-first')]
+                return [pl.col(col_ref).first().alias(f'{output_col_name}-first')]
 
             case 'last':
-                return [pl.col(col_name).last().alias(f'{output_col_name}-last')]
+                return [pl.col(col_ref).last().alias(f'{output_col_name}-last')]
 
             # Complex aggregations (require decomposition)
             case 'mean':
                 return [
-                    pl.col(col_name).sum().alias(f'{output_col_name}-mean-sum'),
+                    pl.col(col_ref).sum().alias(f'{output_col_name}-mean-sum'),
                     pl.len().alias(f'{output_col_name}-mean-count')
                 ]
 
             case 'std':
                 return [
-                    pl.col(col_name).sum().alias(f'{output_col_name}-std-sum'),
-                    pl.col(col_name).pow(2).sum().alias(f'{output_col_name}-std-sumsq'),
+                    pl.col(col_ref).sum().alias(f'{output_col_name}-std-sum'),
+                    pl.col(col_ref).pow(2).sum().alias(f'{output_col_name}-std-sumsq'),
                     pl.len().alias(f'{output_col_name}-std-count')
                 ]
 
             case 'var':
                 return [
-                    pl.col(col_name).sum().alias(f'{output_col_name}-var-sum'),
-                    pl.col(col_name).pow(2).sum().alias(f'{output_col_name}-var-sumsq'),
+                    pl.col(col_ref).sum().alias(f'{output_col_name}-var-sum'),
+                    pl.col(col_ref).pow(2).sum().alias(f'{output_col_name}-var-sumsq'),
                     pl.len().alias(f'{output_col_name}-var-count')
                 ]
 
@@ -489,7 +492,7 @@ class DataModel:
             case 'n_unique':
                 # Store array of unique values per group
                 # Warning: Can get expensive with high cardinality
-                return [pl.col(col_name).unique().alias(f'{output_col_name}-unique-set')]
+                return [pl.col(col_ref).unique().alias(f'{output_col_name}-unique-set')]
 
             case _:
                 raise ValueError(f"Unsupported aggregation function: {agg_func}")
@@ -883,6 +886,8 @@ class DataModel:
         qc = QueryContext(query_context)
 
         # Extract measure names
+        if 'measure' not in qc.context:
+            raise TypeError("Query context must include 'measure' key")
         measure_names = qc.context['measure']
 
         # Validate all measures exist
@@ -940,15 +945,29 @@ class DataModel:
         from cst.transformers.replace_context_with_table_columns import resolve_table_columns
         from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
         from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
+        from cst.transformers.replace_table_calls import replace_table_calls
 
         # Extract source code
         measure_func = self.measures[measure_name]
         source_code = textwrap.dedent(inspect.getsource(measure_func))
 
+        # Strip decorator lines (e.g., @measure(dm))
+        # Decorators start with @ and appear before the def line
+        lines = source_code.split('\n')
+        def_line_idx = next((i for i, line in enumerate(lines) if line.strip().startswith('def ')), 0)
+        source_code = '\n'.join(lines[def_line_idx:])
+
         # Apply transformation pipeline
         current_code = source_code
 
-        # 1. Resolve Allow/Exclude to column lists
+        # 1. Replace dm.table() calls with actual LazyFrame code
+        current_code = replace_table_calls(
+            source_code=current_code,
+            function_name=measure_name,
+            runtime_context={'dm': self, 'self': self, 'qc': query_context.context}
+        )
+
+        # 2. Resolve Allow/Exclude to column lists
         current_code = resolve_table_columns(
             source_code=current_code,
             function_name=measure_name,
@@ -956,13 +975,13 @@ class DataModel:
             output_type='polar_col'
         )
 
-        # 2. Remove empty polars methods
+        # 3. Remove empty polars methods
         current_code = remove_empty_polars_methods(
             source_code=current_code,
             function_name=measure_name
         )
 
-        # 3. Transform pre-agg expressions (only if using pre-agg)
+        # 4. Transform pre-agg expressions (only if using pre-agg)
         if 'self.pre_agg_directory' in current_code:
             current_code = transform_pre_agg_expressions(
                 source_code=current_code,
@@ -1008,12 +1027,12 @@ class DataModel:
             return measure_results[0]
 
         result = measure_results[0]
-        for subsequent in measure_results[1:]:
+        for i, subsequent in enumerate(measure_results[1:], 1):
             if group_by_cols:
-                # Outer join on group by columns
-                result = result.join(subsequent, on=group_by_cols, how='outer')
+                # Outer join on group by columns with coalesce to avoid duplicate join columns
+                result = result.join(subsequent, on=group_by_cols, how='full', coalesce=True, suffix=f'_{i}')
             else:
                 # Cross join (cartesian product) when no group by
-                result = result.join(subsequent, how='cross')
+                result = result.join(subsequent, how='cross', suffix=f'_{i}')
 
         return result
