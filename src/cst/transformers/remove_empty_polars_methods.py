@@ -88,21 +88,25 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
                 prev_call = original_node.func.value
                 if self._is_group_by_method(prev_call) and self._is_empty_method_call(prev_call):
                     # Remove empty group_by and convert agg to select
-                    # Get the chain before group_by (which may have been cleaned already)
-                    if isinstance(updated_node.func, cst.Attribute) and isinstance(updated_node.func.value, cst.Call):
-                        # Use the updated chain (which has empty methods removed)
-                        chain_before_groupby = updated_node.func.value.func.value
-                    elif isinstance(prev_call.func, cst.Attribute):
+                    # Extract the chain before the .group_by([]) call
+                    chain_before_groupby = None
+
+                    # First, try to get chain from the ORIGINAL prev_call (before any transformations)
+                    if isinstance(prev_call.func, cst.Attribute):
                         chain_before_groupby = prev_call.func.value
-                    else:
+
+                    # If we couldn't extract the chain, don't transform
+                    if chain_before_groupby is None:
                         return updated_node
 
                     # Return .select() with the cleaned chain
-                    return updated_node.with_changes(
-                        func=updated_node.func.with_changes(
+                    # We replace the .group_by([]).agg(...) with chain.select(...)
+                    return cst.Call(
+                        func=cst.Attribute(
                             value=chain_before_groupby,
                             attr=cst.Name('select')
-                        )
+                        ),
+                        args=updated_node.args
                     )
             return updated_node
 

@@ -4,6 +4,7 @@ import polars as pl
 import libcst as cst
 
 from query_context.query_context import QueryContext
+from cst.extractors.extract_decorator_variable import extract_decorator_variable_name
 
 # Type aliases for aggregation functions
 AggFuncLiteral = Literal['sum', 'mean', 'min', 'max', 'count', 'len', 'null_count', 'first', 'last', 'n_unique', 'std', 'var']
@@ -759,6 +760,43 @@ class DataModel:
 
         return all_join_specs
 
+    def _resolve_column_table(self, col: str, base_table: str) -> str:
+        """
+        Add table prefix to column if missing by looking up table schemas.
+
+        When columns are provided without table prefixes (e.g., 'category' instead of
+        'products.category'), this method searches through table schemas to find which
+        table contains the column.
+
+        Args:
+            col: Column name (may or may not have table prefix)
+            base_table: Base table to check first (optimization)
+
+        Returns:
+            Column name with table prefix (e.g., 'products.category')
+
+        Example:
+            >>> self._resolve_column_table('category', 'sales')
+            'products.category'  # Found in products table schema
+        """
+        # Already has table prefix - return as-is
+        if '.' in col:
+            return col
+
+        # Check if column exists in base table first (common case)
+        if base_table in self.table_schemas:
+            if col in self.table_schemas[base_table]:
+                return f"{base_table}.{col}"
+
+        # Search other tables for the column
+        for table_name, schema in self.table_schemas.items():
+            if col in schema:
+                return f"{table_name}.{col}"
+
+        # Column not found in any schema - assume it belongs to base table
+        # This allows for dynamic columns or columns not in schema
+        return f"{base_table}.{col}"
+
     def table(
         self: Self,
         original_table: str,
@@ -818,7 +856,16 @@ class DataModel:
                     return self._build_pre_agg_cst(matching_pre_agg['name'])
 
         # Fallback: Build CST for tables with joins
-        all_columns = group_by_cols + list(agg_cols.keys())
+        # Normalize columns to include table prefixes for proper join resolution
+        normalized_group_cols = [
+            self._resolve_column_table(col, original_table)
+            for col in group_by_cols
+        ]
+        normalized_agg_cols_keys = [
+            self._resolve_column_table(col, original_table)
+            for col in agg_cols.keys()
+        ]
+        all_columns = normalized_group_cols + normalized_agg_cols_keys
         join_specs = self._get_join_specs_for_columns(all_columns, original_table)
 
         if not join_specs:
@@ -947,6 +994,13 @@ class DataModel:
         measure_func = self.measures[measure_name]
         source_code = textwrap.dedent(inspect.getsource(measure_func))
 
+        # Extract decorator variable name BEFORE stripping decorator lines
+        # This allows users to use any variable name in @measure(variable_name)
+        decorator_variable_name = extract_decorator_variable_name(
+            source_code=source_code,
+            function_name=measure_name
+        )
+
         # Strip decorator lines (e.g., @measure(dm))
         # Decorators start with @ and appear before the def line
         lines = source_code.split('\n')
@@ -966,17 +1020,27 @@ class DataModel:
 
         # 2. Inject parameters into table() calls based on method chain analysis
         from cst.transformers.inject_table_parameters import inject_table_parameters
+        # Build list of valid variable names for DataModel
+        valid_var_names = ['dm', 'self', 'data_model']
+        if decorator_variable_name is not None:
+            valid_var_names.append(decorator_variable_name)
+
         current_code = inject_table_parameters(
             source_code=current_code,
             function_name=measure_name,
-            runtime_context={'qc': query_context.context}
+            runtime_context={'qc': query_context.context, 'valid_var_names': valid_var_names}
         )
 
         # 3. Replace dm.table() calls with actual LazyFrame code (joins)
+        # Build runtime context with standard aliases and custom decorator variable
+        replace_context = {'dm': self, 'self': self, 'data_model': self, 'qc': query_context.context}
+        if decorator_variable_name is not None:
+            replace_context[decorator_variable_name] = self
+
         current_code = replace_table_calls(
             source_code=current_code,
             function_name=measure_name,
-            runtime_context={'dm': self, 'self': self, 'data_model': self, 'qc': query_context.context}
+            runtime_context=replace_context
         )
 
         # 4. Strip table prefixes from pl.col() calls for Polars execution
@@ -1009,6 +1073,11 @@ class DataModel:
             'Exclude': Exclude,
             'qc': query_context.context
         }
+
+        # Add decorator variable name as alias (if found)
+        # This allows users to use any variable name in @measure(variable_name)
+        if decorator_variable_name is not None:
+            exec_namespace[decorator_variable_name] = self
 
         exec(current_code, exec_namespace)
         measure_func = exec_namespace[measure_name]

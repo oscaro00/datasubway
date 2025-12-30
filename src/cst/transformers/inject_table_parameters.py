@@ -151,7 +151,9 @@ class InjectTableParameters(cst.CSTTransformer):
             return False
 
         if isinstance(node.func.value, cst.Name):
-            return node.func.value.value in ['dm', 'self', 'data_model']
+            # Get valid variable names from runtime context, default to standard names
+            valid_var_names = self.runtime_context.get('valid_var_names', ['dm', 'self', 'data_model'])
+            return node.func.value.value in valid_var_names
 
         return False
 

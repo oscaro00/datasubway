@@ -90,8 +90,14 @@ class ReplaceTableCalls(cst.CSTTransformer):
         if not self._is_table_call(updated_node):
             return updated_node
 
-        # Get the DataModel instance from runtime context
-        data_model = self.runtime_context.get('dm') or self.runtime_context.get('self')
+        # Get the DataModel instance from runtime context using the variable name
+        # Extract variable name from the call (e.g., 'dm' from 'dm.table()')
+        if isinstance(updated_node.func, cst.Attribute) and isinstance(updated_node.func.value, cst.Name):
+            var_name = updated_node.func.value.value
+            data_model = self.runtime_context.get(var_name)
+        else:
+            data_model = None
+
         if data_model is None:
             # No DataModel instance available - leave unchanged
             return updated_node
@@ -137,9 +143,12 @@ class ReplaceTableCalls(cst.CSTTransformer):
         if node.func.attr.value != 'table':
             return False
 
-        # Check if it's called on 'dm', 'self', or 'data_model'
+        # Check if it's called on a DataModel variable (any name in runtime_context that points to DataModel)
         if isinstance(node.func.value, cst.Name):
-            return node.func.value.value in ['dm', 'self', 'data_model']
+            var_name = node.func.value.value
+            # Check if variable is in runtime context and is a DataModel instance
+            # We check runtime_context keys to support custom variable names
+            return var_name in self.runtime_context and hasattr(self.runtime_context.get(var_name), 'table')
 
         return False
 

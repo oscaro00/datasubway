@@ -92,8 +92,8 @@ class TransformPreAggExpressions(cst.CSTTransformer):
             not self.uses_pre_agg):
             return updated_node
 
-        # If this is an .agg() call, transform its arguments
-        if self._is_agg_method(updated_node):
+        # If this is an .agg() or .select() call, transform its arguments
+        if self._is_agg_method(updated_node) or self._is_select_method(updated_node):
             return self._transform_agg_call(updated_node)
 
         return updated_node
@@ -122,6 +122,12 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         if not isinstance(node.func, cst.Attribute):
             return False
         return node.func.attr.value == 'agg'
+
+    def _is_select_method(self, node: cst.Call) -> bool:
+        """Check if this is a .select() method call."""
+        if not isinstance(node.func, cst.Attribute):
+            return False
+        return node.func.attr.value == 'select'
 
     def _transform_expression(
         self,
@@ -209,11 +215,16 @@ class TransformPreAggExpressions(cst.CSTTransformer):
 
         return self._is_simple_agg_expression(node.func.value)
 
-    def _transform_simple_agg(self, node: cst.Call) -> cst.BaseExpression:
+    def _transform_simple_agg(self, node: cst.Call, add_alias: bool = True) -> cst.BaseExpression:
         """
         Transform simple aggregation: pl.col('col').sum()
 
-        Maps based on _get_pre_agg_calculation logic.
+        Maps based on _get_pre_agg_calculation logic and optionally adds .alias() to normalize column names.
+
+        Args:
+            node: The aggregation call node
+            add_alias: If True, add .alias() to restore original column name. Set to False when
+                      there's already an explicit user-provided alias.
         """
         col_name = self._extract_column_name(node)
         agg_func = self._extract_agg_function(node)
@@ -227,26 +238,32 @@ class TransformPreAggExpressions(cst.CSTTransformer):
 
         match agg_func:
             case 'sum':
-                return self._build_simple_transform(node, clean_col, 'sum')
+                transformed = self._build_simple_transform(node, clean_col, 'sum')
             case 'min':
-                return self._build_simple_transform(node, clean_col, 'min')
+                transformed = self._build_simple_transform(node, clean_col, 'min')
             case 'max':
-                return self._build_simple_transform(node, clean_col, 'max')
+                transformed = self._build_simple_transform(node, clean_col, 'max')
             case 'count' | 'len':
-                return self._build_simple_transform(node, clean_col, 'count')
+                transformed = self._build_simple_transform(node, clean_col, 'count')
             case 'first':
-                return self._build_simple_transform(node, clean_col, 'first')
+                transformed = self._build_simple_transform(node, clean_col, 'first')
             case 'last':
-                return self._build_simple_transform(node, clean_col, 'last')
+                transformed = self._build_simple_transform(node, clean_col, 'last')
             case 'mean':
-                return self._build_mean_transform(clean_col)
+                transformed = self._build_mean_transform(clean_col)
             case 'std':
-                return self._build_std_transform(clean_col)
+                transformed = self._build_std_transform(clean_col)
             case 'var':
-                return self._build_var_transform(clean_col)
+                transformed = self._build_var_transform(clean_col)
             case _:
                 # Unsupported aggregation - leave unchanged
                 return node
+
+        # Add alias to normalize column name if requested
+        if add_alias:
+            return self._add_alias_to_expression(transformed, clean_col)
+        else:
+            return transformed
 
     def _has_pre_agg_suffix(self, col_name: str) -> bool:
         """
@@ -267,17 +284,45 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         ]
         return any(col_name.endswith(suffix) for suffix in pre_agg_suffixes)
 
+    def _add_alias_to_expression(
+        self,
+        expr: cst.BaseExpression,
+        alias_name: str
+    ) -> cst.Call:
+        """
+        Wrap expression with .alias('name') to normalize column names.
+
+        Transforms pre-agg column names back to their original names for user-facing results.
+        For example, pl.col('revenue-sum').sum() becomes pl.col('revenue-sum').sum().alias('revenue')
+
+        Args:
+            expr: Expression to wrap (e.g., pl.col('revenue-sum').sum())
+            alias_name: Alias name (original column name without pre-agg suffix)
+
+        Returns:
+            Call node for expr.alias('alias_name')
+        """
+        return cst.Call(
+            func=cst.Attribute(
+                value=expr,
+                attr=cst.Name('alias')
+            ),
+            args=[cst.Arg(value=cst.SimpleString(f"'{alias_name}'"))]
+        )
+
     def _transform_aliased_agg(self, node: cst.Call) -> cst.Call:
         """
         Transform aliased aggregation: pl.col('col').sum().alias('total')
 
-        Transforms the inner aggregation and preserves the alias.
+        Transforms the inner aggregation and preserves the user's explicit alias.
+        Does not add automatic column normalization since user has provided their own alias.
         """
-        # Transform the inner aggregation
+        # Transform the inner aggregation without adding automatic alias
+        # (user's explicit alias takes precedence)
         inner_agg = node.func.value
-        transformed_inner = self._transform_simple_agg(inner_agg)
+        transformed_inner = self._transform_simple_agg(inner_agg, add_alias=False)
 
-        # Rebuild with transformed inner and same alias
+        # Rebuild with transformed inner and same user-provided alias
         return node.with_changes(
             func=node.func.with_changes(
                 value=transformed_inner
