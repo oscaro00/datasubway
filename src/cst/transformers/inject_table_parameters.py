@@ -66,6 +66,49 @@ class InjectTableParameters(cst.CSTTransformer):
         self.current_function = None
         return updated_node
 
+    def leave_Assign(
+        self,
+        original_node: cst.Assign,
+        updated_node: cst.Assign
+    ) -> cst.Assign:
+        """
+        Process assignment statements to inject table() parameters.
+        """
+        # Only transform in target function
+        if self.current_function != self.function_name:
+            return updated_node
+
+        # Try to transform the assigned value
+        transformed_value = self._transform_expression(updated_node.value)
+
+        if transformed_value is not updated_node.value:
+            return updated_node.with_changes(value=transformed_value)
+
+        return updated_node
+
+    def leave_AnnAssign(
+        self,
+        original_node: cst.AnnAssign,
+        updated_node: cst.AnnAssign
+    ) -> cst.AnnAssign:
+        """
+        Process annotated assignment statements to inject table() parameters.
+        """
+        # Only transform in target function
+        if self.current_function != self.function_name:
+            return updated_node
+
+        if updated_node.value is None:
+            return updated_node
+
+        # Try to transform the assigned value
+        transformed_value = self._transform_expression(updated_node.value)
+
+        if transformed_value is not updated_node.value:
+            return updated_node.with_changes(value=transformed_value)
+
+        return updated_node
+
     def leave_Return(
         self,
         original_node: cst.Return,
@@ -104,9 +147,9 @@ class InjectTableParameters(cst.CSTTransformer):
                 group_by_cols = self._extract_group_by_cols(node)
                 agg_cols = self._extract_agg_cols(node)
 
-                # If we found columns, inject parameters into the table() call
-                if group_by_cols or agg_cols:
-                    return self._inject_parameters(node, root_table_call, group_by_cols, agg_cols)
+                # Always inject parameters, even if empty (dm.table needs them)
+                # This handles cases like .filter([]).group_by([]).agg(...) where no columns are extracted
+                return self._inject_parameters(node, root_table_call, group_by_cols, agg_cols)
 
         return node
 

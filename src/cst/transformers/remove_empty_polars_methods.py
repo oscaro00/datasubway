@@ -94,6 +94,9 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
                     # First, try to get chain from the ORIGINAL prev_call (before any transformations)
                     if isinstance(prev_call.func, cst.Attribute):
                         chain_before_groupby = prev_call.func.value
+                        # Skip any empty method calls in the chain (e.g., .filter([]))
+                        # This ensures we don't create invalid code like .filter([]).select(...)
+                        chain_before_groupby = self._skip_empty_methods_in_chain(chain_before_groupby)
 
                     # If we couldn't extract the chain, don't transform
                     if chain_before_groupby is None:
@@ -162,6 +165,75 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
             return len(arg.value.elements) == 0
 
         return False
+
+    def _skip_empty_methods_in_chain(self, node: cst.BaseExpression) -> cst.BaseExpression:
+        """
+        Recursively skip empty method calls in a chain to find the first non-empty call.
+
+        This is used when transforming .group_by([]).agg() to .select() to ensure
+        we don't include empty .filter([]) or other empty methods in the chain.
+
+        For example, with .filter([]).group_by([]), this returns the chain before .filter([]).
+
+        Args:
+            node: The node to start checking from
+
+        Returns:
+            The first non-empty node in the chain, or the original node if no empty methods found
+        """
+        current = node
+        while isinstance(current, cst.Call) and self._is_empty_method_call(current):
+            if isinstance(current.func, cst.Attribute):
+                current = current.func.value
+            else:
+                break
+        return current
+
+    def _ensure_table_has_parameters(self, node: cst.BaseExpression) -> cst.BaseExpression:
+        """
+        Ensure that if node is a dm.table() call, it has the required parameters.
+
+        If dm.table() is called with only the table name, add default empty parameters:
+        dm.table('sales') -> dm.table('sales', [], {})
+
+        Args:
+            node: The node to check and potentially modify
+
+        Returns:
+            The node with parameters added if it was a bare table() call, otherwise unchanged
+        """
+        # Check if this is a Call node
+        if not isinstance(node, cst.Call):
+            return node
+
+        # Check if this is a .table() call
+        if not isinstance(node.func, cst.Attribute):
+            return node
+
+        if node.func.attr.value != 'table':
+            return node
+
+        # Check if it's dm.table() or similar
+        if isinstance(node.func.value, cst.Name):
+            valid_var_names = ['dm', 'self', 'data_model']
+            if node.func.value.value not in valid_var_names:
+                return node
+        else:
+            return node
+
+        # Count positional arguments
+        positional_args = [arg for arg in node.args if arg.keyword is None]
+
+        # If it has only 1 argument (table name), add default empty parameters
+        if len(positional_args) == 1:
+            # Add empty list and empty dict as default parameters
+            new_args = list(node.args) + [
+                cst.Arg(value=cst.List(elements=[])),  # Empty list for group_by_cols
+                cst.Arg(value=cst.Dict(elements=[]))   # Empty dict for agg_cols
+            ]
+            return node.with_changes(args=new_args)
+
+        return node
 
     def _is_group_by_method(self, node: cst.Call) -> bool:
         """

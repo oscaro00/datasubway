@@ -531,3 +531,53 @@ class TestComplexMeasures:
 
         assert len(result) == 1  # Single aggregated row
         assert 'revenue' in result.columns
+    
+    # ========================================================================
+    # MULTI-STEP MEASURES
+    # ========================================================================
+
+    def test_percent_of_total(self, datamodel_with_pre_aggs):
+        """Test measure that calculates a percentage of total or share"""
+        dm = datamodel_with_pre_aggs
+
+        @measure(dm)
+        def store_share_of_revenue(qc):
+            numerator = (
+                dm.table('sales')
+                .filter(Allow('*', context=qc.get('filter')))
+                .group_by(Allow('*', include=['stores.store_id'], context=qc.get('group', [])))
+                .agg(pl.col('revenue').sum().alias('numerator_revenue'))
+            )
+            
+            total_denominator = (
+                dm.table('sales')
+                .filter(Exclude('stores.*', context=qc.get('filter')))
+                .group_by(Exclude('stores.*', context=qc.get('group', [])))
+                .agg(pl.col('revenue').sum().alias('total_revenue'))
+            )
+            
+            if len(qc.get('group')) >= 1:
+                return (
+                    numerator
+                    .join(total_denominator, on=qc.get('group'), how='inner')
+                    .group_by(Allow('*', include=['stores.store_id'], context=qc.get('group', [])))
+                    .agg(
+                        (pl.col('numerator_revenue') / pl.col('total_revenue') * 100).round(1).alias('revenue_percentage')
+                    )
+                )
+            else:
+                return (
+                    numerator
+                    .join(total_denominator, how='cross')
+                    .group_by(Allow('*', include=['stores.store_id'], context=qc.get('group', [])))
+                    .agg(
+                        (pl.col('numerator_revenue') / pl.col('total_revenue') * 100).round(1).first().alias('revenue_percentage')
+                    )
+                )
+        
+        result = dm.query(
+            query_context={'measure' : ['store_share_of_revenue']},
+            output_type='data'
+        )
+
+        print(result)
