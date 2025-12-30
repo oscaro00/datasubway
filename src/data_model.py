@@ -967,6 +967,92 @@ class DataModel:
         # output_type == 'data'
         return result.collect()
 
+    def show_measure_transformation(
+        self: Self,
+        query_context: Dict[str, Any],
+        verbose: bool = True
+    ) -> Dict[str, str]:
+        """
+        Show how a single measure is transformed through each step of the transformation pipeline.
+
+        This debugging method applies each transformer sequentially and captures the code state
+        after each transformation, making it easy to understand how a measure is parsed.
+
+        Args:
+            query_context: Query context dictionary with required 'measure' key containing
+                          exactly ONE measure name. Also supports optional 'filter', 'group',
+                          'sort', 'limit', 'offset', 'allow_pre_aggs' keys.
+            verbose: If True, print each transformation step to console. If False, only return
+                    the dictionary.
+
+        Returns:
+            Dictionary mapping transformer names to code state after each transformation.
+            Keys are numbered (e.g., '0_original', '1_resolve_table_columns', etc.)
+            Values are either the transformed code string or None for skipped steps.
+
+        Raises:
+            ValueError: If query_context doesn't contain exactly one measure
+            KeyError: If the measure name is not registered
+            Exception: If query_context is empty (from QueryContext validation)
+
+        Example:
+            >>> dm = DataModel(...)
+            >>>
+            >>> # Display transformation steps with verbose output
+            >>> steps = dm.show_measure_transformation(
+            ...     {'measure': ['total_revenue'], 'group': ['item_id']},
+            ...     verbose=True
+            ... )
+            >>>
+            >>> # Get steps programmatically without printing
+            >>> steps = dm.show_measure_transformation(
+            ...     {'measure': ['total_revenue'], 'group': ['item_id']},
+            ...     verbose=False
+            ... )
+            >>> print(steps['3_replace_table_calls'])
+        """
+        from query_context.query_context import QueryContext
+
+        # Validate and wrap query context
+        qc = QueryContext(query_context)
+
+        # Extract measure names
+        if 'measure' not in qc.context:
+            raise TypeError("Query context must include 'measure' key")
+
+        measure_names = qc.context['measure']
+
+        # Validate exactly one measure
+        if not isinstance(measure_names, list):
+            raise ValueError(
+                f"show_measure_transformation() requires 'measure' to be a list, "
+                f"got {type(measure_names).__name__}"
+            )
+
+        if len(measure_names) != 1:
+            raise ValueError(
+                f"show_measure_transformation() requires exactly one measure, "
+                f"got {len(measure_names)}: {measure_names}"
+            )
+
+        measure_name = measure_names[0]
+
+        # Validate measure exists
+        if measure_name not in self.measures:
+            raise KeyError(
+                f"Measure '{measure_name}' not registered. "
+                f"Available: {list(self.measures.keys())}"
+            )
+
+        # Process measure with tracking
+        transformation_steps = self._process_single_measure_with_tracking(measure_name, qc)
+
+        # Print if verbose
+        if verbose:
+            self._print_transformation_steps(measure_name, transformation_steps)
+
+        return transformation_steps
+
     def _process_single_measure(
         self: Self,
         measure_name: str,
@@ -1090,6 +1176,153 @@ class DataModel:
             )
 
         return current_code, lazy_frame
+
+    def _process_single_measure_with_tracking(
+        self: Self,
+        measure_name: str,
+        query_context: QueryContext
+    ) -> Dict[str, str]:
+        """
+        Process one measure through transformation pipeline, tracking each step.
+
+        This method duplicates the transformation pipeline from _process_single_measure()
+        but stores the code state after each transformation step instead of executing
+        the final code. Used by show_measure_transformation() for debugging.
+
+        Args:
+            measure_name: Name of measure to process
+            query_context: QueryContext instance
+
+        Returns:
+            Dictionary mapping step names to code state after each transformation.
+            Keys are numbered (e.g., '0_original', '1_resolve_table_columns').
+            Values are either code strings or None for skipped steps.
+        """
+        import inspect
+        import textwrap
+        from cst.transformers.replace_context_with_table_columns import resolve_table_columns
+        from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
+        from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
+        from cst.transformers.replace_table_calls import replace_table_calls
+
+        steps = {}
+
+        # Extract source code
+        measure_func = self.measures[measure_name]
+        source_code = textwrap.dedent(inspect.getsource(measure_func))
+
+        # Extract decorator variable name BEFORE stripping decorator lines
+        decorator_variable_name = extract_decorator_variable_name(
+            source_code=source_code,
+            function_name=measure_name
+        )
+
+        # Strip decorator lines (e.g., @measure(dm))
+        lines = source_code.split('\n')
+        def_line_idx = next((i for i, line in enumerate(lines) if line.strip().startswith('def ')), 0)
+        source_code = '\n'.join(lines[def_line_idx:])
+
+        # STEP 0: Original source code (after decorator strip)
+        current_code = source_code
+        steps['0_original'] = current_code
+
+        # STEP 1: Resolve Allow/Exclude to column lists
+        current_code = resolve_table_columns(
+            source_code=current_code,
+            function_name=measure_name,
+            runtime_context={'qc': query_context.context},
+            output_type='polar_col'
+        )
+        steps['1_resolve_table_columns'] = current_code
+
+        # STEP 2: Inject parameters into table() calls
+        from cst.transformers.inject_table_parameters import inject_table_parameters
+        valid_var_names = ['dm', 'self', 'data_model']
+        if decorator_variable_name is not None:
+            valid_var_names.append(decorator_variable_name)
+
+        current_code = inject_table_parameters(
+            source_code=current_code,
+            function_name=measure_name,
+            runtime_context={'qc': query_context.context, 'valid_var_names': valid_var_names}
+        )
+        steps['2_inject_table_parameters'] = current_code
+
+        # STEP 3: Replace dm.table() calls with actual LazyFrame code
+        replace_context = {'dm': self, 'self': self, 'data_model': self, 'qc': query_context.context}
+        if decorator_variable_name is not None:
+            replace_context[decorator_variable_name] = self
+
+        current_code = replace_table_calls(
+            source_code=current_code,
+            function_name=measure_name,
+            runtime_context=replace_context
+        )
+        steps['3_replace_table_calls'] = current_code
+
+        # STEP 4: Strip table prefixes from pl.col() calls
+        from cst.transformers.strip_table_prefixes import strip_table_prefixes
+        current_code = strip_table_prefixes(
+            source_code=current_code,
+            function_name=measure_name
+        )
+        steps['4_strip_table_prefixes'] = current_code
+
+        # STEP 5: Remove empty polars methods
+        current_code = remove_empty_polars_methods(
+            source_code=current_code,
+            function_name=measure_name
+        )
+        steps['5_remove_empty_polars_methods'] = current_code
+
+        # STEP 6: Transform pre-agg expressions (conditional)
+        if 'self.pre_agg_directory' in current_code:
+            current_code = transform_pre_agg_expressions(
+                source_code=current_code,
+                function_name=measure_name
+            )
+            steps['6_transform_pre_agg_expressions'] = current_code
+        else:
+            steps['6_transform_pre_agg_expressions'] = None  # Mark as skipped
+
+        return steps
+
+    def _print_transformation_steps(
+        self: Self,
+        measure_name: str,
+        steps: Dict[str, str]
+    ) -> None:
+        """
+        Pretty-print transformation steps to console.
+
+        Args:
+            measure_name: Name of the measure being transformed
+            steps: Dictionary of transformation steps from _process_single_measure_with_tracking()
+        """
+        print("=" * 79)
+        print(f"Transformation Pipeline for Measure: '{measure_name}'")
+        print("=" * 79)
+        print()
+
+        for i, (step_name, code) in enumerate(steps.items()):
+            # Extract readable step name (remove numbered prefix)
+            readable_name = step_name.split('_', 1)[1] if '_' in step_name else step_name
+
+            if code is None:
+                # Skipped step
+                print(f"[STEP {i}] After: {readable_name} [SKIPPED]")
+                print("-" * 79)
+                print()
+            else:
+                # Show transformed code
+                print(f"[STEP {i}] After: {readable_name}")
+                print("-" * 79)
+                print(code)
+                print()
+
+        print("=" * 79)
+        print("Transformation Complete")
+        print("=" * 79)
 
     def _combine_measure_results(
         self: Self,

@@ -49,7 +49,6 @@ The purpose of this library is to define a data model using python focusing on t
 
 - Complex measure testing with a more complete example
   - Checking that pre aggregation calculations work correctly
-- Ability to show the steps of a measure being transformed by the transformers
 - Logging solution
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
   - Could also display logs
