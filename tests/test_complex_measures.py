@@ -559,7 +559,7 @@ class TestComplexMeasures:
     # MULTI-STEP MEASURES
     # ========================================================================
 
-    def test_percent_of_total(self, datamodel_with_pre_aggs, complex_sales_data):
+    def test_percent_of_total_measure(self, datamodel_with_pre_aggs, complex_sales_data):
         """Test measure that calculates a percentage of total or share"""
         dm = datamodel_with_pre_aggs
 
@@ -630,3 +630,33 @@ class TestComplexMeasures:
         assert_frame_equal(result, polars_result)
 
         # dm.show_measure_transformation(query_context={'measure' : ['store_share_of_revenue']}, verbose=True)
+    
+    def test_3_day_rolling_average_revenue_measure(self, datamodel_with_pre_aggs, complex_sales_data):
+        """Test measure that calculates average revenue over a 3 day rolling window"""
+        dm = datamodel_with_pre_aggs
+        
+        @measure(dm)
+        def rolling_3_day_average_revenue(qc):
+            return (
+                dm.table('sales')
+                .filter(Allow('*', context=qc.get('filter')))
+                .sort('sales.date')
+                .group_by_dynamic('sales.date', every='1d', period='3d', group_by=Allow('*', context=qc.get('group')))
+                .agg(
+                    pl.col('revenue').mean().alias('average_3_day_rolling_revenue')
+                )
+            )
+        
+        query_result = dm.query(
+            query_context={'measure' : ['rolling_3_day_average_revenue'], 'filter' : ('stores.store_name', '!=', 'Store_1'), 'group' : ['stores.store_name'], 'sort' : [('stores.store_name', 'desc'), ('sales.date', 'asc')]},
+            output_type='query'
+        )
+
+        print(query_result)
+
+        result = dm.query(
+            query_context={'measure' : ['rolling_3_day_average_revenue'], 'filter' : ('stores.store_name', '!=', 'Store_1'), 'group' : ['stores.store_name'], 'sort' : [('stores.store_name', 'desc'), ('sales.date', 'asc')]},
+            output_type='data'
+        )
+
+        print(result)

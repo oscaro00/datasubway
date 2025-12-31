@@ -5,7 +5,7 @@ import libcst as cst
 # Polars-specific methods that indicate a polars method chain
 POLARS_METHODS = {
     'select', 'filter', 'with_columns', 'drop', 'rename', 'sort',
-    'limit', 'offset', 'group_by', 'dynamic_group_by', 'rolling_group_by',
+    'limit', 'offset', 'group_by', 'group_by_dynamic', 'rolling',
     'agg', 'join', 'join_asof', 'collect', 'lazy', 'head', 'tail',
     'unique', 'drop_nulls', 'fill_null', 'fill_nan', 'with_row_index',
     'cast', 'explode', 'melt', 'pivot', 'unpivot', 'sample', 'shuffle',
@@ -14,7 +14,7 @@ POLARS_METHODS = {
 }
 
 # Group by variants that are valid before .agg()
-GROUP_BY_VARIANTS = {'group_by', 'dynamic_group_by', 'rolling_group_by'}
+GROUP_BY_VARIANTS = {'group_by', 'group_by_dynamic', 'rolling'}
 
 
 def _remove_subchains(chains: List['MethodChain']) -> List['MethodChain']:
@@ -258,7 +258,7 @@ def validate_measure_method_chain(source_code: str, function_name: str) -> Tuple
         if not polars_chains:
             return False, (
                 f"Measure '{function_name}' must contain at least one polars method chain "
-                f"ending with .group_by().agg() (or .dynamic_group_by().agg() / .rolling_group_by().agg())"
+                f"ending with .group_by().agg() (or .group_by_dynamic().agg() / .rolling().agg())"
             )
 
         # Sort by line number to find the LAST chain
@@ -289,7 +289,7 @@ def validate_measure_method_chain(source_code: str, function_name: str) -> Tuple
             # Has .agg() but not preceded by group_by variant
             return False, (
                 f"Measure '{function_name}' - the last polars method chain must end with one of: "
-                f".group_by().agg(), .dynamic_group_by().agg(), or .rolling_group_by().agg(). "
+                f".group_by().agg(), .group_by_dynamic().agg(), or .rolling().agg(). "
                 f"Last chain: {' -> '.join(last_chain.methods)}"
             )
 

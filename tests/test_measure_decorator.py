@@ -19,9 +19,10 @@ class TestMeasureDecorator:
         tables = {
             'sales': pl.LazyFrame({
                 'item_id': [1, 2, 3],
+                'date': ['2024-01-01', '2024-01-02', '2024-01-03'],
                 'revenue': [100, 200, 300],
                 'quantity': [10, 20, 30]
-            })
+            }).with_columns(pl.col('date').str.to_date())
         }
         return DataModel(
             tables=tables,
@@ -48,27 +49,27 @@ class TestMeasureDecorator:
         assert 'total_revenue' in simple_datamodel.measures
         assert simple_datamodel.measures['total_revenue'] == total_revenue
 
-    def test_measure_with_dynamic_group_by_agg(self, simple_datamodel):
-        """Test that .dynamic_group_by().agg() is accepted."""
+    def test_measure_with_group_by_dynamic_agg(self, simple_datamodel):
+        """Test that .group_by_dynamic().agg() is accepted."""
 
         @measure(simple_datamodel)
         def dynamic_revenue():
             return (
                 simple_datamodel.tables['sales']
-                .dynamic_group_by('item_id')
+                .group_by_dynamic('date', every='1d')
                 .agg(pl.col('revenue').sum())
             )
 
         assert 'dynamic_revenue' in simple_datamodel.measures
 
-    def test_measure_with_rolling_group_by_agg(self, simple_datamodel):
-        """Test that .rolling_group_by().agg() is accepted."""
+    def test_measure_with_rolling_agg(self, simple_datamodel):
+        """Test that .rolling().agg() is accepted."""
 
         @measure(simple_datamodel)
         def rolling_revenue():
             return (
                 simple_datamodel.tables['sales']
-                .rolling_group_by('item_id')
+                .rolling(index_column='date', period='3d')
                 .agg(pl.col('revenue').sum())
             )
 

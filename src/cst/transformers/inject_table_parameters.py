@@ -208,7 +208,7 @@ class InjectTableParameters(cst.CSTTransformer):
 
     def _extract_group_by_cols(self, node: cst.BaseExpression) -> List[str]:
         """
-        Extract column names from .group_by() calls in the method chain.
+        Extract column names from .group_by(), .group_by_dynamic(), and .rolling() calls in the method chain.
 
         Returns:
             List of column names with table prefixes (e.g., ['products.product_name'])
@@ -217,10 +217,31 @@ class InjectTableParameters(cst.CSTTransformer):
 
         # Find all .group_by() calls
         group_by_calls = self._find_method_calls(node, 'group_by')
-
         for call in group_by_calls:
             # Extract columns from the list argument
             cols = self._extract_columns_from_call_args(call)
+            columns.update(cols)
+
+        # Find all .group_by_dynamic() calls
+        group_by_dynamic_calls = self._find_method_calls(node, 'group_by_dynamic')
+        for call in group_by_dynamic_calls:
+            # Extract first positional arg (index/time column)
+            cols = self._extract_columns_from_call_args(call)
+            columns.update(cols)
+
+            # Extract columns from group_by= keyword argument
+            cols = self._extract_columns_from_keyword_arg(call, 'group_by')
+            columns.update(cols)
+
+        # Find all .rolling() calls
+        rolling_calls = self._find_method_calls(node, 'rolling')
+        for call in rolling_calls:
+            # Extract columns from index_column= keyword argument
+            cols = self._extract_columns_from_keyword_arg(call, 'index_column')
+            columns.update(cols)
+
+            # Extract columns from group_by= keyword argument (if present)
+            cols = self._extract_columns_from_keyword_arg(call, 'group_by')
             columns.update(cols)
 
         return sorted(list(columns))
@@ -294,6 +315,30 @@ class InjectTableParameters(cst.CSTTransformer):
 
         return columns
 
+    def _extract_columns_from_keyword_arg(self, call: cst.Call, keyword_name: str) -> List[str]:
+        """
+        Extract column names from a specific keyword argument.
+
+        Handles: .group_by_dynamic(..., group_by=[pl.col('store_name')])
+                .rolling(index_column='date', ...)
+
+        Args:
+            call: The Call node
+            keyword_name: Name of the keyword argument (e.g., 'group_by', 'index_column')
+
+        Returns:
+            List of column names
+        """
+        columns = []
+
+        for arg in call.args:
+            if arg.keyword is not None and arg.keyword.value == keyword_name:
+                # Found the keyword argument, extract columns from its value
+                cols = self._extract_columns_from_expression(arg.value)
+                columns.extend(cols)
+
+        return columns
+
     def _extract_columns_from_expression(self, expr: cst.BaseExpression) -> List[str]:
         """
         Extract column names from an expression.
@@ -301,6 +346,7 @@ class InjectTableParameters(cst.CSTTransformer):
         Handles:
         - List: [pl.col('col1'), pl.col('col2')]
         - Single pl.col() call
+        - String literal: 'column_name'
         """
         columns = []
 
@@ -312,6 +358,11 @@ class InjectTableParameters(cst.CSTTransformer):
         elif isinstance(expr, cst.Call):
             # Check if this is pl.col('column_name')
             col_name = self._extract_column_from_pl_col(expr)
+            if col_name:
+                columns.append(col_name)
+        elif isinstance(expr, cst.SimpleString):
+            # Handle raw string column names like 'sales.date'
+            col_name = expr.value.strip('\'"')
             if col_name:
                 columns.append(col_name)
 

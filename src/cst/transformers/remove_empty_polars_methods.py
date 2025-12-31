@@ -145,7 +145,7 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
         method_name = node.func.attr.value
         polars_dataframe_methods = {
             'filter', 'select', 'drop', 'with_columns', 'rename',
-            'sort', 'group_by', 'dynamic_group_by', 'rolling',
+            'sort', 'group_by', 'group_by_dynamic', 'rolling',
             'drop_nulls', 'unique', 'explode'
         }
         if method_name not in polars_dataframe_methods:
@@ -237,7 +237,7 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
 
     def _is_group_by_method(self, node: cst.Call) -> bool:
         """
-        Check if this is a group_by/dynamic_group_by/rolling method.
+        Check if this is a group_by/group_by_dynamic/rolling method.
 
         Args:
             node: Call node to check
@@ -249,7 +249,7 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
             return False
 
         method_name = node.func.attr.value
-        return method_name in ['group_by', 'dynamic_group_by', 'rolling']
+        return method_name in ['group_by', 'group_by_dynamic', 'rolling']
 
     def _is_agg_method(self, node: cst.Call) -> bool:
         """

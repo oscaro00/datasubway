@@ -104,17 +104,17 @@ def another_function():
         assert result.count('.select(pl.col(\'y\').sum())') == 1
         assert result.count('.group_by([]).agg(pl.col(\'x\').sum())') == 1
 
-    def test_empty_dynamic_group_by(self):
-        """Test that empty .dynamic_group_by([]) is removed."""
+    def test_empty_group_by_dynamic(self):
+        """Test that empty .group_by_dynamic([]) is removed."""
         code = """
 def my_measure():
-    return df.dynamic_group_by([]).agg(pl.col('x').sum())
+    return df.group_by_dynamic([]).agg(pl.col('x').sum())
 """
         result = remove_empty_polars_methods(code, 'my_measure')
-        assert '.dynamic_group_by([])' not in result
+        assert '.group_by_dynamic([])' not in result
         assert '.select(pl.col(\'x\').sum())' in result
 
-    def test_empty_rolling_group_by(self):
+    def test_empty_rolling(self):
         """Test that empty .rolling([]) is removed."""
         code = """
 def my_measure():

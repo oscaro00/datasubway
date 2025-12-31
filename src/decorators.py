@@ -13,7 +13,7 @@ def measure(data_model_instance: DataModel) -> Callable:
     This decorator:
     1. Validates that the function name is unique (not already in data_model.measures)
     2. Validates that the last polars method chain ends with .group_by().agg()
-       (or .dynamic_group_by().agg() / .rolling_group_by().agg())
+       (or .group_by_dynamic().agg() / .rolling().agg())
     3. Registers the function in data_model.measures
 
     All validation occurs at decoration time (when @measure is applied), ensuring
