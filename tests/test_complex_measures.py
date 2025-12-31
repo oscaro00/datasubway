@@ -603,8 +603,6 @@ class TestComplexMeasures:
             output_type='data'
         )
 
-        print(result)
-
         polars_num = (
             complex_sales_data
             .group_by('store_id')
@@ -631,7 +629,7 @@ class TestComplexMeasures:
 
         # dm.show_measure_transformation(query_context={'measure' : ['store_share_of_revenue']}, verbose=True)
     
-    def test_3_day_rolling_average_revenue_measure(self, datamodel_with_pre_aggs, complex_sales_data):
+    def test_3_day_rolling_average_revenue_measure(self, datamodel_with_pre_aggs, complex_sales_data, stores_data):
         """Test measure that calculates average revenue over a 3 day rolling window"""
         dm = datamodel_with_pre_aggs
         
@@ -646,17 +644,123 @@ class TestComplexMeasures:
                     pl.col('revenue').mean().alias('average_3_day_rolling_revenue')
                 )
             )
-        
-        query_result = dm.query(
-            query_context={'measure' : ['rolling_3_day_average_revenue'], 'filter' : ('stores.store_name', '!=', 'Store_1'), 'group' : ['stores.store_name'], 'sort' : [('stores.store_name', 'desc'), ('sales.date', 'asc')]},
-            output_type='query'
-        )
-
-        print(query_result)
 
         result = dm.query(
-            query_context={'measure' : ['rolling_3_day_average_revenue'], 'filter' : ('stores.store_name', '!=', 'Store_1'), 'group' : ['stores.store_name'], 'sort' : [('stores.store_name', 'desc'), ('sales.date', 'asc')]},
+            query_context={
+                'measure' : ['rolling_3_day_average_revenue'], 
+                'filter' : ('stores.store_name', '!=', 'Store_1'), 
+                'group' : ['stores.store_name'], 
+                'sort' : [('stores.store_name', 'desc'), ('sales.date', 'asc')]
+            },
+            output_type='data'
+        )
+
+        polars_result = (
+            complex_sales_data
+            .join(stores_data, on='store_id', how='left')
+            .filter(pl.col('store_name') != 'Store_1')
+            .sort('date')
+            .group_by_dynamic('date', every='1d', period='3d', group_by='store_name')
+            .agg(pl.col('revenue').mean().alias('average_3_day_rolling_revenue'))
+            .sort(['store_name', 'date'], descending=[True, False])
+            .collect()
+        )
+
+        assert_frame_equal(result, polars_result)
+    
+    def test_prior_day_revenue_measure(self, datamodel_with_pre_aggs, complex_sales_data, stores_data):
+        """Test measure that calculates prior day revenue"""
+        dm = datamodel_with_pre_aggs
+
+        @measure(dm)
+        def prior_day_revenue(qc):
+            return (
+                dm.table('sales', qc.get('group', []), {}, allow_pre_aggs=False)
+                .filter(Allow('*', context=qc.get('filter')))
+                .with_columns(
+                    (pl.col('sales.date') + pl.duration(days=1)).alias('date')
+                )
+                .group_by(Allow('*', include=['sales.date'], context=qc.get('group', [])))
+                .agg(
+                    pl.col('revenue').sum().alias('prior_day_revenue')
+                )
+            )
+
+        result = dm.query(
+            query_context={
+                'measure': ['prior_day_revenue'],
+                'group': ['stores.store_name', 'sales.date'],
+                'sort': [('sales.date', 'asc'), ('stores.store_name', 'asc')]
+            },
             output_type='data'
         )
 
         print(result)
+
+        polars_result = (
+            complex_sales_data
+            .join(stores_data, on='store_id', how='left')
+            .with_columns(
+                (pl.col('date') + pl.duration(days=1)).alias('date')
+            )
+            .group_by(['date', 'store_name'])
+            .agg(pl.col('revenue').sum().alias('prior_day_revenue'))
+            .sort(['date', 'store_name'])
+            .collect()
+        )
+
+        assert_frame_equal(result, polars_result, check_column_order=False)
+
+    def test_week_to_date_revenue_measure(self, datamodel_with_pre_aggs, complex_sales_data, products_data):
+        """Test measure that calculates week-to-date revenue (Sunday-based weeks)"""
+        dm = datamodel_with_pre_aggs
+
+        @measure(dm)
+        def wtd_revenue(qc):
+            return (
+                dm.table('sales', qc.get('group', []), {}, allow_pre_aggs=False)
+                .filter(Allow('*', context=qc.get('filter')))
+                .with_columns([
+                    ((pl.col('date') + pl.duration(days=1)).dt.truncate('1w') - pl.duration(days=1)).alias('week_start')
+                ])
+                .sort(Allow('*', context=qc.get('group', [])))
+                .with_columns([
+                    pl.col('revenue').cum_sum().over(Exclude('sales.date', include=['week_start'], context=qc.get('group', []))).alias('wtd_revenue')
+                ])
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(
+                    pl.col('wtd_revenue').max()
+                )
+            )
+
+        result = dm.query(
+            query_context={
+                'measure': ['wtd_revenue'],
+                'filter': ('sales.quantity', '>', 5),
+                'group': ['products.category', 'sales.date'],
+                'sort': [('products.category', 'asc'), ('sales.date', 'asc')]
+            },
+            output_type='data'
+        )
+
+        print(result.head(30))
+
+        # Polars baseline uses hardcoded columns for validation (this is expected)
+        polars_result = (
+            complex_sales_data
+            .join(products_data, on='item_id', how='left')
+            .filter(pl.col('quantity') > 5)
+            .with_columns([
+                ((pl.col('date') + pl.duration(days=1)).dt.truncate('1w') - pl.duration(days=1)).alias('week_start')
+            ])
+            .sort(['category', 'date'])
+            .with_columns([
+                pl.col('revenue').cum_sum().over(['category', 'week_start']).alias('wtd_revenue')
+            ])
+            .group_by(['category', 'date'])
+            .agg(pl.col('wtd_revenue').max())
+            .sort(['category', 'date'])
+            .collect()
+        )
+
+        assert_frame_equal(result, polars_result, check_column_order=False)

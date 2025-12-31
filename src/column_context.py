@@ -342,7 +342,8 @@ class Allow:
         # Add include columns
         for tbl_col in self.include_columns:
             if isinstance(tbl_col, tuple):
-                col_str = f"{tbl_col[0]}.{tbl_col[1]}"
+                # Only add table prefix dot if column name is not empty
+                col_str = f"{tbl_col[0]}.{tbl_col[1]}" if tbl_col[1] else tbl_col[0]
                 if col_str not in filtered:
                     filtered.append(col_str)
 
@@ -363,7 +364,8 @@ class Allow:
         # Add include columns (default to 'asc')
         for tbl_col in self.include_columns:
             if isinstance(tbl_col, tuple):
-                col_str = f"{tbl_col[0]}.{tbl_col[1]}"
+                # Only add table prefix dot if column name is not empty
+                col_str = f"{tbl_col[0]}.{tbl_col[1]}" if tbl_col[1] else tbl_col[0]
                 if not any(col == col_str for col, _ in filtered):
                     filtered.append((col_str, 'asc'))
 
@@ -698,7 +700,8 @@ class Exclude:
         # Add include columns
         for tbl_col in self.include_columns:
             if isinstance(tbl_col, tuple):
-                col_str = f"{tbl_col[0]}.{tbl_col[1]}"
+                # Only add table prefix dot if column name is not empty
+                col_str = f"{tbl_col[0]}.{tbl_col[1]}" if tbl_col[1] else tbl_col[0]
                 if col_str not in filtered:
                     filtered.append(col_str)
 
@@ -719,7 +722,8 @@ class Exclude:
         # Add include columns (default to 'asc')
         for tbl_col in self.include_columns:
             if isinstance(tbl_col, tuple):
-                col_str = f"{tbl_col[0]}.{tbl_col[1]}"
+                # Only add table prefix dot if column name is not empty
+                col_str = f"{tbl_col[0]}.{tbl_col[1]}" if tbl_col[1] else tbl_col[0]
                 if not any(col == col_str for col, _ in filtered):
                     filtered.append((col_str, 'asc'))
 
