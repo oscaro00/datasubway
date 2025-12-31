@@ -1,5 +1,6 @@
 import pytest
 import polars as pl
+from polars.testing import assert_frame_equal
 from pathlib import Path
 import sys
 import tempfile
@@ -40,6 +41,16 @@ class TestComplexMeasures:
             'quantity': [1 + (i % 20) for i in range(100)],
             'cost': [60.0 + (i * 6.3) for i in range(100)],
             'discount': [5.0 + (i * 0.5) for i in range(100)],
+        },
+        schema={
+            'transaction_id' : pl.Int64,
+            'item_id' : pl.Int64,
+            'store_id' : pl.Int64,
+            'date' : pl.Date,
+            'revenue' : pl.Float64,
+            'quantity' : pl.Int64,
+            'cost' : pl.Float64,
+            'discount' : pl.Float64
         })
 
     @pytest.fixture
@@ -50,6 +61,12 @@ class TestComplexMeasures:
             'product_name': [f'Product_{i}' for i in range(1, 11)],
             'category': ['Electronics' if i % 3 == 0 else 'Clothing' if i % 3 == 1 else 'Food' for i in range(1, 11)],
             'brand': [f'Brand_{i % 3}' for i in range(1, 11)],
+        },
+        schema={
+            'item_id' : pl.Int64,
+            'product_name' : pl.String,
+            'category' : pl.String,
+            'brand' : pl.String
         })
 
     @pytest.fixture
@@ -60,6 +77,12 @@ class TestComplexMeasures:
             'store_name': [f'Store_{i}' for i in range(1, 6)],
             'region': ['North' if i <= 2 else 'South' for i in range(1, 6)],
             'size': ['Large' if i % 2 == 0 else 'Small' for i in range(1, 6)],
+        },
+        schema={
+            'store_id' : pl.Int64,
+            'store_name' : pl.String,
+            'region' : pl.String,
+            'size' : pl.String
         })
 
     @pytest.fixture
@@ -536,7 +559,7 @@ class TestComplexMeasures:
     # MULTI-STEP MEASURES
     # ========================================================================
 
-    def test_percent_of_total(self, datamodel_with_pre_aggs):
+    def test_percent_of_total(self, datamodel_with_pre_aggs, complex_sales_data):
         """Test measure that calculates a percentage of total or share"""
         dm = datamodel_with_pre_aggs
 
@@ -581,5 +604,29 @@ class TestComplexMeasures:
         )
 
         print(result)
+
+        polars_num = (
+            complex_sales_data
+            .group_by('store_id')
+            .agg(pl.col('revenue').sum().alias('numerator_revenue'))
+        )
+
+        polars_denom = (
+            complex_sales_data
+            .select(pl.col('revenue').sum().alias('total_revenue'))
+        )
+
+        polars_result = (
+            polars_num
+            .join(polars_denom, how='cross')
+            .group_by('store_id')
+            .agg(
+                (pl.col('numerator_revenue') / pl.col('total_revenue') * 100).round(1).first().alias('revenue_percentage')
+            )
+            .sort('store_id', descending=False)
+            .collect()
+        )
+
+        assert_frame_equal(result, polars_result)
 
         # dm.show_measure_transformation(query_context={'measure' : ['store_share_of_revenue']}, verbose=True)
