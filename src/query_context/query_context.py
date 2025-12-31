@@ -57,6 +57,40 @@ class QueryContext:
                         except (TypeError, ValueError) as e:
                             raise ValueError(f"Invalid filter: {e}") from e
 
+                case 'having':
+                    # Validate having structure (skip if None)
+                    if val is not None:
+                        try:
+                            # Allow unprefixed columns for having (aggregated column names)
+                            having_obj = Filter(val, allow_unprefixed_columns=True)
+                        except (TypeError, ValueError) as e:
+                            raise ValueError(f"Invalid having clause: {e}") from e
+
+                case 'sort':
+                    # Validate sort structure (skip if None)
+                    if val is not None:
+                        if not isinstance(val, list):
+                            raise TypeError(f"sort must be a list of tuples, got: {type(val).__name__}")
+
+                        for i, sort_item in enumerate(val):
+                            if not isinstance(sort_item, tuple):
+                                raise TypeError(f"sort[{i}] must be a tuple, got: {type(sort_item).__name__}")
+
+                            if len(sort_item) != 2:
+                                raise ValueError(
+                                    f"sort[{i}] must be a tuple of (column, direction), got length {len(sort_item)}"
+                                )
+
+                            column, direction = sort_item
+
+                            if not isinstance(column, str):
+                                raise TypeError(f"sort[{i}] column must be a string, got: {type(column).__name__}")
+
+                            if direction not in ('asc', 'desc'):
+                                raise ValueError(
+                                    f"sort[{i}] direction must be 'asc' or 'desc', got: '{direction}'"
+                                )
+
                 case 'allow_pre_aggs':
                     if not isinstance(val, bool):
                         raise TypeError('allow_pre_aggs must be a boolean')
@@ -72,6 +106,12 @@ class QueryContext:
 
         if 'filter' not in self.context.keys():
             self.context['filter'] = None
+
+        if 'having' not in self.context.keys():
+            self.context['having'] = None
+
+        if 'sort' not in self.context.keys():
+            self.context['sort'] = None
 
         if 'group' not in self.context.keys():
             self.context['group'] = []
@@ -97,3 +137,16 @@ class QueryContext:
 
         filter_obj = Filter(self.context['filter'])
         return filter_obj.get_columns()
+
+    def get_having_columns(self) -> List[str]:
+        """
+        Extract all column references from the having clause.
+
+        Returns:
+            List of column names in 'table_name.column_name' format
+        """
+        if 'having' not in self.context or self.context['having'] is None:
+            return []
+
+        having_obj = Filter(self.context['having'])
+        return having_obj.get_columns()

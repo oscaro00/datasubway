@@ -72,9 +72,15 @@ class Filter:
         })
     """
 
-    def __init__(self, filter_expr: FilterExpression) -> None:
-        """Initialize and validate the filter expression."""
+    def __init__(self, filter_expr: FilterExpression, allow_unprefixed_columns: bool = False) -> None:
+        """Initialize and validate the filter expression.
+
+        Args:
+            filter_expr: The filter expression to validate
+            allow_unprefixed_columns: If True, allows columns without table prefix (for having clauses)
+        """
         self.filter_expr = filter_expr
+        self.allow_unprefixed_columns = allow_unprefixed_columns
         self.validate()
 
     def validate(self) -> None:
@@ -178,21 +184,23 @@ class Filter:
         if not column:
             raise ValueError("Column name cannot be empty")
 
-        # Validate column format: table_name.column_name
-        if '.' not in column:
+        # Validate column format: table_name.column_name (unless unprefixed columns are allowed)
+        if '.' in column:
+            # Column has a prefix, validate it
+            parts = column.split('.')
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Column '{column}' must have exactly one dot (table_name.column_name)"
+                )
+
+            if not parts[0] or not parts[1]:
+                raise ValueError(
+                    f"Column '{column}' has empty table or column name"
+                )
+        elif not self.allow_unprefixed_columns:
+            # Column has no prefix and unprefixed columns are not allowed
             raise ValueError(
                 f"Column '{column}' must be in 'table_name.column_name' format"
-            )
-
-        parts = column.split('.')
-        if len(parts) != 2:
-            raise ValueError(
-                f"Column '{column}' must have exactly one dot (table_name.column_name)"
-            )
-
-        if not parts[0] or not parts[1]:
-            raise ValueError(
-                f"Column '{column}' has empty table or column name"
             )
 
         # Validate operator

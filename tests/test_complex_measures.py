@@ -576,8 +576,10 @@ class TestComplexMeasures:
                 )
         
         result = dm.query(
-            query_context={'measure' : ['store_share_of_revenue']},
+            query_context={'measure' : ['store_share_of_revenue'], 'sort' : [('stores.store_id', 'asc')]},
             output_type='data'
         )
 
         print(result)
+
+        # dm.show_measure_transformation(query_context={'measure' : ['store_share_of_revenue']}, verbose=True)
