@@ -85,6 +85,10 @@ class StripTablePrefixes(cst.CSTTransformer):
         if self._is_sort_call(updated_node):
             return self._strip_from_sort_call(updated_node)
 
+        # Check if this is a join() call
+        if self._is_join_call(updated_node):
+            return self._strip_from_join_call(updated_node)
+
         return updated_node
 
     def _strip_from_pl_col(self, node: cst.Call) -> cst.Call:
@@ -196,6 +200,61 @@ class StripTablePrefixes(cst.CSTTransformer):
                     quote_char = arg.value.value[0]
                     new_value = cst.SimpleString(f"{quote_char}{stripped_name}{quote_char}")
                     new_arg = arg.with_changes(value=new_value)
+                    new_args.append(new_arg)
+                    continue
+
+            # Keep argument unchanged
+            new_args.append(arg)
+
+        return node.with_changes(args=new_args)
+
+    def _is_join_call(self, node: cst.Call) -> bool:
+        """Check if this is a join() call."""
+        if not isinstance(node.func, cst.Attribute):
+            return False
+
+        return node.func.attr.value == 'join'
+
+    def _strip_from_join_call(self, node: cst.Call) -> cst.Call:
+        """
+        Strip table prefixes from join() call arguments.
+
+        Handles:
+        - .join(other, on='table.column') → .join(other, on='column')
+        - .join(other, on=['table.col1', 'table.col2']) → .join(other, on=['col1', 'col2'])
+        - .join(other, left_on='table.col1', right_on='table.col2') → strips both
+        """
+        new_args = []
+
+        for arg in node.args:
+            # Handle 'on' keyword argument
+            if arg.keyword is not None and arg.keyword.value in ['on', 'left_on', 'right_on']:
+                # String literal
+                if isinstance(arg.value, cst.SimpleString):
+                    column_name = arg.value.value.strip('\'"')
+                    if '.' in column_name:
+                        stripped_name = column_name.split('.', 1)[1]
+                        quote_char = arg.value.value[0]
+                        new_value = cst.SimpleString(f"{quote_char}{stripped_name}{quote_char}")
+                        new_arg = arg.with_changes(value=new_value)
+                        new_args.append(new_arg)
+                        continue
+                # List of strings
+                elif isinstance(arg.value, cst.List):
+                    new_elements = []
+                    for element in arg.value.elements:
+                        if isinstance(element.value, cst.SimpleString):
+                            column_name = element.value.value.strip('\'"')
+                            if '.' in column_name:
+                                stripped_name = column_name.split('.', 1)[1]
+                                quote_char = element.value.value[0]
+                                new_value = cst.SimpleString(f"{quote_char}{stripped_name}{quote_char}")
+                                new_element = element.with_changes(value=new_value)
+                                new_elements.append(new_element)
+                                continue
+                        new_elements.append(element)
+                    new_list = arg.value.with_changes(elements=new_elements)
+                    new_arg = arg.with_changes(value=new_list)
                     new_args.append(new_arg)
                     continue
 

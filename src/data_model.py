@@ -690,6 +690,11 @@ class DataModel:
                         if agg_func in pre_funcs:
                             found_match = True
                             break
+                        # Special case: 'rank' can use 'sum' pre-aggregations
+                        # rank() operates on aggregated values, so it can work with summed data
+                        elif agg_func == 'rank' and 'sum' in pre_funcs:
+                            found_match = True
+                            break
 
                 if not found_match:
                     all_match = False
@@ -1118,7 +1123,11 @@ class DataModel:
         current_code = inject_table_parameters(
             source_code=current_code,
             function_name=measure_name,
-            runtime_context={'qc': query_context.context, 'valid_var_names': valid_var_names}
+            runtime_context={
+                'qc': query_context.context,
+                'valid_var_names': valid_var_names,
+                'table_schemas': self.table_schemas
+            }
         )
 
         # 3. Replace dm.table() calls with actual LazyFrame code (joins)
@@ -1248,7 +1257,11 @@ class DataModel:
         current_code = inject_table_parameters(
             source_code=current_code,
             function_name=measure_name,
-            runtime_context={'qc': query_context.context, 'valid_var_names': valid_var_names}
+            runtime_context={
+                'qc': query_context.context,
+                'valid_var_names': valid_var_names,
+                'table_schemas': self.table_schemas
+            }
         )
         steps['2_inject_table_parameters'] = current_code
 

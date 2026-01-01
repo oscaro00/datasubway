@@ -20,7 +20,7 @@ Example:
     >>> # data_model.table('sales', ['products.product_name'], {'sales.revenue': 'sum'})
 """
 
-from typing import Dict, Any, Optional, List, Set
+from typing import Dict, Any, Optional, List, Set, Tuple
 import libcst as cst
 import libcst.matchers as m
 
@@ -244,26 +244,108 @@ class InjectTableParameters(cst.CSTTransformer):
             cols = self._extract_columns_from_keyword_arg(call, 'group_by')
             columns.update(cols)
 
+        # Also extract non-aggregated columns from .select() calls
+        select_group_cols, _ = self._extract_select_params(node)
+        columns.update(select_group_cols)
+
         return sorted(list(columns))
 
     def _extract_agg_cols(self, node: cst.BaseExpression) -> Dict[str, str]:
         """
         Extract column names and aggregation functions from .agg() calls.
 
+        Only includes columns that exist in the base table's schema.
+        Columns from joins or calculations are excluded.
+
         Returns:
             Dict mapping column -> agg function (e.g., {'sales.revenue': 'sum'})
         """
+        # Find the base table name from dm.table() call
+        base_table = self._extract_table_name_from_chain(node)
+
         agg_cols: Dict[str, str] = {}
 
         # Find all .agg() calls
         agg_calls = self._find_method_calls(node, 'agg')
 
         for call in agg_calls:
-            # Extract aggregations from the call arguments
+            # Extract aggregations and filter by base_table schema
             aggs = self._extract_aggregations_from_call_args(call)
-            agg_cols.update(aggs)
+
+            # Filter: only include columns that exist in base table
+            if base_table:
+                for col, agg_func in aggs.items():
+                    if self._column_exists_in_table(col, base_table):
+                        agg_cols[col] = agg_func
+                    # else: skip columns not in base table (from joins/calculations)
+            else:
+                # No table context, include all (backward compatibility)
+                agg_cols.update(aggs)
+
+        # Also extract aggregations from .select() calls
+        _, select_agg_cols = self._extract_select_params(node)
+
+        # Filter select agg cols same way
+        if base_table:
+            filtered_select_aggs = {
+                col: func for col, func in select_agg_cols.items()
+                if self._column_exists_in_table(col, base_table)
+            }
+            agg_cols.update(filtered_select_aggs)
+        else:
+            agg_cols.update(select_agg_cols)
 
         return agg_cols
+
+    def _extract_select_params(
+        self,
+        node: cst.BaseExpression
+    ) -> Tuple[List[str], Dict[str, str]]:
+        """
+        Extract group_by columns and aggregations from .select() calls.
+
+        In .select() calls:
+        - Columns WITHOUT aggregation methods → group_by_cols
+        - Columns WITH aggregation methods → agg_cols
+
+        Args:
+            node: Expression node to analyze
+
+        Returns:
+            Tuple of (group_by_cols, agg_cols)
+
+        Example:
+            .select(
+                pl.col('item_id'),           # → group_by_cols
+                pl.col('revenue').rank()     # → agg_cols
+            )
+        """
+        group_by_cols = []
+        agg_cols = {}
+
+        # Find all .select() calls in the method chain
+        select_calls = self._find_method_calls(node, 'select')
+
+        for select_call in select_calls:
+            # Process each argument in the .select() call
+            for arg in select_call.args:
+                # Try to extract column name and aggregation function
+                result = self._extract_column_and_agg(arg.value)
+
+                if result:
+                    col_name, agg_func = result
+
+                    if agg_func:
+                        # Has aggregation → add to agg_cols
+                        # Strip table prefix for consistency
+                        clean_col = col_name.split('.')[-1] if '.' in col_name else col_name
+                        agg_cols[clean_col] = agg_func
+                    else:
+                        # No aggregation → add to group_by_cols
+                        if col_name not in group_by_cols:
+                            group_by_cols.append(col_name)
+
+        return group_by_cols, agg_cols
 
     def _find_method_calls(self, node: cst.BaseExpression, method_name: str) -> List[cst.Call]:
         """
@@ -296,6 +378,48 @@ class InjectTableParameters(cst.CSTTransformer):
             pass
 
         return calls
+
+    def _extract_table_name_from_chain(self, node: cst.BaseExpression) -> Optional[str]:
+        """
+        Extract table name from dm.table('table_name') call in chain.
+
+        Returns:
+            Table name string or None if not found
+        """
+        # Find table() call in the chain
+        table_call = self._find_table_call_root(node)
+
+        if table_call and len(table_call.args) > 0:
+            # Extract table name from first argument
+            first_arg = table_call.args[0].value
+            if isinstance(first_arg, cst.SimpleString):
+                return first_arg.value.strip('\'"')
+
+        return None
+
+    def _column_exists_in_table(self, col_name: str, table_name: str) -> bool:
+        """
+        Check if column exists in the specified table's schema.
+
+        Args:
+            col_name: Column name (with or without table prefix)
+            table_name: Table name to check
+
+        Returns:
+            True if column exists in table schema, False otherwise
+        """
+        table_schemas = self.runtime_context.get('table_schemas', {})
+
+        # No schema context available - include all columns (backward compatibility)
+        if not table_schemas or table_name not in table_schemas:
+            return True
+
+        schema_cols = table_schemas[table_name]
+
+        # Strip table prefix if present
+        clean_col = col_name.split('.')[-1] if '.' in col_name else col_name
+
+        return clean_col in schema_cols
 
     def _extract_columns_from_call_args(self, call: cst.Call) -> List[str]:
         """
@@ -462,7 +586,7 @@ class InjectTableParameters(cst.CSTTransformer):
                 method_name = current.func.attr.value
 
                 # Check if this is an aggregation method
-                if method_name in ['sum', 'mean', 'max', 'min', 'count', 'first', 'last', 'std', 'var']:
+                if method_name in ['sum', 'mean', 'max', 'min', 'count', 'first', 'last', 'std', 'var', 'rank']:
                     agg_func = method_name
 
                 # Traverse to the object being called on

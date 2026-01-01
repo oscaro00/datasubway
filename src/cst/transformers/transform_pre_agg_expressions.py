@@ -5,10 +5,14 @@ This module provides a libcst transformer that:
 1. Detects if code uses pre-aggregations (by looking for self.pre_agg_directory)
 2. Transforms column names in .agg() expressions to match pre-agg column naming
 3. Decomposes complex aggregations (mean, std, var) into formulas using stored components
+4. Transforms window functions (rank) to operate on pre-aggregated columns
 
 Example transformations:
     >>> # Simple aggregation
     >>> pl.col('revenue').sum()  →  pl.col('revenue-sum').sum()
+
+    >>> # Window function
+    >>> pl.col('revenue').rank('min', descending=True)  →  pl.col('revenue-sum').rank('min', descending=True)
 
     >>> # Decomposed aggregation
     >>> pl.col('revenue').mean()  →  pl.col('revenue-mean-sum').sum() / pl.col('revenue-mean-count').sum()
@@ -45,23 +49,6 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         self.pre_agg_metadata = pre_agg_metadata
         self.current_function: Optional[str] = None
         self.inside_agg: int = 0  # Track nesting level
-        self.uses_pre_agg: Optional[bool] = None
-
-    def visit_Module(self, node: cst.Module) -> None:
-        """
-        Scan entire module to detect pre-agg usage.
-
-        Looks for self.pre_agg_directory to determine if this code
-        is using a pre-aggregation.
-        """
-        # Use libcst matcher to find: self.pre_agg_directory
-        pre_agg_pattern = m.Attribute(
-            value=m.Name('self'),
-            attr=m.Name('pre_agg_directory')
-        )
-
-        matches = m.findall(node, pre_agg_pattern)
-        self.uses_pre_agg = len(matches) > 0
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
         """Track which function we're currently visiting."""
@@ -76,6 +63,102 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         self.current_function = None
         return updated_node
 
+    def _is_part_of_pre_agg_chain(self, node: cst.Call) -> bool:
+        """
+        Check if this node is part of a chain that starts with a pre-agg scan.
+
+        Walks up the tree looking for: pl.scan_parquet(...pre_agg_directory...)
+
+        IMPORTANT: Stops at .join() calls. If we encounter a join before reaching
+        the pre-agg scan, returns False because expressions after joins may operate
+        on joined data, not pre-agg columns.
+
+        Args:
+            node: Call node to check
+
+        Returns:
+            True if part of pre-agg chain (before any joins), False otherwise
+        """
+        current = node
+
+        while True:
+            # Check if current node is pl.scan_parquet with pre_agg_directory
+            if self._is_pre_agg_scan(current):
+                return True
+
+            # Check if current node is a .join() call - stop here!
+            # Expressions after joins may operate on joined data, not pre-agg data
+            if self._is_join_call(current):
+                return False
+
+            # Try to go up one level in the chain
+            if isinstance(current.func, cst.Attribute) and isinstance(current.func.value, cst.Call):
+                current = current.func.value
+            else:
+                # Reached the top of the chain
+                return False
+
+    def _is_join_call(self, node: cst.Call) -> bool:
+        """
+        Check if this is a .join() method call.
+
+        Args:
+            node: Call node to check
+
+        Returns:
+            True if this is a .join() call
+        """
+        if not isinstance(node.func, cst.Attribute):
+            return False
+        return node.func.attr.value == 'join'
+
+    def _is_pre_agg_scan(self, node: cst.Call) -> bool:
+        """
+        Check if this is a pl.scan_parquet call with pre_agg_directory path.
+
+        Pattern: pl.scan_parquet(self.pre_agg_directory / 'xxx.parquet')
+
+        Args:
+            node: Call node to check
+
+        Returns:
+            True if this is a pre-agg scan
+        """
+        # Check if it's pl.scan_parquet
+        if not isinstance(node.func, cst.Attribute):
+            return False
+        if node.func.attr.value != 'scan_parquet':
+            return False
+        if not isinstance(node.func.value, cst.Name) or node.func.value.value != 'pl':
+            return False
+
+        # Check if argument contains pre_agg_directory
+        if len(node.args) == 0:
+            return False
+
+        # Look for BinaryOperation with pre_agg_directory (path / 'file.parquet')
+        arg = node.args[0].value
+        return self._contains_pre_agg_directory(arg)
+
+    def _contains_pre_agg_directory(self, node: cst.BaseExpression) -> bool:
+        """
+        Recursively check if expression contains self.pre_agg_directory.
+
+        Args:
+            node: Expression node to check
+
+        Returns:
+            True if contains self.pre_agg_directory
+        """
+        if isinstance(node, cst.Attribute):
+            return (node.attr.value == 'pre_agg_directory' and
+                    isinstance(node.value, cst.Name) and
+                    node.value.value == 'self')
+        elif isinstance(node, cst.BinaryOperation):
+            return (self._contains_pre_agg_directory(node.left) or
+                    self._contains_pre_agg_directory(node.right))
+        return False
+
     def leave_Call(
         self,
         original_node: cst.Call,
@@ -84,17 +167,19 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         """
         Transform aggregation expressions in .agg() calls when using pre-agg.
 
+        Only transforms expressions that are part of a pre-aggregation chain.
+
         Returns:
             Transformed call node or expression
         """
-        # Only transform in target function and when using pre-agg
-        if (self.current_function != self.function_name or
-            not self.uses_pre_agg):
+        # Only transform in target function
+        if self.current_function != self.function_name:
             return updated_node
 
-        # If this is an .agg() or .select() call, transform its arguments
+        # Only transform if this specific call is part of a pre-agg chain
         if self._is_agg_method(updated_node) or self._is_select_method(updated_node):
-            return self._transform_agg_call(updated_node)
+            if self._is_part_of_pre_agg_chain(updated_node):
+                return self._transform_agg_call(updated_node)
 
         return updated_node
 
@@ -182,7 +267,7 @@ class TransformPreAggExpressions(cst.CSTTransformer):
 
         # Check if func is an aggregation method
         agg_func = node.func.attr.value
-        if agg_func not in ['sum', 'min', 'max', 'count', 'len', 'mean', 'std', 'var', 'first', 'last']:
+        if agg_func not in ['sum', 'min', 'max', 'count', 'len', 'mean', 'std', 'var', 'first', 'last', 'rank']:
             return False
 
         # Check if the value is a pl.col() call
@@ -236,6 +321,14 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         if self._has_pre_agg_suffix(clean_col):
             return node
 
+        # Check if this column is in the pre-agg metadata
+        # Only transform columns that are actually in the pre-aggregation
+        if self.pre_agg_metadata:
+            pre_agg_cols = self.pre_agg_metadata.get('aggregations', {})
+            if clean_col not in pre_agg_cols:
+                # Column not in pre-agg (e.g., from join) - don't transform
+                return node
+
         match agg_func:
             case 'sum':
                 transformed = self._build_simple_transform(node, clean_col, 'sum')
@@ -249,6 +342,8 @@ class TransformPreAggExpressions(cst.CSTTransformer):
                 transformed = self._build_simple_transform(node, clean_col, 'first')
             case 'last':
                 transformed = self._build_simple_transform(node, clean_col, 'last')
+            case 'rank':
+                transformed = self._build_rank_transform(node, clean_col)
             case 'mean':
                 transformed = self._build_mean_transform(clean_col)
             case 'std':
@@ -365,6 +460,46 @@ class TransformPreAggExpressions(cst.CSTTransformer):
                 attr=cst.Name(agg_func)
             ),
             args=[]
+        )
+
+    def _build_rank_transform(
+        self,
+        original_node: cst.Call,
+        col_name: str
+    ) -> cst.Call:
+        """
+        Build rank transformation: pl.col('col').rank(...) → pl.col('col-sum').rank(...)
+
+        Unlike simple aggregations, rank() is a window function that operates on
+        pre-aggregated values. We transform the column name but preserve all
+        rank() arguments (method, descending, seed).
+
+        Args:
+            original_node: Original rank() call node
+            col_name: Clean column name (without table prefix)
+
+        Returns:
+            Transformed call with new column name and preserved rank() arguments
+        """
+        # Use 'sum' as the default pre-agg suffix for rank operations
+        new_col_name = f'{col_name}-sum'
+
+        # Build pl.col('col-sum')
+        new_col_call = cst.Call(
+            func=cst.Attribute(
+                value=cst.Name('pl'),
+                attr=cst.Name('col')
+            ),
+            args=[cst.Arg(value=cst.SimpleString(f"'{new_col_name}'"))]
+        )
+
+        # Build pl.col('col-sum').rank(...) with preserved arguments
+        return cst.Call(
+            func=cst.Attribute(
+                value=new_col_call,
+                attr=cst.Name('rank')
+            ),
+            args=original_node.args  # KEY: Preserve all rank() arguments
         )
 
     def _build_mean_transform(self, col_name: str) -> cst.BinaryOperation:

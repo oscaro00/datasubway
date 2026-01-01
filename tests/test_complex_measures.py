@@ -764,3 +764,52 @@ class TestComplexMeasures:
         )
 
         assert_frame_equal(result, polars_result, check_column_order=False)
+    
+    def test_product_rank_by_revenue_measure(self, datamodel_with_pre_aggs, complex_sales_data, products_data):
+        """Test measure that calculates the product rank by revenue"""
+        dm = datamodel_with_pre_aggs
+
+        @measure(dm)
+        def product_rank_by_revenue(qc):
+            product_rank = (
+                dm.table('sales')
+                .filter(Allow('*', context=qc.get('filter')))
+                .select(
+                    pl.col('sales.item_id'),
+                    pl.col('sales.revenue').rank('min', descending=True).alias('product_rank')
+                )
+            )
+            
+            return (
+                dm.table('sales')
+                .filter(Allow('*', context=qc.get('filter')))
+                .join(product_rank, on='sales.item_id', how='inner')
+                .group_by(Allow('*', include=['sales.item_id'], context=qc.get('group')))
+                .agg(
+                    pl.col('product_rank').min().alias('product_rank')
+                )
+            )
+        
+        query_result = dm.query(
+            query_context={
+                'measure': ['product_rank_by_revenue'],
+                # 'filter': ('sales.quantity', '>', 5),
+                # 'group': ['products.category', 'sales.date'],
+                'sort': [('sales.item_id', 'asc')]
+            },
+            output_type='query'
+        )
+
+        print(query_result)
+
+        result = dm.query(
+            query_context={
+                'measure': ['product_rank_by_revenue'],
+                # 'filter': ('sales.quantity', '>', 5),
+                # 'group': ['products.category', 'sales.date'],
+                'sort': [('sales.item_id', 'asc')]
+            },
+            output_type='data'
+        )
+
+        print(result)

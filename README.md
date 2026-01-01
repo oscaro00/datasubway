@@ -47,8 +47,7 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## TO DO
 
-- Complex measure testing with a more complete example
-  - Checking that pre aggregation calculations work correctly
+- Look at include parameter of the last group_by to understand which columns must exist in a group_by for the measure to be selected
 - Logging solution
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
   - Could also display logs
