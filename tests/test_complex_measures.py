@@ -771,37 +771,30 @@ class TestComplexMeasures:
 
         @measure(dm)
         def product_rank_by_revenue(qc):
+            # Step 1: Calculate TOTAL revenue per product, THEN rank those totals
+            # Specify pre-agg columns to enable pre-agg usage
             product_rank = (
-                dm.table('sales')
+                dm.table('sales', ['sales.item_id'], {'revenue': 'sum'})
                 .filter(Allow('*', context=qc.get('filter')))
-                .select(
-                    pl.col('sales.item_id'),
-                    pl.col('sales.revenue').rank('min', descending=True).alias('product_rank')
+                .group_by(Allow('*', include=['sales.item_id'], context=[]))  # Use Allow for proper transformation
+                .agg(pl.col('revenue').sum().alias('total_revenue'))
+                .with_columns(
+                    pl.col('total_revenue').rank('min', descending=True).alias('product_rank')
                 )
+                .select(pl.col('item_id'), pl.col('product_rank'))
             )
-            
+
+            # Step 2: Join ranks back and aggregate (use pre-agg with correct spec)
             return (
-                dm.table('sales')
+                dm.table('sales', ['sales.item_id'], {'revenue': 'sum'})
                 .filter(Allow('*', context=qc.get('filter')))
-                .join(product_rank, on='sales.item_id', how='inner')
+                .join(product_rank, on='item_id', how='inner')
                 .group_by(Allow('*', include=['sales.item_id'], context=qc.get('group')))
                 .agg(
-                    pl.col('product_rank').min().alias('product_rank')
+                    pl.col('product_rank').min().alias('product_rank'),
+                    pl.col('revenue').sum().alias('revenue')
                 )
             )
-        
-        query_result = dm.query(
-            query_context={
-                'measure': ['product_rank_by_revenue'],
-                # 'filter': ('sales.quantity', '>', 5),
-                # 'group': ['products.category', 'sales.date'],
-                'sort': [('sales.item_id', 'asc')]
-            },
-            output_type='query'
-        )
-
-        print(query_result)
-
         result = dm.query(
             query_context={
                 'measure': ['product_rank_by_revenue'],
@@ -813,3 +806,28 @@ class TestComplexMeasures:
         )
 
         print(result)
+
+        # Polars baseline: mirror the measure logic
+        polars_product_rank = (
+            complex_sales_data
+            .group_by('item_id')
+            .agg(pl.col('revenue').sum().alias('total_revenue'))
+            .with_columns(
+                pl.col('total_revenue').rank('min', descending=True).alias('product_rank')
+            )
+            .select('item_id', 'product_rank')
+        )
+
+        polars_result = (
+            complex_sales_data
+            .join(polars_product_rank, on='item_id', how='inner')
+            .group_by('item_id')
+            .agg(
+                pl.col('product_rank').min().alias('product_rank'),
+                pl.col('revenue').sum().alias('revenue')
+            )
+            .sort('item_id')
+            .collect()
+        )
+
+        assert_frame_equal(result, polars_result)

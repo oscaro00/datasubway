@@ -708,6 +708,38 @@ class DataModel:
 
         return None
 
+    def _extract_pre_agg_metadata_from_code(self: Self, code: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract pre-agg metadata from code by parsing the parquet filename.
+
+        Looks for pattern: pl.scan_parquet(self.pre_agg_directory / 'filename.parquet')
+        Returns the metadata for that pre-agg, or None if not found.
+
+        Args:
+            code: Source code to parse
+
+        Returns:
+            Pre-agg metadata dict or None if not found
+        """
+        import re
+
+        # Find parquet filename in code
+        pattern = r"self\.pre_agg_directory\s*/\s*['\"]([^'\"]+\.parquet)['\"]"
+        match = re.search(pattern, code)
+
+        if not match:
+            return None
+
+        parquet_filename = match.group(1)
+        pre_agg_name = parquet_filename.replace('.parquet', '')
+
+        # Find matching pre-agg metadata
+        for pre_agg in self.pre_agg_metadata:
+            if pre_agg['name'] == pre_agg_name:
+                return pre_agg
+
+        return None
+
     def _get_join_specs_for_columns(
         self: Self,
         columns: List[str],
@@ -1157,9 +1189,12 @@ class DataModel:
 
         # 6. Transform pre-agg expressions (only if using pre-agg)
         if 'self.pre_agg_directory' in current_code:
+            # Extract pre-agg metadata from code to know which columns exist in pre-agg
+            pre_agg_metadata = self._extract_pre_agg_metadata_from_code(current_code)
             current_code = transform_pre_agg_expressions(
                 source_code=current_code,
-                function_name=measure_name
+                function_name=measure_name,
+                pre_agg_metadata=pre_agg_metadata
             )
 
         # Execute transformed code
@@ -1294,9 +1329,12 @@ class DataModel:
 
         # STEP 6: Transform pre-agg expressions (conditional)
         if 'self.pre_agg_directory' in current_code:
+            # Extract pre-agg metadata from code to know which columns exist in pre-agg
+            pre_agg_metadata = self._extract_pre_agg_metadata_from_code(current_code)
             current_code = transform_pre_agg_expressions(
                 source_code=current_code,
-                function_name=measure_name
+                function_name=measure_name,
+                pre_agg_metadata=pre_agg_metadata
             )
             steps['6_transform_pre_agg_expressions'] = current_code
         else:

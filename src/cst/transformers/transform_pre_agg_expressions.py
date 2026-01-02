@@ -67,17 +67,17 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         """
         Check if this node is part of a chain that starts with a pre-agg scan.
 
-        Walks up the tree looking for: pl.scan_parquet(...pre_agg_directory...)
+        Walks up the method chain looking for: pl.scan_parquet(...pre_agg_directory...)
 
-        IMPORTANT: Stops at .join() calls. If we encounter a join before reaching
-        the pre-agg scan, returns False because expressions after joins may operate
-        on joined data, not pre-agg columns.
+        Note: Continues searching even past .join() calls, since columns from the
+        pre-agg are still available after joins. The _has_pre_agg_suffix() check
+        will prevent transforming columns from joined tables.
 
         Args:
             node: Call node to check
 
         Returns:
-            True if part of pre-agg chain (before any joins), False otherwise
+            True if part of pre-agg chain, False otherwise
         """
         current = node
 
@@ -86,31 +86,12 @@ class TransformPreAggExpressions(cst.CSTTransformer):
             if self._is_pre_agg_scan(current):
                 return True
 
-            # Check if current node is a .join() call - stop here!
-            # Expressions after joins may operate on joined data, not pre-agg data
-            if self._is_join_call(current):
-                return False
-
             # Try to go up one level in the chain
             if isinstance(current.func, cst.Attribute) and isinstance(current.func.value, cst.Call):
                 current = current.func.value
             else:
                 # Reached the top of the chain
                 return False
-
-    def _is_join_call(self, node: cst.Call) -> bool:
-        """
-        Check if this is a .join() method call.
-
-        Args:
-            node: Call node to check
-
-        Returns:
-            True if this is a .join() call
-        """
-        if not isinstance(node.func, cst.Attribute):
-            return False
-        return node.func.attr.value == 'join'
 
     def _is_pre_agg_scan(self, node: cst.Call) -> bool:
         """
@@ -325,7 +306,12 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         # Only transform columns that are actually in the pre-aggregation
         if self.pre_agg_metadata:
             pre_agg_cols = self.pre_agg_metadata.get('aggregations', {})
-            if clean_col not in pre_agg_cols:
+            # Check if clean_col matches any column in pre-agg (strip table prefixes from both)
+            col_found = any(
+                clean_col == (pre_col.split('.')[-1] if '.' in pre_col else pre_col)
+                for pre_col in pre_agg_cols.keys()
+            )
+            if not col_found:
                 # Column not in pre-agg (e.g., from join) - don't transform
                 return node
 
