@@ -47,7 +47,13 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## TO DO
 
+- Bigger change: feed the Allow() and Exclude() calls into the table() call when the measure is defined, then there are fewer moving parts when a measure is called
+  - Allow()/Exclude() calls from filter(), group_by(), with_columns(), select() [no aggregation applied] should go in the group_by part of table()
+  - Allow()/Exclude() calls from agg() and select() [with aggregation applied] should go in the agg part of table()
+  - It is important feeding Allow() and Exclude() into table() calls only happens within a polars method chain
+
 - Look at include parameter of the last group_by to understand which columns must exist in a group_by for the measure to be selected
+  - Would also need the rest of the Allow() and Exclude() to understand with the context
 - Logging solution
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
   - Could also display logs

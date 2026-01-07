@@ -185,6 +185,13 @@ class TestComplexMeasures:
                     'sales.revenue': ['sum', 'mean'],
                     'sales.quantity': 'sum',
                 }
+            },
+            'sales_by_date_store' : {
+                'group_by': ['sales.date', 'sales.store_id'],
+                'aggregations': {
+                    'sales.revenue': ['sum', 'mean'],
+                    'sales.quantity': 'sum',
+                }
             }
         }
 
@@ -710,6 +717,31 @@ class TestComplexMeasures:
         )
 
         assert_frame_equal(result, polars_result, check_column_order=False)
+
+        # Measure transformation testing example for presentation
+        # @measure(dm)
+        # def prior_day_revenue2(qc):
+        #     return (
+        #         dm.table('sales')
+        #         .filter(Allow('*', context=qc.get('filter')))
+        #         .with_columns(
+        #             (pl.col('sales.date') + pl.duration(days=1)).alias('date')
+        #         )
+        #         .group_by(Allow('*', include=['sales.date'], context=qc.get('group', [])))
+        #         .agg(
+        #             pl.col('revenue').sum().alias('prior_day_revenue')
+        #         )
+        #     )
+
+        # result = dm.show_measure_transformation(
+        #     query_context={
+        #         'measure': ['prior_day_revenue2'],
+        #         'group': ['sales.store_id'],
+        #         'sort': [('sales.store_id', 'asc'), ('sales.date', 'asc')],
+        #         'allow_pre_aggs': True
+        #     },
+        #     verbose=True
+        # )
 
     def test_week_to_date_revenue_measure(self, datamodel_with_pre_aggs, complex_sales_data, products_data):
         """Test measure that calculates week-to-date revenue (Sunday-based weeks)"""
