@@ -20,6 +20,7 @@ Example transformations:
 
 from typing import Optional, Union
 import libcst as cst
+import libcst.matchers as m
 
 
 class RemoveEmptyPolarsMethods(cst.CSTTransformer):
@@ -42,7 +43,6 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
         super().__init__()
         self.function_name = function_name
         self.current_function: Optional[str] = None
-        self.last_method_was_empty_group_by: bool = False
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
         """Track which function we're currently visiting."""
@@ -55,7 +55,6 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
     ) -> cst.FunctionDef:
         """Reset function tracking when leaving."""
         self.current_function = None
-        self.last_method_was_empty_group_by = False
         return updated_node
 
     def leave_Call(
@@ -113,58 +112,28 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
                     )
             return updated_node
 
-        # Remove empty group_by methods
-        if self._is_group_by_method(updated_node) and self._is_empty_method_call(updated_node):
-            # Remove this call by returning the chain before it
-            if isinstance(updated_node.func, cst.Attribute):
-                return updated_node.func.value
-            return updated_node
-
-        # Remove other empty method calls
+        # Remove empty method calls
         if self._is_empty_method_call(updated_node):
-            if isinstance(updated_node.func, cst.Attribute):
-                return updated_node.func.value
+            return updated_node.func.value
 
         return updated_node
 
     def _is_empty_method_call(self, node: cst.Call) -> bool:
-        """
-        Check if method call has a single empty list argument.
-
-        Args:
-            node: Call node to check
-
-        Returns:
-            True if this is a method call with empty list argument
-        """
-        # Must be method call (has Attribute func)
-        if not isinstance(node.func, cst.Attribute):
-            return False
-
-        # Only check specific polars DataFrame methods
-        method_name = node.func.attr.value
+        """Check if method call has a single empty list argument."""
         polars_dataframe_methods = {
             'filter', 'select', 'drop', 'with_columns', 'rename',
             'sort', 'group_by', 'group_by_dynamic', 'rolling',
             'drop_nulls', 'unique', 'explode'
         }
-        if method_name not in polars_dataframe_methods:
-            return False
-
-        # Must have exactly one argument
-        if len(node.args) != 1:
-            return False
-
-        # Argument must not be keyword arg
-        arg = node.args[0]
-        if arg.keyword is not None:
-            return False
-
-        # Argument must be empty list
-        if isinstance(arg.value, cst.List):
-            return len(arg.value.elements) == 0
-
-        return False
+        return m.matches(
+            node,
+            m.Call(
+                func=m.Attribute(
+                    attr=m.Name(m.MatchIfTrue(lambda name: name in polars_dataframe_methods))
+                ),
+                args=[m.Arg(keyword=None, value=m.List(elements=[]))]
+            )
+        )
 
     def _skip_empty_methods_in_chain(self, node: cst.BaseExpression) -> cst.BaseExpression:
         """
@@ -189,82 +158,20 @@ class RemoveEmptyPolarsMethods(cst.CSTTransformer):
                 break
         return current
 
-    def _ensure_table_has_parameters(self, node: cst.BaseExpression) -> cst.BaseExpression:
-        """
-        Ensure that if node is a dm.table() call, it has the required parameters.
-
-        If dm.table() is called with only the table name, add default empty parameters:
-        dm.table('sales') -> dm.table('sales', [], {})
-
-        Args:
-            node: The node to check and potentially modify
-
-        Returns:
-            The node with parameters added if it was a bare table() call, otherwise unchanged
-        """
-        # Check if this is a Call node
-        if not isinstance(node, cst.Call):
-            return node
-
-        # Check if this is a .table() call
-        if not isinstance(node.func, cst.Attribute):
-            return node
-
-        if node.func.attr.value != 'table':
-            return node
-
-        # Check if it's dm.table() or similar
-        if isinstance(node.func.value, cst.Name):
-            valid_var_names = ['dm', 'self', 'data_model']
-            if node.func.value.value not in valid_var_names:
-                return node
-        else:
-            return node
-
-        # Count positional arguments
-        positional_args = [arg for arg in node.args if arg.keyword is None]
-
-        # If it has only 1 argument (table name), add default empty parameters
-        if len(positional_args) == 1:
-            # Add empty list and empty dict as default parameters
-            new_args = list(node.args) + [
-                cst.Arg(value=cst.List(elements=[])),  # Empty list for group_by_cols
-                cst.Arg(value=cst.Dict(elements=[]))   # Empty dict for agg_cols
-            ]
-            return node.with_changes(args=new_args)
-
-        return node
-
     def _is_group_by_method(self, node: cst.Call) -> bool:
-        """
-        Check if this is a group_by/group_by_dynamic/rolling method.
-
-        Args:
-            node: Call node to check
-
-        Returns:
-            True if this is a group_by variant
-        """
-        if not isinstance(node.func, cst.Attribute):
-            return False
-
-        method_name = node.func.attr.value
-        return method_name in ['group_by', 'group_by_dynamic', 'rolling']
+        """Check if this is a group_by/group_by_dynamic/rolling method."""
+        return m.matches(
+            node,
+            m.Call(func=m.Attribute(attr=m.OneOf(
+                m.Name("group_by"),
+                m.Name("group_by_dynamic"),
+                m.Name("rolling")
+            )))
+        )
 
     def _is_agg_method(self, node: cst.Call) -> bool:
-        """
-        Check if this is an agg() method.
-
-        Args:
-            node: Call node to check
-
-        Returns:
-            True if this is an agg() call
-        """
-        if not isinstance(node.func, cst.Attribute):
-            return False
-
-        return node.func.attr.value == 'agg'
+        """Check if this is an agg() method."""
+        return m.matches(node, m.Call(func=m.Attribute(attr=m.Name("agg"))))
 
 
 def remove_empty_polars_methods(
