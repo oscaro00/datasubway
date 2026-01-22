@@ -21,6 +21,8 @@ Example:
 """
 
 from typing import Dict, Any, Optional, List, Set, Tuple
+import warnings
+
 import libcst as cst
 import libcst.matchers as m
 
@@ -139,7 +141,7 @@ class InjectTableParameters(cst.CSTTransformer):
         Recursively transform expressions to inject table() parameters.
         """
         # Handle method chains (Call nodes)
-        if isinstance(node, cst.Call):
+        if m.matches(node, m.Call()):
             # Check if this is the root of a table() call chain
             root_table_call = self._find_table_call_root(node)
             if root_table_call is not None:
@@ -168,18 +170,21 @@ class InjectTableParameters(cst.CSTTransformer):
         current = node
 
         while True:
-            if isinstance(current, cst.Call):
+            if m.matches(current, m.Call()):
+                call_node = cst.ensure_type(current, cst.Call)
                 # Check if this is a table() call
-                if self._is_table_call(current) and self._has_only_table_name(current):
-                    return current
+                if self._is_table_call(call_node) and self._has_only_table_name(call_node):
+                    return call_node
 
                 # If it's a method call, traverse to the object it's called on
-                if isinstance(current.func, cst.Attribute):
-                    current = current.func.value
+                if m.matches(call_node.func, m.Attribute()):
+                    func_attr = cst.ensure_type(call_node.func, cst.Attribute)
+                    current = func_attr.value
                 else:
                     break
-            elif isinstance(current, cst.Attribute):
-                current = current.value
+            elif m.matches(current, m.Attribute()):
+                attr_node = cst.ensure_type(current, cst.Attribute)
+                current = attr_node.value
             else:
                 break
 
@@ -187,16 +192,17 @@ class InjectTableParameters(cst.CSTTransformer):
 
     def _is_table_call(self, node: cst.Call) -> bool:
         """Check if this is a dm.table() or data_model.table() call."""
-        if not isinstance(node.func, cst.Attribute):
+        valid_var_names = self.runtime_context.get('valid_var_names', ['dm', 'self', 'data_model'])
+
+        # Use matcher to check structure: <name>.table(...)
+        if not m.matches(node, m.Call(func=m.Attribute(attr=m.Name('table')))):
             return False
 
-        if node.func.attr.value != 'table':
-            return False
-
-        if isinstance(node.func.value, cst.Name):
-            # Get valid variable names from runtime context, default to standard names
-            valid_var_names = self.runtime_context.get('valid_var_names', ['dm', 'self', 'data_model'])
-            return node.func.value.value in valid_var_names
+        # Check if the object is one of the valid variable names
+        if m.matches(node.func, m.Attribute(value=m.Name())):
+            func_attr = cst.ensure_type(node.func, cst.Attribute)
+            name_node = cst.ensure_type(func_attr.value, cst.Name)
+            return name_node.value in valid_var_names
 
         return False
 
@@ -358,26 +364,21 @@ class InjectTableParameters(cst.CSTTransformer):
         Returns:
             List of Call nodes matching the method name
         """
-        calls = []
+        # Use m.findall with a matcher for .method_name() calls
+        matcher = m.Call(func=m.Attribute(attr=m.Name(method_name)))
 
-        # Use a visitor to collect method calls
-        class MethodCallCollector(cst.CSTVisitor):
-            def visit_Call(self, node: cst.Call) -> None:
-                if isinstance(node.func, cst.Attribute):
-                    if node.func.attr.value == method_name:
-                        calls.append(node)
-
-        # Create a temporary module to visit
-        # Wrap the expression in a statement so we can visit it
         try:
+            # Wrap expression in a statement so we can use findall
             stmt = cst.SimpleStatementLine(body=[cst.Expr(value=node)])
-            collector = MethodCallCollector()
-            stmt.visit(collector)
-        except Exception:
-            # If wrapping fails, return empty list
-            pass
-
-        return calls
+            matches = m.findall(stmt, matcher)
+            return list(matches)
+        except (TypeError, ValueError) as e:
+            warnings.warn(
+                f"Failed to find method calls for '{method_name}': {type(e).__name__}: {e}",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            return []
 
     def _extract_table_name_from_chain(self, node: cst.BaseExpression) -> Optional[str]:
         """
@@ -392,8 +393,9 @@ class InjectTableParameters(cst.CSTTransformer):
         if table_call and len(table_call.args) > 0:
             # Extract table name from first argument
             first_arg = table_call.args[0].value
-            if isinstance(first_arg, cst.SimpleString):
-                return first_arg.value.strip('\'"')
+            if m.matches(first_arg, m.SimpleString()):
+                string_node = cst.ensure_type(first_arg, cst.SimpleString)
+                return string_node.value.strip('\'"')
 
         return None
 
@@ -474,19 +476,23 @@ class InjectTableParameters(cst.CSTTransformer):
         """
         columns = []
 
-        if isinstance(expr, cst.List):
-            for element in expr.elements:
-                if isinstance(element, cst.Element):
-                    cols = self._extract_columns_from_expression(element.value)
+        if m.matches(expr, m.List()):
+            list_node = cst.ensure_type(expr, cst.List)
+            for element in list_node.elements:
+                if m.matches(element, m.Element()):
+                    elem_node = cst.ensure_type(element, cst.Element)
+                    cols = self._extract_columns_from_expression(elem_node.value)
                     columns.extend(cols)
-        elif isinstance(expr, cst.Call):
+        elif m.matches(expr, m.Call()):
             # Check if this is pl.col('column_name')
-            col_name = self._extract_column_from_pl_col(expr)
+            call_node = cst.ensure_type(expr, cst.Call)
+            col_name = self._extract_column_from_pl_col(call_node)
             if col_name:
                 columns.append(col_name)
-        elif isinstance(expr, cst.SimpleString):
+        elif m.matches(expr, m.SimpleString()):
             # Handle raw string column names like 'sales.date'
-            col_name = expr.value.strip('\'"')
+            string_node = cst.ensure_type(expr, cst.SimpleString)
+            col_name = string_node.value.strip('\'"')
             if col_name:
                 columns.append(col_name)
 
@@ -499,22 +505,19 @@ class InjectTableParameters(cst.CSTTransformer):
         Returns:
             Column name as string (e.g., 'products.product_name') or None
         """
-        # Check if this is pl.col() call
-        if not isinstance(call.func, cst.Attribute):
-            return None
-
-        if call.func.attr.value != 'col':
-            return None
-
-        if not isinstance(call.func.value, cst.Name) or call.func.value.value != 'pl':
+        # Use matcher to check: pl.col(...)
+        if not m.matches(
+            call,
+            m.Call(func=m.Attribute(value=m.Name('pl'), attr=m.Name('col')))
+        ):
             return None
 
         # Extract the string argument
         if len(call.args) > 0:
             arg = call.args[0]
-            if isinstance(arg.value, cst.SimpleString):
-                # Remove quotes
-                return arg.value.value.strip('\'"')
+            if m.matches(arg.value, m.SimpleString()):
+                string_node = cst.ensure_type(arg.value, cst.SimpleString)
+                return string_node.value.strip('\'"')
 
         return None
 
@@ -546,12 +549,14 @@ class InjectTableParameters(cst.CSTTransformer):
         """
         aggs = {}
 
-        if isinstance(expr, cst.List):
-            for element in expr.elements:
-                if isinstance(element, cst.Element):
-                    extracted = self._extract_aggregations_from_expression(element.value)
+        if m.matches(expr, m.List()):
+            list_node = cst.ensure_type(expr, cst.List)
+            for element in list_node.elements:
+                if m.matches(element, m.Element()):
+                    elem_node = cst.ensure_type(element, cst.Element)
+                    extracted = self._extract_aggregations_from_expression(elem_node.value)
                     aggs.update(extracted)
-        elif isinstance(expr, cst.Call):
+        elif m.matches(expr, m.Call()):
             # This might be pl.col('col').sum().alias('name')
             # We need to find the pl.col() and the aggregation function
             col_name, agg_func = self._extract_column_and_agg(expr)
@@ -560,7 +565,7 @@ class InjectTableParameters(cst.CSTTransformer):
 
         return aggs
 
-    def _extract_column_and_agg(self, expr: cst.BaseExpression) -> tuple[Optional[str], Optional[str]]:
+    def _extract_column_and_agg(self, expr: cst.BaseExpression) -> Tuple[Optional[str], Optional[str]]:
         """
         Extract column name and aggregation function from method chain.
 
@@ -582,15 +587,16 @@ class InjectTableParameters(cst.CSTTransformer):
                 break
 
             # Check if this is an aggregation method
-            if isinstance(current.func, cst.Attribute):
-                method_name = current.func.attr.value
+            if m.matches(current.func, m.Attribute()):
+                func_attr = cst.ensure_type(current.func, cst.Attribute)
+                method_name = func_attr.attr.value
 
                 # Check if this is an aggregation method
                 if method_name in ['sum', 'mean', 'max', 'min', 'count', 'first', 'last', 'std', 'var', 'rank']:
                     agg_func = method_name
 
                 # Traverse to the object being called on
-                current = current.func.value
+                current = func_attr.value
             else:
                 break
 
@@ -662,13 +668,15 @@ class InjectTableParameters(cst.CSTTransformer):
         if tree is old_node:
             return new_node
 
-        if isinstance(tree, cst.Call):
+        if m.matches(tree, m.Call()):
+            call_node = cst.ensure_type(tree, cst.Call)
             # Check if the function being called contains the old node
-            if isinstance(tree.func, cst.Attribute):
-                updated_value = self._replace_node_in_tree(tree.func.value, old_node, new_node)
-                if updated_value is not tree.func.value:
-                    return tree.with_changes(
-                        func=tree.func.with_changes(value=updated_value)
+            if m.matches(call_node.func, m.Attribute()):
+                func_attr = cst.ensure_type(call_node.func, cst.Attribute)
+                updated_value = self._replace_node_in_tree(func_attr.value, old_node, new_node)
+                if updated_value is not func_attr.value:
+                    return call_node.with_changes(
+                        func=func_attr.with_changes(value=updated_value)
                     )
 
         return tree
