@@ -25,26 +25,6 @@ The purpose of this library is to define a data model using python focusing on t
 
 
 
-## Learnings from prior implementations
-
-- The metroframe implementations of group_by() and agg() need to be more intelligent
-    - skipping group by if there are no group by columns
-    - agg turns into a select if there are no group by columns
-    - AggExpr need to be smarter to convert operations like mean() to sum of values / sum of count if using a pre aggregation
-    - I think the metro frame wrapper should be the first piece implemented in rust
-- Measure parsing
-    - No compile time parsing because python can't do anything at compile time
-    - Measure granularity probably needs to be stored at a step level because multiple table() calls should still only pull the relevant tables?
-        - Maybe granularity steps are determined by the number of table() calls? (think more on this)
-        - Adding granularity per step might be too much complexity... Most measures probably don't need several steps
-    - Syn crate is useful for validating measure rules
-    - Planning the measure with a blank query context is useful for the output columns
-- Pre aggregations need a smarter way of handling filters
-    - Either the filters of the pre agg need to match the measure or the relevant columns exist to do filtering
-- Pre aggregations need to store more information for operations like means -> sum of values and count to make subsequent calculations correct
-
-
-
 ## TO DO
 
 - Bigger change: feed the Allow() and Exclude() calls into the table() call when the measure is defined, then there are fewer moving parts when a measure is called

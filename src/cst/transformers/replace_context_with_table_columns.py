@@ -22,8 +22,12 @@ Example:
 """
 
 from typing import Dict, Any, Union, Optional, Literal, Tuple
+import warnings
+
 import libcst as cst
 import libcst.matchers as m
+import polars as pl
+
 from column_context import Allow, Exclude
 
 
@@ -56,11 +60,15 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
         self.function_name = function_name
         self.runtime_context = runtime_context or {}
         self.output_type = output_type
+        # Note: We use manual function tracking rather than @m.call_if_inside()
+        # because function_name is a dynamic instance attribute, and decorator-based
+        # matchers are evaluated at class definition time.
         self.current_function: Optional[str] = None
 
-    def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
         """Track which function we're currently visiting."""
         self.current_function = node.name.value
+        return True  # Continue visiting children
 
     def leave_FunctionDef(
         self,
@@ -111,7 +119,6 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             call_code = temp_module.code.strip()
 
             # Prepare restricted eval globals
-            import polars as pl
             eval_globals = {
                 'Allow': Allow,
                 'Exclude': Exclude,
@@ -137,13 +144,16 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             else:
                 return self._create_string_list(instance, self.output_type)
 
-        except (NameError, KeyError, AttributeError) as e:
+        except (NameError, KeyError, AttributeError):
             # Missing runtime context variable - leave unchanged
-            # Could add logging here for debugging
             return updated_node
-        except Exception as e:
-            # Unexpected error - fail safe by leaving unchanged
-            # Could add logging here for debugging
+        except (SyntaxError, TypeError, ValueError) as e:
+            # Eval or type-related error - leave unchanged
+            warnings.warn(
+                f"Failed to transform Allow/Exclude call: {type(e).__name__}: {e}",
+                RuntimeWarning,
+                stacklevel=2
+            )
             return updated_node
 
     def _is_sort_method_call(self, node: cst.Call) -> bool:
@@ -194,7 +204,6 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             temp_module = cst.Module(body=[cst.Expr(value=allow_exclude_arg)])
             call_code = temp_module.code.strip()
 
-            import polars as pl
             eval_globals = {
                 'Allow': Allow,
                 'Exclude': Exclude,
@@ -208,21 +217,14 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             if instance.context_type != 'sort':
                 return None
 
-            # Get filtered sort context
-            filtered_sort = instance._filter_sort_context(instance.raw_context)
-
-            # Add include columns (default to 'asc')
-            for tbl_col in instance.include_columns:
-                if isinstance(tbl_col, tuple):
-                    col_str = f"{tbl_col[0]}.{tbl_col[1]}"
-                    if not any(col == col_str for col, _ in filtered_sort):
-                        filtered_sort.append((col_str, 'asc'))
+            # Get sort columns with direction using shared helper
+            sort_columns = self._get_sort_columns_with_direction(instance)
 
             # Build column list (without .desc())
             col_elements = []
             descending_values = []
 
-            for column, direction in filtered_sort:
+            for column, direction in sort_columns:
                 col_call = self._build_pl_col(column)
                 col_elements.append(cst.Element(value=col_call))
                 descending_values.append(direction.lower() == 'desc')
@@ -262,8 +264,16 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             # Return updated call
             return node.with_changes(args=new_args)
 
-        except Exception:
-            # If transformation fails, return None to fall back to default behavior
+        except (NameError, KeyError, AttributeError):
+            # Missing runtime context variable - fall back to default behavior
+            return None
+        except (SyntaxError, TypeError, ValueError) as e:
+            # Eval or type-related error - fall back with warning
+            warnings.warn(
+                f"Failed to transform sort call: {type(e).__name__}: {e}",
+                RuntimeWarning,
+                stacklevel=2
+            )
             return None
 
     def _create_string_list(self, instance: Union[Allow, Exclude], output_type: Literal['tbl_col', 'col', 'polar_col']) -> cst.List:
@@ -334,6 +344,32 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
         # Neither - return None literal as the parameter (e.g., .filter(None))
         return cst.Name('None')
 
+    def _get_sort_columns_with_direction(
+        self,
+        instance: Union[Allow, Exclude]
+    ) -> list[tuple[str, str]]:
+        """
+        Get sort columns with their direction from an Allow/Exclude instance.
+
+        Combines filtered sort context with include columns (defaulting to 'asc').
+
+        Args:
+            instance: Allow or Exclude instance with sort context
+
+        Returns:
+            List of (column, direction) tuples where direction is 'asc' or 'desc'
+        """
+        filtered_sort = instance._filter_sort_context(instance.raw_context)
+
+        # Add include columns (default to 'asc')
+        for tbl_col in instance.include_columns:
+            if isinstance(tbl_col, tuple):
+                col_str = f"{tbl_col[0]}.{tbl_col[1]}"
+                if not any(col == col_str for col, _ in filtered_sort):
+                    filtered_sort.append((col_str, 'asc'))
+
+        return filtered_sort
+
     def _create_sort_list(self, instance: Union[Allow, Exclude]) -> cst.List:
         """
         Create a List node with pl.col() calls for sort context.
@@ -350,19 +386,10 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
         Returns:
             CST List node with column expressions (no direction info)
         """
-        # Get filtered sort context from instance
-        filtered_sort = instance._filter_sort_context(instance.raw_context)
-
-        # Add include columns (default to 'asc')
-        for tbl_col in instance.include_columns:
-            if isinstance(tbl_col, tuple):
-                col_str = f"{tbl_col[0]}.{tbl_col[1]}"
-                if not any(col == col_str for col, _ in filtered_sort):
-                    filtered_sort.append((col_str, 'asc'))
+        sort_columns = self._get_sort_columns_with_direction(instance)
 
         elements = []
-        for column, direction in filtered_sort:
-            # Build base pl.col('column') node (direction is ignored here)
+        for column, direction in sort_columns:
             col_call = self._build_pl_col(column)
             elements.append(cst.Element(value=col_call))
 
@@ -468,6 +495,21 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             right=right
         )
 
+    def _wrap_in_parens(self, node: cst.BaseExpression) -> cst.BaseExpression:
+        """
+        Wrap a CST expression in parentheses for proper precedence.
+
+        Args:
+            node: CST expression to wrap
+
+        Returns:
+            Same expression wrapped with lpar/rpar
+        """
+        return node.with_changes(
+            lpar=[cst.LeftParen()],
+            rpar=[cst.RightParen()]
+        )
+
     def _build_comparison(self, column: str, operator: str, value: Any) -> cst.Comparison:
         """
         Build comparison expression for =, !=, >, <, >=, <= operators.
@@ -499,11 +541,7 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             ]
         )
 
-        # Wrap in parentheses for proper precedence when combined with & or |
-        return comparison.with_changes(
-            lpar=[cst.LeftParen()],
-            rpar=[cst.RightParen()]
-        )
+        return self._wrap_in_parens(comparison)
 
     def _build_is_in(self, column: str, value_list: list) -> cst.Call:
         """
@@ -524,11 +562,7 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             args=[cst.Arg(value=self._build_value_cst(value_list))]
         )
 
-        # Wrap in parentheses for proper precedence when combined with & or |
-        return call.with_changes(
-            lpar=[cst.LeftParen()],
-            rpar=[cst.RightParen()]
-        )
+        return self._wrap_in_parens(call)
 
     def _build_not_in(self, column: str, value_list: list) -> cst.UnaryOperation:
         """
@@ -571,11 +605,7 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             args=[cst.Arg(value=cst.SimpleString(repr(value)))]
         )
 
-        # Wrap in parentheses for proper precedence when combined with & or |
-        return call.with_changes(
-            lpar=[cst.LeftParen()],
-            rpar=[cst.RightParen()]
-        )
+        return self._wrap_in_parens(call)
 
     def _build_null_check(self, column: str, method: str) -> cst.Call:
         """
@@ -596,11 +626,7 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             args=[]
         )
 
-        # Wrap in parentheses for proper precedence when combined with & or |
-        return call.with_changes(
-            lpar=[cst.LeftParen()],
-            rpar=[cst.RightParen()]
-        )
+        return self._wrap_in_parens(call)
 
     def _build_filter_cst_from_structure(self, filter_expr: Union[Tuple, Dict]) -> cst.BaseExpression:
         """
