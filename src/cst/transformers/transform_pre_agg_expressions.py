@@ -32,6 +32,8 @@ class TransformPreAggExpressions(cst.CSTTransformer):
     (like mean, std, var) into formulas that can be correctly re-aggregated.
     """
 
+    AGG_FUNCS = frozenset(['sum', 'min', 'max', 'count', 'len', 'mean', 'std', 'var', 'first', 'last', 'rank'])
+
     def __init__(
         self,
         function_name: str,
@@ -48,7 +50,6 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         self.function_name = function_name
         self.pre_agg_metadata = pre_agg_metadata
         self.current_function: Optional[str] = None
-        self.inside_agg: int = 0  # Track nesting level
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
         """Track which function we're currently visiting."""
@@ -106,11 +107,10 @@ class TransformPreAggExpressions(cst.CSTTransformer):
             True if this is a pre-agg scan
         """
         # Check if it's pl.scan_parquet
-        if not isinstance(node.func, cst.Attribute):
-            return False
-        if node.func.attr.value != 'scan_parquet':
-            return False
-        if not isinstance(node.func.value, cst.Name) or node.func.value.value != 'pl':
+        if not m.matches(
+            node,
+            m.Call(func=m.Attribute(value=m.Name('pl'), attr=m.Name('scan_parquet')))
+        ):
             return False
 
         # Check if argument contains pre_agg_directory
@@ -118,8 +118,7 @@ class TransformPreAggExpressions(cst.CSTTransformer):
             return False
 
         # Look for BinaryOperation with pre_agg_directory (path / 'file.parquet')
-        arg = node.args[0].value
-        return self._contains_pre_agg_directory(arg)
+        return self._contains_pre_agg_directory(node.args[0].value)
 
     def _contains_pre_agg_directory(self, node: cst.BaseExpression) -> bool:
         """
@@ -185,15 +184,11 @@ class TransformPreAggExpressions(cst.CSTTransformer):
 
     def _is_agg_method(self, node: cst.Call) -> bool:
         """Check if this is an .agg() method call."""
-        if not isinstance(node.func, cst.Attribute):
-            return False
-        return node.func.attr.value == 'agg'
+        return m.matches(node, m.Call(func=m.Attribute(attr=m.Name('agg'))))
 
     def _is_select_method(self, node: cst.Call) -> bool:
         """Check if this is a .select() method call."""
-        if not isinstance(node.func, cst.Attribute):
-            return False
-        return node.func.attr.value == 'select'
+        return m.matches(node, m.Call(func=m.Attribute(attr=m.Name('select'))))
 
     def _transform_expression(
         self,
@@ -243,42 +238,29 @@ class TransformPreAggExpressions(cst.CSTTransformer):
         Returns:
             True if matches the pattern
         """
-        if not isinstance(node.func, cst.Attribute):
-            return False
-
-        # Check if func is an aggregation method
-        agg_func = node.func.attr.value
-        if agg_func not in ['sum', 'min', 'max', 'count', 'len', 'mean', 'std', 'var', 'first', 'last', 'rank']:
-            return False
-
-        # Check if the value is a pl.col() call
-        if not isinstance(node.func.value, cst.Call):
-            return False
-
-        col_call = node.func.value
-        if not isinstance(col_call.func, cst.Attribute):
-            return False
-
-        # Check if it's pl.col
-        if not (isinstance(col_call.func.value, cst.Name) and
-                col_call.func.value.value == 'pl' and
-                col_call.func.attr.value == 'col'):
-            return False
-
-        return True
+        return m.matches(
+            node,
+            m.Call(
+                func=m.Attribute(
+                    value=m.Call(
+                        func=m.Attribute(
+                            value=m.Name('pl'),
+                            attr=m.Name('col')
+                        )
+                    ),
+                    attr=m.MatchIfTrue(
+                        lambda attr: isinstance(attr, cst.Name) and attr.value in self.AGG_FUNCS
+                    )
+                )
+            )
+        )
 
     def _is_aliased_agg_expression(self, node: cst.Call) -> bool:
         """Check if this is pl.col('name').agg_func().alias('name') pattern."""
-        if not isinstance(node.func, cst.Attribute):
+        if not m.matches(node, m.Call(func=m.Attribute(attr=m.Name('alias')))):
             return False
-
-        if node.func.attr.value != 'alias':
-            return False
-
-        # Check if the value is a simple agg expression
         if not isinstance(node.func.value, cst.Call):
             return False
-
         return self._is_simple_agg_expression(node.func.value)
 
     def _transform_simple_agg(self, node: cst.Call, add_alias: bool = True) -> cst.BaseExpression:
@@ -503,64 +485,58 @@ class TransformPreAggExpressions(cst.CSTTransformer):
             right=denominator
         )
 
+    def _build_variance_expression(self, col_name: str, prefix: str) -> cst.BinaryOperation:
+        """
+        Build variance calculation expression.
+
+        Formula: (sum(sumsq) - sum(sum)^2/n) / (n-1)
+
+        Args:
+            col_name: Base column name
+            prefix: Column prefix ('std' or 'var')
+
+        Returns:
+            BinaryOperation representing the variance formula
+        """
+        sum_sumsq = self._build_pl_col_agg(f'{col_name}-{prefix}-sumsq', 'sum')
+        sum_sum = self._build_pl_col_agg(f'{col_name}-{prefix}-sum', 'sum')
+        n = self._build_pl_col_agg(f'{col_name}-{prefix}-count', 'sum')
+
+        # sum(sum)^2
+        sum_squared = cst.Call(
+            func=cst.Attribute(value=sum_sum, attr=cst.Name('pow')),
+            args=[cst.Arg(value=cst.Integer('2'))]
+        )
+
+        # sum(sum)^2 / n
+        sum_squared_over_n = cst.BinaryOperation(
+            left=sum_squared, operator=cst.Divide(), right=n
+        )
+
+        # sum(sumsq) - sum(sum)^2/n
+        variance_numerator = cst.BinaryOperation(
+            left=sum_sumsq, operator=cst.Subtract(), right=sum_squared_over_n
+        )
+
+        # n - 1
+        n_minus_1 = cst.BinaryOperation(
+            left=n, operator=cst.Subtract(), right=cst.Integer('1')
+        )
+
+        # (sum(sumsq) - sum(sum)^2/n) / (n-1)
+        return cst.BinaryOperation(
+            left=variance_numerator, operator=cst.Divide(), right=n_minus_1
+        )
+
     def _build_std_transform(self, col_name: str) -> cst.Call:
         """
         Build standard deviation transformation.
 
         Formula: sqrt((sum(sumsq) - sum(sum)^2/n) / (n-1))
         """
-        # sum(sumsq)
-        sum_sumsq = self._build_pl_col_agg(f'{col_name}-std-sumsq', 'sum')
-
-        # sum(sum)
-        sum_sum = self._build_pl_col_agg(f'{col_name}-std-sum', 'sum')
-
-        # n = sum(count)
-        n = self._build_pl_col_agg(f'{col_name}-std-count', 'sum')
-
-        # sum(sum)^2
-        sum_squared = cst.Call(
-            func=cst.Attribute(
-                value=sum_sum,
-                attr=cst.Name('pow')
-            ),
-            args=[cst.Arg(value=cst.Integer('2'))]
-        )
-
-        # sum(sum)^2 / n
-        sum_squared_over_n = cst.BinaryOperation(
-            left=sum_squared,
-            operator=cst.Divide(),
-            right=n
-        )
-
-        # sum(sumsq) - sum(sum)^2/n
-        variance_numerator = cst.BinaryOperation(
-            left=sum_sumsq,
-            operator=cst.Subtract(),
-            right=sum_squared_over_n
-        )
-
-        # n - 1
-        n_minus_1 = cst.BinaryOperation(
-            left=n,
-            operator=cst.Subtract(),
-            right=cst.Integer('1')
-        )
-
-        # (sum(sumsq) - sum(sum)^2/n) / (n-1)
-        variance = cst.BinaryOperation(
-            left=variance_numerator,
-            operator=cst.Divide(),
-            right=n_minus_1
-        )
-
-        # sqrt(variance)
+        variance = self._build_variance_expression(col_name, 'std')
         return cst.Call(
-            func=cst.Attribute(
-                value=variance,
-                attr=cst.Name('sqrt')
-            ),
+            func=cst.Attribute(value=variance, attr=cst.Name('sqrt')),
             args=[]
         )
 
@@ -570,51 +546,7 @@ class TransformPreAggExpressions(cst.CSTTransformer):
 
         Formula: (sum(sumsq) - sum(sum)^2/n) / (n-1)
         """
-        # sum(sumsq)
-        sum_sumsq = self._build_pl_col_agg(f'{col_name}-var-sumsq', 'sum')
-
-        # sum(sum)
-        sum_sum = self._build_pl_col_agg(f'{col_name}-var-sum', 'sum')
-
-        # n = sum(count)
-        n = self._build_pl_col_agg(f'{col_name}-var-count', 'sum')
-
-        # sum(sum)^2
-        sum_squared = cst.Call(
-            func=cst.Attribute(
-                value=sum_sum,
-                attr=cst.Name('pow')
-            ),
-            args=[cst.Arg(value=cst.Integer('2'))]
-        )
-
-        # sum(sum)^2 / n
-        sum_squared_over_n = cst.BinaryOperation(
-            left=sum_squared,
-            operator=cst.Divide(),
-            right=n
-        )
-
-        # sum(sumsq) - sum(sum)^2/n
-        variance_numerator = cst.BinaryOperation(
-            left=sum_sumsq,
-            operator=cst.Subtract(),
-            right=sum_squared_over_n
-        )
-
-        # n - 1
-        n_minus_1 = cst.BinaryOperation(
-            left=n,
-            operator=cst.Subtract(),
-            right=cst.Integer('1')
-        )
-
-        # (sum(sumsq) - sum(sum)^2/n) / (n-1)
-        return cst.BinaryOperation(
-            left=variance_numerator,
-            operator=cst.Divide(),
-            right=n_minus_1
-        )
+        return self._build_variance_expression(col_name, 'var')
 
     def _build_pl_col_agg(self, col_name: str, agg_func: str) -> cst.Call:
         """
