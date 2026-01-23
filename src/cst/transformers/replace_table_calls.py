@@ -22,6 +22,8 @@ Example:
 """
 
 from typing import Dict, Any, Optional, Union
+import warnings
+
 import libcst as cst
 import libcst.matchers as m
 
@@ -134,20 +136,18 @@ class ReplaceTableCalls(cst.CSTTransformer):
             node: Call node to check
 
         Returns:
-            True if this is a table() method call
+            True if this is a table() method call on a DataModel instance
         """
-        if not isinstance(node.func, cst.Attribute):
+        # Use matcher to check structure: <name>.table(...)
+        if not m.matches(node, m.Call(func=m.Attribute(attr=m.Name('table')))):
             return False
 
-        # Check if attribute name is 'table'
-        if node.func.attr.value != 'table':
-            return False
-
-        # Check if it's called on a DataModel variable (any name in runtime_context that points to DataModel)
-        if isinstance(node.func.value, cst.Name):
-            var_name = node.func.value.value
-            # Check if variable is in runtime context and is a DataModel instance
-            # We check runtime_context keys to support custom variable names
+        # Check if the object is a Name node (variable reference)
+        if m.matches(node.func, m.Attribute(value=m.Name())):
+            func_attr = cst.ensure_type(node.func, cst.Attribute)
+            name_node = cst.ensure_type(func_attr.value, cst.Name)
+            var_name = name_node.value
+            # Check if variable is in runtime context and has a 'table' method
             return var_name in self.runtime_context and hasattr(self.runtime_context.get(var_name), 'table')
 
         return False
@@ -209,30 +209,53 @@ class ReplaceTableCalls(cst.CSTTransformer):
             return node.value.strip('\'"')
         return None
 
+    def _try_eval_expression(self, node: cst.BaseExpression) -> Optional[Any]:
+        """
+        Attempt to evaluate a CST expression using eval().
+
+        This is used as a fallback for complex expressions like qc.get('key', default).
+
+        Args:
+            node: The CST expression node to evaluate
+
+        Returns:
+            The evaluated Python value, or None if evaluation fails
+
+        Warning:
+            Emits a RuntimeWarning if evaluation fails.
+        """
+        try:
+            temp_module = cst.Module(body=[cst.Expr(value=node)])
+            call_code = temp_module.code.strip()
+            return eval(call_code, {}, self.runtime_context)
+        except Exception as e:
+            warnings.warn(
+                f"Failed to evaluate expression: {type(e).__name__}: {e}",
+                RuntimeWarning,
+                stacklevel=3
+            )
+            return None
+
     def _evaluate_list_arg(self, node: cst.BaseExpression) -> Optional[list[str]]:
         """Evaluate a list argument."""
         # Handle direct list literal
-        if isinstance(node, cst.List):
+        if m.matches(node, m.List()):
+            list_node = cst.ensure_type(node, cst.List)
             result = []
-            for element in node.elements:
+            for element in list_node.elements:
                 if isinstance(element, cst.Element):
-                    if isinstance(element.value, cst.SimpleString):
-                        result.append(element.value.value.strip('\'"'))
+                    if m.matches(element.value, m.SimpleString()):
+                        string_node = cst.ensure_type(element.value, cst.SimpleString)
+                        result.append(string_node.value.strip('\'"'))
                     else:
                         return None
             return result
 
         # Handle function call like qc.get('group', [])
-        # We need to evaluate it
-        if isinstance(node, cst.Call):
-            try:
-                temp_module = cst.Module(body=[cst.Expr(value=node)])
-                call_code = temp_module.code.strip()
-                result = eval(call_code, {}, self.runtime_context)
-                if isinstance(result, list):
-                    return result
-            except Exception:
-                pass
+        if m.matches(node, m.Call()):
+            result = self._try_eval_expression(node)
+            if isinstance(result, list):
+                return result
 
         return None
 
@@ -265,21 +288,18 @@ class ReplaceTableCalls(cst.CSTTransformer):
     def _evaluate_bool_arg(self, node: cst.BaseExpression) -> bool:
         """Evaluate a boolean argument."""
         # Handle direct boolean literal
-        if isinstance(node, cst.Name):
-            if node.value == 'True':
+        if m.matches(node, m.Name()):
+            name_node = cst.ensure_type(node, cst.Name)
+            if name_node.value == 'True':
                 return True
-            elif node.value == 'False':
+            elif name_node.value == 'False':
                 return False
 
         # Handle function call like qc.get('allow_pre_aggs', True)
-        if isinstance(node, cst.Call):
-            try:
-                temp_module = cst.Module(body=[cst.Expr(value=node)])
-                call_code = temp_module.code.strip()
-                result = eval(call_code, {}, self.runtime_context)
+        if m.matches(node, m.Call()):
+            result = self._try_eval_expression(node)
+            if result is not None:
                 return bool(result)
-            except Exception:
-                pass
 
         # Default to True
         return True
