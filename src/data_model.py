@@ -1,10 +1,137 @@
 from typing import Self, Dict, List, Any, Optional, Union, Literal
 from pathlib import Path
+import os
+import inspect
+import textwrap
 import polars as pl
 import libcst as cst
 
 from query_context.query_context import QueryContext
 from cst.extractors.extract_decorator_variable import extract_decorator_variable_name
+
+# Threshold for parallel vs sequential measure processing
+# Below this count, process overhead exceeds parallelization benefit
+PARALLEL_THRESHOLD = 5
+
+# Module-level worker state for ProcessPoolExecutor
+_worker_dm: Optional['DataModel'] = None
+
+
+def _init_worker(
+    tables: Dict[str, pl.LazyFrame],
+    joins: List[Dict[str, Any]],
+    pre_aggs: Dict[str, Any],
+    pre_agg_dir: Path,
+    pre_agg_metadata: List[Dict[str, Any]],
+    table_schemas: Dict[str, List[str]],
+    join_lookup: Dict[str, Dict[str, Any]]
+) -> None:
+    """
+    Initialize worker process with its own DataModel instance.
+
+    Called once per worker by ProcessPoolExecutor. Creates a lightweight
+    DataModel clone with all data needed for CST transformations, but
+    without the measures dict (which contains unpicklable functions).
+
+    Args:
+        tables: Dict mapping table names to LazyFrames
+        joins: List of join specifications
+        pre_aggs: Pre-aggregation definitions
+        pre_agg_dir: Directory for pre-aggregation parquet files
+        pre_agg_metadata: List of pre-agg metadata dicts
+        table_schemas: Dict mapping table names to column lists
+        join_lookup: Pre-computed join paths between tables
+    """
+    global _worker_dm
+    _worker_dm = DataModel(tables, joins, pre_aggs, pre_agg_dir)
+    _worker_dm.pre_agg_metadata = pre_agg_metadata
+    # Skip recomputation - use pre-computed values from main process
+    _worker_dm.table_schemas = table_schemas
+    _worker_dm.join_lookup = join_lookup
+
+
+def _transform_measure_worker(args: tuple) -> tuple[str, str]:
+    """
+    Worker function to transform a single measure's source code.
+
+    Runs in a worker process. Applies all CST transformations using
+    the worker's DataModel instance (_worker_dm).
+
+    Args:
+        args: Tuple of (measure_name, source_code, qc_context, decorator_var_name)
+
+    Returns:
+        Tuple of (measure_name, transformed_code)
+    """
+    from cst.transformers.replace_context_with_table_columns import resolve_table_columns
+    from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
+    from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
+    from cst.transformers.replace_table_calls import replace_table_calls
+    from cst.transformers.inject_table_parameters import inject_table_parameters
+    from cst.transformers.strip_table_prefixes import strip_table_prefixes
+
+    measure_name, source_code, qc_context, decorator_var_name = args
+    global _worker_dm
+
+    current_code = source_code
+
+    # 1. Resolve Allow/Exclude to column lists
+    current_code = resolve_table_columns(
+        source_code=current_code,
+        function_name=measure_name,
+        runtime_context={'qc': qc_context},
+        output_type='polar_col'
+    )
+
+    # 2. Inject parameters into table() calls
+    valid_var_names = ['dm', 'self', 'data_model']
+    if decorator_var_name is not None:
+        valid_var_names.append(decorator_var_name)
+
+    current_code = inject_table_parameters(
+        source_code=current_code,
+        function_name=measure_name,
+        runtime_context={
+            'qc': qc_context,
+            'valid_var_names': valid_var_names,
+            'table_schemas': _worker_dm.table_schemas
+        }
+    )
+
+    # 3. Replace dm.table() calls with actual LazyFrame code
+    replace_context = {'dm': _worker_dm, 'self': _worker_dm, 'data_model': _worker_dm, 'qc': qc_context}
+    if decorator_var_name is not None:
+        replace_context[decorator_var_name] = _worker_dm
+
+    current_code = replace_table_calls(
+        source_code=current_code,
+        function_name=measure_name,
+        runtime_context=replace_context
+    )
+
+    # 4. Strip table prefixes from pl.col() calls
+    current_code = strip_table_prefixes(
+        source_code=current_code,
+        function_name=measure_name
+    )
+
+    # 5. Remove empty polars methods
+    current_code = remove_empty_polars_methods(
+        source_code=current_code,
+        function_name=measure_name
+    )
+
+    # 6. Transform pre-agg expressions (only if using pre-agg)
+    if 'self.pre_agg_directory' in current_code:
+        pre_agg_metadata = _worker_dm._extract_pre_agg_metadata_from_code(current_code)
+        current_code = transform_pre_agg_expressions(
+            source_code=current_code,
+            function_name=measure_name,
+            pre_agg_metadata=pre_agg_metadata
+        )
+
+    return (measure_name, current_code)
+
 
 # Type aliases for aggregation functions
 AggFuncLiteral = Literal['sum', 'mean', 'min', 'max', 'count', 'len', 'null_count', 'first', 'last', 'n_unique', 'std', 'var']
@@ -978,13 +1105,17 @@ class DataModel:
                     f"Available: {list(self.measures.keys())}"
                 )
 
-        # Process each measure
+        # Process measures (parallel or sequential based on count)
+        if len(measure_names) >= PARALLEL_THRESHOLD:
+            results = self._process_measures_parallel(measure_names, qc)
+        else:
+            results = self._process_measures_sequential(measure_names, qc)
+
+        # Unpack results
         transformed_codes = {}
         lazy_frames = []
-
-        for measure_name in measure_names:
-            code, lazy_frame = self._process_single_measure(measure_name, qc)
-            transformed_codes[measure_name] = code
+        for i, (code, lazy_frame) in enumerate(results):
+            transformed_codes[measure_names[i]] = code
             lazy_frames.append(lazy_frame)
 
         # Handle 'query' output type
@@ -1224,6 +1355,182 @@ class DataModel:
             )
 
         return current_code, lazy_frame
+
+    def _extract_measure_source(
+        self: Self,
+        measure_name: str
+    ) -> tuple[str, Optional[str]]:
+        """
+        Extract source code and decorator variable name for a measure.
+
+        Handles:
+        1. Getting source code via inspect.getsource
+        2. Extracting decorator variable name (e.g., 'dm' from @measure(dm))
+        3. Stripping decorator lines
+
+        Args:
+            measure_name: Name of the registered measure
+
+        Returns:
+            Tuple of (source_code, decorator_variable_name)
+            decorator_variable_name may be None if not found
+        """
+        measure_func = self.measures[measure_name]
+        source_code = textwrap.dedent(inspect.getsource(measure_func))
+
+        # Extract decorator variable name BEFORE stripping decorator lines
+        decorator_variable_name = extract_decorator_variable_name(
+            source_code=source_code,
+            function_name=measure_name
+        )
+
+        # Strip decorator lines (e.g., @measure(dm))
+        lines = source_code.split('\n')
+        def_line_idx = next((i for i, line in enumerate(lines) if line.strip().startswith('def ')), 0)
+        source_code = '\n'.join(lines[def_line_idx:])
+
+        return source_code, decorator_variable_name
+
+    def _exec_transformed_code(
+        self: Self,
+        measure_name: str,
+        transformed_code: str,
+        query_context: QueryContext,
+        decorator_variable_name: Optional[str] = None
+    ) -> pl.LazyFrame:
+        """
+        Execute transformed measure code and return the resulting LazyFrame.
+
+        This method is used after CST transformations are complete (either from
+        sequential processing or from parallel workers).
+
+        Args:
+            measure_name: Name of the measure function
+            transformed_code: Fully transformed Python source code
+            query_context: QueryContext instance
+            decorator_variable_name: Optional custom variable name from decorator
+
+        Returns:
+            LazyFrame result from executing the measure
+
+        Raises:
+            ValueError: If measure doesn't return a LazyFrame
+        """
+        from column_context import Allow, Exclude
+
+        exec_namespace = {
+            'pl': pl,
+            'self': self,
+            'dm': self,
+            'data_model': self,
+            'Allow': Allow,
+            'Exclude': Exclude,
+            'qc': query_context.context
+        }
+
+        if decorator_variable_name is not None:
+            exec_namespace[decorator_variable_name] = self
+
+        exec(transformed_code, exec_namespace)
+        measure_func = exec_namespace[measure_name]
+        lazy_frame = measure_func(query_context.context)
+
+        if not isinstance(lazy_frame, pl.LazyFrame):
+            raise ValueError(
+                f"Measure '{measure_name}' must return pl.LazyFrame, "
+                f"got: {type(lazy_frame)}"
+            )
+
+        return lazy_frame
+
+    def _process_measures_sequential(
+        self: Self,
+        measure_names: List[str],
+        query_context: QueryContext
+    ) -> List[tuple[str, pl.LazyFrame]]:
+        """
+        Process measures sequentially using existing single-measure logic.
+
+        Used when measure count is below PARALLEL_THRESHOLD.
+
+        Args:
+            measure_names: List of measure names to process
+            query_context: QueryContext instance
+
+        Returns:
+            List of (transformed_code, lazy_frame) tuples
+        """
+        return [
+            self._process_single_measure(name, query_context)
+            for name in measure_names
+        ]
+
+    def _process_measures_parallel(
+        self: Self,
+        measure_names: List[str],
+        query_context: QueryContext
+    ) -> List[tuple[str, pl.LazyFrame]]:
+        """
+        Process measures in parallel using ProcessPoolExecutor.
+
+        Used when measure count >= PARALLEL_THRESHOLD. Each worker applies
+        CST transformations independently, then main process executes the
+        transformed code.
+
+        Args:
+            measure_names: List of measure names to process
+            query_context: QueryContext instance
+
+        Returns:
+            List of (transformed_code, lazy_frame) tuples
+        """
+        from concurrent.futures import ProcessPoolExecutor
+
+        # Extract source code in main process (requires access to self.measures)
+        measure_sources = {}
+        for name in measure_names:
+            source, decorator_var = self._extract_measure_source(name)
+            measure_sources[name] = (source, decorator_var)
+
+        # Prepare worker initialization data (all picklable)
+        init_args = (
+            self.tables,
+            self.joins,
+            self.pre_aggregations,
+            self.pre_agg_directory,
+            self.pre_agg_metadata,
+            self.table_schemas,
+            self.join_lookup
+        )
+
+        # Prepare per-measure work items
+        work_items = [
+            (name, measure_sources[name][0], query_context.context, measure_sources[name][1])
+            for name in measure_names
+        ]
+
+        # Process in parallel
+        max_workers = min(len(measure_names), os.cpu_count() or 4)
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_worker,
+            initargs=init_args
+        ) as executor:
+            transformed_results = list(executor.map(_transform_measure_worker, work_items))
+
+        # Execute transformed code in main process and build results
+        results = []
+        for measure_name, transformed_code in transformed_results:
+            decorator_var = measure_sources[measure_name][1]
+            lazy_frame = self._exec_transformed_code(
+                measure_name,
+                transformed_code,
+                query_context,
+                decorator_var
+            )
+            results.append((transformed_code, lazy_frame))
+
+        return results
 
     def _process_single_measure_with_tracking(
         self: Self,

@@ -446,3 +446,193 @@ class TestDataModelQueryMethod:
         # Should only have item_id=1
         assert len(result) == 1
         assert result['item_id'][0] == 1
+
+    # ========================================================================
+    # PARALLEL PROCESSING TESTS (5+ measures triggers parallel path)
+    # ========================================================================
+
+    @pytest.fixture
+    def datamodel_with_many_measures(self, simple_datamodel):
+        """Create DataModel with 6 measures to trigger parallel processing."""
+        dm = simple_datamodel
+
+        @measure(dm)
+        def measure_revenue_sum(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('revenue').sum().alias('revenue_sum'))
+            )
+
+        @measure(dm)
+        def measure_revenue_mean(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('revenue').mean().alias('revenue_mean'))
+            )
+
+        @measure(dm)
+        def measure_quantity_sum(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('quantity').sum().alias('quantity_sum'))
+            )
+
+        @measure(dm)
+        def measure_quantity_mean(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('quantity').mean().alias('quantity_mean'))
+            )
+
+        @measure(dm)
+        def measure_row_count(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.len().alias('row_count'))
+            )
+
+        @measure(dm)
+        def measure_revenue_max(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('revenue').max().alias('revenue_max'))
+            )
+
+        return dm
+
+    def test_parallel_processing_with_six_measures(self, datamodel_with_many_measures):
+        """Test that 6 measures triggers parallel processing and returns correct results."""
+        from data_model import PARALLEL_THRESHOLD
+
+        dm = datamodel_with_many_measures
+        measure_names = [
+            'measure_revenue_sum',
+            'measure_revenue_mean',
+            'measure_quantity_sum',
+            'measure_quantity_mean',
+            'measure_row_count',
+            'measure_revenue_max'
+        ]
+
+        # Verify we're testing the parallel path
+        assert len(measure_names) >= PARALLEL_THRESHOLD
+
+        result = dm.query(
+            query_context={
+                'measure': measure_names,
+                'group': ['item_id']
+            },
+            output_type='data'
+        )
+
+        assert isinstance(result, pl.DataFrame)
+        # Should have 3 rows (item_id 1, 2, 3)
+        assert len(result) == 3
+        # Should have all measure columns
+        assert 'revenue_sum' in result.columns
+        assert 'revenue_mean' in result.columns
+        assert 'quantity_sum' in result.columns
+        assert 'quantity_mean' in result.columns
+        assert 'row_count' in result.columns
+        assert 'revenue_max' in result.columns
+
+    def test_parallel_results_match_sequential(self, datamodel_with_many_measures):
+        """Test that parallel processing produces same results as sequential."""
+        from data_model import PARALLEL_THRESHOLD
+
+        dm = datamodel_with_many_measures
+
+        # Run with 4 measures (sequential path)
+        sequential_measures = [
+            'measure_revenue_sum',
+            'measure_revenue_mean',
+            'measure_quantity_sum',
+            'measure_quantity_mean'
+        ]
+        assert len(sequential_measures) < PARALLEL_THRESHOLD
+
+        sequential_result = dm.query(
+            query_context={
+                'measure': sequential_measures,
+                'group': ['item_id']
+            },
+            output_type='data'
+        ).sort('item_id')
+
+        # Run with 6 measures (parallel path) but compare overlapping columns
+        parallel_measures = [
+            'measure_revenue_sum',
+            'measure_revenue_mean',
+            'measure_quantity_sum',
+            'measure_quantity_mean',
+            'measure_row_count',
+            'measure_revenue_max'
+        ]
+        assert len(parallel_measures) >= PARALLEL_THRESHOLD
+
+        parallel_result = dm.query(
+            query_context={
+                'measure': parallel_measures,
+                'group': ['item_id']
+            },
+            output_type='data'
+        ).sort('item_id')
+
+        # Compare the overlapping columns
+        for col in ['item_id', 'revenue_sum', 'revenue_mean', 'quantity_sum', 'quantity_mean']:
+            assert sequential_result[col].to_list() == parallel_result[col].to_list(), \
+                f"Column {col} differs between sequential and parallel processing"
+
+    def test_parallel_processing_output_type_query(self, datamodel_with_many_measures):
+        """Test that parallel processing works with output_type='query'."""
+        dm = datamodel_with_many_measures
+        measure_names = [
+            'measure_revenue_sum',
+            'measure_revenue_mean',
+            'measure_quantity_sum',
+            'measure_quantity_mean',
+            'measure_row_count',
+            'measure_revenue_max'
+        ]
+
+        result = dm.query(
+            query_context={
+                'measure': measure_names,
+                'group': ['item_id']
+            },
+            output_type='query'
+        )
+
+        # With multiple measures, should return dict
+        assert isinstance(result, dict)
+        assert len(result) == 6
+        for name in measure_names:
+            assert name in result
+            assert isinstance(result[name], str)
+
+    def test_parallel_processing_without_group_by(self, datamodel_with_many_measures):
+        """Test parallel processing without group_by columns."""
+        dm = datamodel_with_many_measures
+        measure_names = [
+            'measure_revenue_sum',
+            'measure_revenue_mean',
+            'measure_quantity_sum',
+            'measure_quantity_mean',
+            'measure_row_count',
+            'measure_revenue_max'
+        ]
+
+        result = dm.query(
+            query_context={'measure': measure_names},
+            output_type='data'
+        )
+
+        assert isinstance(result, pl.DataFrame)
+        # Without group by, should have 1 row with aggregated totals
+        assert len(result) == 1
