@@ -504,10 +504,42 @@ class TestDataModelQueryMethod:
                 .agg(pl.col('revenue').max().alias('revenue_max'))
             )
 
+        @measure(dm)
+        def measure_revenue_min(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('revenue').min().alias('revenue_min'))
+            )
+
+        @measure(dm)
+        def measure_quantity_max(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('quantity').max().alias('quantity_max'))
+            )
+
+        @measure(dm)
+        def measure_quantity_min(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('quantity').min().alias('quantity_min'))
+            )
+
+        @measure(dm)
+        def measure_revenue_std(qc):
+            return (
+                dm.table('sales')
+                .group_by(Allow('*', context=qc.get('group', [])))
+                .agg(pl.col('revenue').std().alias('revenue_std'))
+            )
+
         return dm
 
-    def test_parallel_processing_with_six_measures(self, datamodel_with_many_measures):
-        """Test that 6 measures triggers parallel processing and returns correct results."""
+    def test_parallel_processing_with_ten_measures(self, datamodel_with_many_measures):
+        """Test that 10 measures triggers parallel processing and returns correct results."""
         from data_model import PARALLEL_THRESHOLD
 
         dm = datamodel_with_many_measures
@@ -517,7 +549,11 @@ class TestDataModelQueryMethod:
             'measure_quantity_sum',
             'measure_quantity_mean',
             'measure_row_count',
-            'measure_revenue_max'
+            'measure_revenue_max',
+            'measure_revenue_min',
+            'measure_quantity_max',
+            'measure_quantity_min',
+            'measure_revenue_std'
         ]
 
         # Verify we're testing the parallel path
@@ -541,6 +577,10 @@ class TestDataModelQueryMethod:
         assert 'quantity_mean' in result.columns
         assert 'row_count' in result.columns
         assert 'revenue_max' in result.columns
+        assert 'revenue_min' in result.columns
+        assert 'quantity_max' in result.columns
+        assert 'quantity_min' in result.columns
+        assert 'revenue_std' in result.columns
 
     def test_parallel_results_match_sequential(self, datamodel_with_many_measures):
         """Test that parallel processing produces same results as sequential."""
@@ -548,12 +588,17 @@ class TestDataModelQueryMethod:
 
         dm = datamodel_with_many_measures
 
-        # Run with 4 measures (sequential path)
+        # Run with 9 measures (sequential path)
         sequential_measures = [
             'measure_revenue_sum',
             'measure_revenue_mean',
             'measure_quantity_sum',
-            'measure_quantity_mean'
+            'measure_quantity_mean',
+            'measure_row_count',
+            'measure_revenue_max',
+            'measure_revenue_min',
+            'measure_quantity_max',
+            'measure_quantity_min'
         ]
         assert len(sequential_measures) < PARALLEL_THRESHOLD
 
@@ -565,14 +610,18 @@ class TestDataModelQueryMethod:
             output_type='data'
         ).sort('item_id')
 
-        # Run with 6 measures (parallel path) but compare overlapping columns
+        # Run with 10 measures (parallel path) but compare overlapping columns
         parallel_measures = [
             'measure_revenue_sum',
             'measure_revenue_mean',
             'measure_quantity_sum',
             'measure_quantity_mean',
             'measure_row_count',
-            'measure_revenue_max'
+            'measure_revenue_max',
+            'measure_revenue_min',
+            'measure_quantity_max',
+            'measure_quantity_min',
+            'measure_revenue_std'
         ]
         assert len(parallel_measures) >= PARALLEL_THRESHOLD
 
@@ -585,7 +634,8 @@ class TestDataModelQueryMethod:
         ).sort('item_id')
 
         # Compare the overlapping columns
-        for col in ['item_id', 'revenue_sum', 'revenue_mean', 'quantity_sum', 'quantity_mean']:
+        for col in ['item_id', 'revenue_sum', 'revenue_mean', 'quantity_sum', 'quantity_mean',
+                    'row_count', 'revenue_max', 'revenue_min', 'quantity_max', 'quantity_min']:
             assert sequential_result[col].to_list() == parallel_result[col].to_list(), \
                 f"Column {col} differs between sequential and parallel processing"
 
@@ -598,7 +648,11 @@ class TestDataModelQueryMethod:
             'measure_quantity_sum',
             'measure_quantity_mean',
             'measure_row_count',
-            'measure_revenue_max'
+            'measure_revenue_max',
+            'measure_revenue_min',
+            'measure_quantity_max',
+            'measure_quantity_min',
+            'measure_revenue_std'
         ]
 
         result = dm.query(
@@ -611,7 +665,7 @@ class TestDataModelQueryMethod:
 
         # With multiple measures, should return dict
         assert isinstance(result, dict)
-        assert len(result) == 6
+        assert len(result) == 10
         for name in measure_names:
             assert name in result
             assert isinstance(result[name], str)
@@ -625,7 +679,11 @@ class TestDataModelQueryMethod:
             'measure_quantity_sum',
             'measure_quantity_mean',
             'measure_row_count',
-            'measure_revenue_max'
+            'measure_revenue_max',
+            'measure_revenue_min',
+            'measure_quantity_max',
+            'measure_quantity_min',
+            'measure_revenue_std'
         ]
 
         result = dm.query(

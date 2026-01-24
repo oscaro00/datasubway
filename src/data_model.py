@@ -11,7 +11,7 @@ from cst.extractors.extract_decorator_variable import extract_decorator_variable
 
 # Threshold for parallel vs sequential measure processing
 # Below this count, process overhead exceeds parallelization benefit
-PARALLEL_THRESHOLD = 5
+PARALLEL_THRESHOLD = 10
 
 # Module-level worker state for ProcessPoolExecutor
 _worker_dm: Optional['DataModel'] = None
