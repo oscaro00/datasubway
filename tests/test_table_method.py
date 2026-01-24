@@ -6,6 +6,8 @@ import tempfile
 import shutil
 
 from datasubway import DataModel
+from datasubway.cst_builders import build_pre_agg_cst, build_table_access_cst, build_join_chain_cst
+from datasubway.column_utils import normalize_column_name, columns_match
 
 
 class TestTableMethod:
@@ -71,14 +73,15 @@ class TestTableMethod:
         pre_agg_path = temp_pre_agg_dir / 'sales_by_item.parquet'
         pre_agg_data.write_parquet(pre_agg_path)
 
-        # Manually populate metadata
-        dm.pre_agg_metadata = [{
+        # Manually populate metadata (update manager's list and sync to DataModel)
+        dm._pre_agg_manager.metadata.append({
             'name': 'sales_by_item',
             'path': str(pre_agg_path),
             'group_by': ['item_id'],
-            'aggregations': {'revenue': 'sum', 'quantity': 'sum'},
+            'aggregations': {'revenue': ['sum'], 'quantity': ['sum']},
             'row_count': 3
-        }]
+        })
+        dm.pre_agg_metadata = dm._pre_agg_manager.metadata
 
         return dm
 
@@ -257,13 +260,14 @@ class TestTableMethod:
 
         # Manually create metadata pointing to non-existent file
         pre_agg_path = temp_pre_agg_dir / 'missing_pre_agg.parquet'
-        dm.pre_agg_metadata = [{
+        dm._pre_agg_manager.metadata.append({
             'name': 'missing_pre_agg',
             'path': str(pre_agg_path),
             'group_by': ['item_id'],
-            'aggregations': {'revenue': 'sum'},
+            'aggregations': {'revenue': ['sum']},
             'row_count': 100
-        }]
+        })
+        dm.pre_agg_metadata = dm._pre_agg_manager.metadata
 
         # The table() method should fall back to source tables with a warning
         with pytest.warns(UserWarning, match="Pre-agg file not found"):
@@ -294,23 +298,23 @@ class TestTableMethod:
         assert "self.tables['sales']" in code
 
     def test_cst_builder_pre_agg(self, datamodel_no_pre_agg):
-        """Test _build_pre_agg_cst helper method."""
-        result_cst = datamodel_no_pre_agg._build_pre_agg_cst('test_pre_agg')
+        """Test build_pre_agg_cst helper function."""
+        result_cst = build_pre_agg_cst('test_pre_agg')
 
         code = cst.Module(body=[cst.Expr(value=result_cst)]).code.strip()
 
         assert code == "pl.scan_parquet(self.pre_agg_directory / 'test_pre_agg.parquet')"
 
     def test_cst_builder_table_access(self, datamodel_no_pre_agg):
-        """Test _build_table_access_cst helper method."""
-        result_cst = datamodel_no_pre_agg._build_table_access_cst('test_table')
+        """Test build_table_access_cst helper function."""
+        result_cst = build_table_access_cst('test_table')
 
         code = cst.Module(body=[cst.Expr(value=result_cst)]).code.strip()
 
         assert code == "self.tables['test_table']"
 
     def test_cst_builder_join_chain(self, datamodel_no_pre_agg):
-        """Test _build_join_chain_cst helper method."""
+        """Test build_join_chain_cst helper function."""
         join_specs = [
             {
                 'right': 'products',
@@ -320,7 +324,7 @@ class TestTableMethod:
             }
         ]
 
-        result_cst = datamodel_no_pre_agg._build_join_chain_cst('sales', join_specs)
+        result_cst = build_join_chain_cst('sales', join_specs)
 
         code = cst.Module(body=[cst.Expr(value=result_cst)]).code.strip()
 
@@ -333,18 +337,18 @@ class TestTableMethod:
         assert "'inner'" in code
 
     def test_column_normalization(self, datamodel_no_pre_agg):
-        """Test _normalize_column_name helper method."""
+        """Test normalize_column_name helper function."""
         # Column with prefix - should remain unchanged
-        assert datamodel_no_pre_agg._normalize_column_name('sales.revenue', 'sales') == 'sales.revenue'
+        assert normalize_column_name('sales.revenue', 'sales') == 'sales.revenue'
 
         # Column without prefix - should add table prefix
-        assert datamodel_no_pre_agg._normalize_column_name('revenue', 'sales') == 'sales.revenue'
+        assert normalize_column_name('revenue', 'sales') == 'sales.revenue'
 
     def test_columns_match(self, datamodel_no_pre_agg):
-        """Test _columns_match helper method."""
+        """Test columns_match helper function."""
         # Same column, different prefixes
-        assert datamodel_no_pre_agg._columns_match('sales.revenue', 'revenue')
-        assert datamodel_no_pre_agg._columns_match('table1.col', 'table2.col')
+        assert columns_match('sales.revenue', 'revenue')
+        assert columns_match('table1.col', 'table2.col')
 
         # Different columns
-        assert not datamodel_no_pre_agg._columns_match('revenue', 'quantity')
+        assert not columns_match('revenue', 'quantity')
