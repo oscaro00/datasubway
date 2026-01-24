@@ -28,7 +28,7 @@ import libcst as cst
 import libcst.matchers as m
 import polars as pl
 
-from column_context import Allow, Exclude
+from datasubway.column_context import Allow, Exclude
 
 
 class ReplaceContextWithTableColumns(cst.CSTTransformer):

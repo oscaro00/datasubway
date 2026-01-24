@@ -5,9 +5,9 @@
 import polars as pl
 from pathlib import Path
 
-from column_context import Allow# , Exclude
-from data_model import DataModel
-from decorators import measure
+from datasubway.column_context import Allow  # , Exclude
+from datasubway.data_model import DataModel
+from datasubway.decorators import measure
 
 def main():
     

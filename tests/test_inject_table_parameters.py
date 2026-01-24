@@ -6,13 +6,8 @@ including support for custom variable names.
 """
 
 import pytest
-import sys
-from pathlib import Path
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-from cst.transformers.inject_table_parameters import inject_table_parameters
+from datasubway.cst.transformers.inject_table_parameters import inject_table_parameters
 
 
 class TestInjectTableParameters:

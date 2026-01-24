@@ -6,8 +6,8 @@ import textwrap
 import polars as pl
 import libcst as cst
 
-from query_context.query_context import QueryContext
-from cst.extractors.extract_decorator_variable import extract_decorator_variable_name
+from datasubway.query_context.query_context import QueryContext
+from datasubway.cst.extractors.extract_decorator_variable import extract_decorator_variable_name
 
 # Threshold for parallel vs sequential measure processing
 # Below this count, process overhead exceeds parallelization benefit
@@ -63,12 +63,12 @@ def _transform_measure_worker(args: tuple) -> tuple[str, str]:
     Returns:
         Tuple of (measure_name, transformed_code)
     """
-    from cst.transformers.replace_context_with_table_columns import resolve_table_columns
-    from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
-    from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
-    from cst.transformers.replace_table_calls import replace_table_calls
-    from cst.transformers.inject_table_parameters import inject_table_parameters
-    from cst.transformers.strip_table_prefixes import strip_table_prefixes
+    from datasubway.cst.transformers.replace_context_with_table_columns import resolve_table_columns
+    from datasubway.cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
+    from datasubway.cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
+    from datasubway.cst.transformers.replace_table_calls import replace_table_calls
+    from datasubway.cst.transformers.inject_table_parameters import inject_table_parameters
+    from datasubway.cst.transformers.strip_table_prefixes import strip_table_prefixes
 
     measure_name, source_code, qc_context, decorator_var_name = args
     global _worker_dm
@@ -1081,7 +1081,7 @@ class DataModel:
             ...     output_type='data'
             ... )
         """
-        from query_context.query_context import QueryContext
+        from datasubway.query_context.query_context import QueryContext
 
         # Validate output_type
         if output_type not in ['explain', 'query', 'data']:
@@ -1183,7 +1183,7 @@ class DataModel:
             ... )
             >>> print(steps['3_replace_table_calls'])
         """
-        from query_context.query_context import QueryContext
+        from datasubway.query_context.query_context import QueryContext
 
         # Validate and wrap query context
         qc = QueryContext(query_context)
@@ -1242,11 +1242,11 @@ class DataModel:
         """
         import inspect
         import textwrap
-        from cst.transformers.replace_context_with_table_columns import resolve_table_columns
-        from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
-        from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
-        from cst.transformers.replace_table_calls import replace_table_calls
-        from column_context import Allow, Exclude
+        from datasubway.cst.transformers.replace_context_with_table_columns import resolve_table_columns
+        from datasubway.cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
+        from datasubway.cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
+        from datasubway.cst.transformers.replace_table_calls import replace_table_calls
+        from datasubway.column_context import Allow, Exclude
 
         # Extract source code
         measure_func = self.measures[measure_name]
@@ -1277,7 +1277,7 @@ class DataModel:
         )
 
         # 2. Inject parameters into table() calls based on method chain analysis
-        from cst.transformers.inject_table_parameters import inject_table_parameters
+        from datasubway.cst.transformers.inject_table_parameters import inject_table_parameters
         # Build list of valid variable names for DataModel
         valid_var_names = ['dm', 'self', 'data_model']
         if decorator_variable_name is not None:
@@ -1306,7 +1306,7 @@ class DataModel:
         )
 
         # 4. Strip table prefixes from pl.col() calls for Polars execution
-        from cst.transformers.strip_table_prefixes import strip_table_prefixes
+        from datasubway.cst.transformers.strip_table_prefixes import strip_table_prefixes
         current_code = strip_table_prefixes(
             source_code=current_code,
             function_name=measure_name
@@ -1416,7 +1416,7 @@ class DataModel:
         Raises:
             ValueError: If measure doesn't return a LazyFrame
         """
-        from column_context import Allow, Exclude
+        from datasubway.column_context import Allow, Exclude
 
         exec_namespace = {
             'pl': pl,
@@ -1555,10 +1555,10 @@ class DataModel:
         """
         import inspect
         import textwrap
-        from cst.transformers.replace_context_with_table_columns import resolve_table_columns
-        from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
-        from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
-        from cst.transformers.replace_table_calls import replace_table_calls
+        from datasubway.cst.transformers.replace_context_with_table_columns import resolve_table_columns
+        from datasubway.cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
+        from datasubway.cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
+        from datasubway.cst.transformers.replace_table_calls import replace_table_calls
 
         steps = {}
 
@@ -1591,7 +1591,7 @@ class DataModel:
         steps['1_resolve_table_columns'] = current_code
 
         # STEP 2: Inject parameters into table() calls
-        from cst.transformers.inject_table_parameters import inject_table_parameters
+        from datasubway.cst.transformers.inject_table_parameters import inject_table_parameters
         valid_var_names = ['dm', 'self', 'data_model']
         if decorator_variable_name is not None:
             valid_var_names.append(decorator_variable_name)
@@ -1620,7 +1620,7 @@ class DataModel:
         steps['3_replace_table_calls'] = current_code
 
         # STEP 4: Strip table prefixes from pl.col() calls
-        from cst.transformers.strip_table_prefixes import strip_table_prefixes
+        from datasubway.cst.transformers.strip_table_prefixes import strip_table_prefixes
         current_code = strip_table_prefixes(
             source_code=current_code,
             function_name=measure_name
@@ -1731,7 +1731,7 @@ class DataModel:
             {'AND': [('total_revenue', '>', 1000), ('count', '>=', 10)]}
                 → (pl.col('total_revenue') > 1000) & (pl.col('count') >= 10)
         """
-        from column_context import OPERATOR_MAP
+        from datasubway.column_context import OPERATOR_MAP
 
         # Simple condition (tuple)
         if isinstance(having_expr, tuple):

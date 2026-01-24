@@ -2,8 +2,8 @@ from typing import Callable
 import inspect
 import textwrap
 
-from data_model import DataModel
-from cst.visitors.validate_measure_method_chain import validate_measure_method_chain
+from datasubway.data_model import DataModel
+from datasubway.cst.visitors.validate_measure_method_chain import validate_measure_method_chain
 
 
 def measure(data_model_instance: DataModel) -> Callable:

@@ -5,13 +5,8 @@ Tests the functionality of extracting variable names from @measure(variable_name
 """
 
 import pytest
-import sys
-from pathlib import Path
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-from cst.extractors.extract_decorator_variable import extract_decorator_variable_name
+from datasubway.cst.extractors.extract_decorator_variable import extract_decorator_variable_name
 
 
 class TestExtractDecoratorVariable:

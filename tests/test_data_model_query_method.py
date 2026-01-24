@@ -1,16 +1,10 @@
 import pytest
 import polars as pl
 from pathlib import Path
-import sys
 import tempfile
 import shutil
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-from data_model import DataModel
-from decorators import measure
-from column_context import Allow
+from datasubway import DataModel, measure, Allow
 
 
 class TestDataModelQueryMethod:
@@ -540,7 +534,7 @@ class TestDataModelQueryMethod:
 
     def test_parallel_processing_with_ten_measures(self, datamodel_with_many_measures):
         """Test that 10 measures triggers parallel processing and returns correct results."""
-        from data_model import PARALLEL_THRESHOLD
+        from datasubway.data_model import PARALLEL_THRESHOLD
 
         dm = datamodel_with_many_measures
         measure_names = [
@@ -584,7 +578,7 @@ class TestDataModelQueryMethod:
 
     def test_parallel_results_match_sequential(self, datamodel_with_many_measures):
         """Test that parallel processing produces same results as sequential."""
-        from data_model import PARALLEL_THRESHOLD
+        from datasubway.data_model import PARALLEL_THRESHOLD
 
         dm = datamodel_with_many_measures
 

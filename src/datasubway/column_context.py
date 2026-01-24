@@ -412,7 +412,7 @@ class Allow:
                 return []
 
             # Recursively extract columns from filter expression
-            from query_context.filter_context import Filter
+            from datasubway.query_context.filter_context import Filter
             filter_obj = Filter(filtered_expr)
             columns = filter_obj.get_columns()
 
@@ -770,7 +770,7 @@ class Exclude:
                 return []
 
             # Recursively extract columns from filter expression
-            from query_context.filter_context import Filter
+            from datasubway.query_context.filter_context import Filter
             filter_obj = Filter(filtered_expr)
             columns = filter_obj.get_columns()
 

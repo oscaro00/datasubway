@@ -1,13 +1,7 @@
 import pytest
 import polars as pl
-from pathlib import Path
-import sys
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-from data_model import DataModel
-from decorators import measure
+from datasubway import DataModel, measure
 
 
 class TestMeasureDecorator:

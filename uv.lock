@@ -18,10 +18,14 @@ wheels = [
 [[package]]
 name = "datasubway"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "libcst" },
     { name = "polars" },
+]
+
+[package.optional-dependencies]
+dev = [
     { name = "pytest" },
 ]
 
@@ -29,8 +33,9 @@ dependencies = [
 requires-dist = [
     { name = "libcst", specifier = ">=1.8.6" },
     { name = "polars", specifier = ">=1.36.1" },
-    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "iniconfig"

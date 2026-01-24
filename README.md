@@ -32,7 +32,7 @@ The purpose of this library is to define a data model using python focusing on t
   - Allow()/Exclude() calls from agg() and select() [with aggregation applied] should go in the agg part of table()
   - It is important feeding Allow() and Exclude() into table() calls only happens within a polars method chain
 
-- Figure out how to arrange the repo to create a package
+- Add a license file
 - Look at include parameter of the last group_by to understand which columns must exist in a group_by for the measure to be selected
   - Would also need the rest of the Allow() and Exclude() to understand with the context
 - Logging solution

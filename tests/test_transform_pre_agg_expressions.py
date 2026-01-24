@@ -1,11 +1,6 @@
 import pytest
-import sys
-from pathlib import Path
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-from cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
+from datasubway.cst.transformers.transform_pre_agg_expressions import transform_pre_agg_expressions
 
 
 class TestTransformPreAggExpressions:

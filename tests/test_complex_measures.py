@@ -2,16 +2,10 @@ import pytest
 import polars as pl
 from polars.testing import assert_frame_equal
 from pathlib import Path
-import sys
 import tempfile
 import shutil
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-from data_model import DataModel
-from decorators import measure
-from column_context import Allow, Exclude
+from datasubway import DataModel, measure, Allow, Exclude
 
 
 class TestComplexMeasures:
@@ -586,24 +580,18 @@ class TestComplexMeasures:
                 .agg(pl.col('revenue').sum().alias('total_revenue'))
             )
             
-            if len(qc.get('group')) >= 1:
-                return (
-                    numerator
-                    .join(total_denominator, on=qc.get('group'), how='inner')
-                    .group_by(Allow('*', include=['stores.store_id'], context=qc.get('group', [])))
-                    .agg(
-                        (pl.col('numerator_revenue') / pl.col('total_revenue') * 100).round(1).alias('revenue_percentage')
-                    )
+            return (
+                numerator
+                .join(
+                    total_denominator, 
+                    on=qc.get('group') if len(qc.get('group', [])) >= 1 else None, 
+                    how='inner' if len(qc.get('group', [])) >= 1 else 'cross'
                 )
-            else:
-                return (
-                    numerator
-                    .join(total_denominator, how='cross')
-                    .group_by(Allow('*', include=['stores.store_id'], context=qc.get('group', [])))
-                    .agg(
-                        (pl.col('numerator_revenue') / pl.col('total_revenue') * 100).round(1).first().alias('revenue_percentage')
-                    )
+                .group_by(Allow('*', include=['stores.store_id'], context=qc.get('group', [])))
+                .agg(
+                    (pl.col('numerator_revenue') / pl.col('total_revenue') * 100).round(1).first().alias('revenue_percentage')
                 )
+            )
         
         result = dm.query(
             query_context={'measure' : ['store_share_of_revenue'], 'sort' : [('stores.store_id', 'asc')]},

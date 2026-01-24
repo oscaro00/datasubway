@@ -2,14 +2,10 @@ import pytest
 import polars as pl
 import libcst as cst
 from pathlib import Path
-import sys
 import tempfile
 import shutil
 
-# Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-from data_model import DataModel
+from datasubway import DataModel
 
 
 class TestTableMethod:

@@ -1,11 +1,6 @@
 import pytest
-import sys
-from pathlib import Path
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-from cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
+from datasubway.cst.transformers.remove_empty_polars_methods import remove_empty_polars_methods
 
 
 class TestRemoveEmptyPolarsMethods:
