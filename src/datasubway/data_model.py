@@ -71,6 +71,7 @@ class DataModel:
         self.table_schemas = {tbl_name : lf.collect_schema().names() for tbl_name, lf in self.tables.items()}
 
         self.measures = {}
+        self.grouping_contexts = {}
 
         self.validate_tables()
         self.join_lookup = JoinGraph(self.tables, self.joins).build()

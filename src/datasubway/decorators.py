@@ -4,6 +4,7 @@ import textwrap
 
 from datasubway.data_model import DataModel
 from datasubway.cst.visitors.validate_measure_method_chain import validate_measure_method_chain
+from datasubway.cst.visitors.get_last_grouping_context import get_last_grouping_context
 
 
 def measure(data_model_instance: DataModel) -> Callable:
@@ -70,6 +71,13 @@ def measure(data_model_instance: DataModel) -> Callable:
 
             if not is_valid:
                 raise ValueError(error_msg)
+
+            # Extract and store grouping context
+            try:
+                grouping_context = get_last_grouping_context(dedented_source, func_name)
+                data_model_instance.grouping_contexts[func_name] = grouping_context
+            except Exception:
+                data_model_instance.grouping_contexts[func_name] = None
 
         except OSError as e:
             # inspect.getsource() can fail for functions defined in interactive sessions
