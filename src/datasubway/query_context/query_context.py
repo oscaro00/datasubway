@@ -1,6 +1,7 @@
 from typing import Dict, Self, List
 import polars as pl
 from datasubway.query_context.filter_context import Filter
+from datasubway.validation.safe_literals import validate_safe_context, validate_all_strings_are_safe
 
 class QueryContext:
     """
@@ -35,6 +36,12 @@ class QueryContext:
         self.context = context
 
         self.validate_context()
+
+        # Security validation: ensure no callables/code objects
+        validate_safe_context(context)
+        # Security validation: ensure all strings are safe identifiers
+        validate_all_strings_are_safe(context)
+
         self.set_default_limit_offset()
     
 

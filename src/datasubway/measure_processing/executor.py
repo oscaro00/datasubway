@@ -6,6 +6,8 @@ from typing import Dict, Any, Optional, Callable, Tuple, TYPE_CHECKING
 
 import polars as pl
 
+from datasubway.validation.safe_literals import validate_safe_context, validate_all_strings_are_safe
+
 if TYPE_CHECKING:
     from datasubway.data_model import DataModel
     from datasubway.query_context.query_context import QueryContext
@@ -90,6 +92,12 @@ def exec_transformed_code(
 
     if decorator_variable_name is not None:
         exec_namespace[decorator_variable_name] = data_model
+
+    # Defense in depth: validate query_context before exec
+    # This should already be validated in QueryContext.__init__, but we
+    # re-validate here as a security safeguard
+    validate_safe_context(query_context.context)
+    validate_all_strings_are_safe(query_context.context)
 
     exec(transformed_code, exec_namespace)
     measure_func = exec_namespace[measure_name]

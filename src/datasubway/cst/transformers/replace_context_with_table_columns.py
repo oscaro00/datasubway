@@ -22,11 +22,11 @@ Example:
 """
 
 from typing import Dict, Any, Union, Optional, Literal, Tuple
+import ast
 import warnings
 
 import libcst as cst
 import libcst.matchers as m
-import polars as pl
 
 from datasubway.column_context import Allow, Exclude
 
@@ -79,6 +79,189 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
         self.current_function = None
         return updated_node
 
+    def _safe_construct_allow_exclude(self, call_node: cst.Call) -> Optional[Union[Allow, Exclude]]:
+        """Safely construct an Allow or Exclude instance from a CST Call node.
+
+        Parses arguments from CST and constructs the instance without using eval().
+        For complex expressions referencing runtime_context, uses safe lookup.
+
+        Args:
+            call_node: CST Call node for Allow() or Exclude()
+
+        Returns:
+            Allow or Exclude instance, or None if construction fails
+        """
+        # Determine which class to instantiate
+        func_name = cst.ensure_type(call_node.func, cst.Name).value
+        cls = Allow if func_name == 'Allow' else Exclude
+
+        # Extract arguments
+        # Allow/Exclude signature: def __init__(self, *columns, **kwargs)
+        # Positional args go into *columns, keyword args go into **kwargs
+        args_list = []  # For positional args (*columns)
+        kwargs: Dict[str, Any] = {}  # For keyword args (include=, context=)
+
+        for arg in call_node.args:
+            if arg.keyword is not None:
+                # Keyword argument
+                arg_name = arg.keyword.value
+                value = self._safe_extract_arg_value(arg.value)
+                kwargs[arg_name] = value
+            else:
+                # Positional argument - goes into *columns
+                value = self._safe_extract_arg_value(arg.value)
+                if value is None:
+                    return None
+                args_list.append(value)
+
+        try:
+            return cls(*args_list, **kwargs)
+        except Exception:
+            return None
+
+    def _safe_extract_arg_value(self, node: cst.BaseExpression) -> Optional[Any]:
+        """Safely extract a Python value from a CST expression node.
+
+        Handles:
+        - String literals
+        - List literals
+        - Dict literals
+        - Boolean/None literals
+        - var['key'] subscripts (looks up in runtime_context)
+        - var.get('key', default) calls (looks up in runtime_context)
+
+        Args:
+            node: CST expression node
+
+        Returns:
+            Extracted Python value, or None if extraction fails
+        """
+        # String literal
+        if isinstance(node, cst.SimpleString):
+            return node.value.strip('\'"')
+
+        # Concatenated string
+        if isinstance(node, cst.ConcatenatedString):
+            parts = []
+            for part in node.left, node.right:
+                if isinstance(part, cst.SimpleString):
+                    parts.append(part.value.strip('\'"'))
+            return ''.join(parts) if parts else None
+
+        # List literal
+        if isinstance(node, cst.List):
+            result = []
+            for elem in node.elements:
+                if isinstance(elem, cst.Element):
+                    val = self._safe_extract_arg_value(elem.value)
+                    if val is not None:
+                        result.append(val)
+            return result
+
+        # Tuple literal
+        if isinstance(node, cst.Tuple):
+            result = []
+            for elem in node.elements:
+                if isinstance(elem, cst.Element):
+                    val = self._safe_extract_arg_value(elem.value)
+                    if val is not None:
+                        result.append(val)
+            return tuple(result)
+
+        # Dict literal
+        if isinstance(node, cst.Dict):
+            result = {}
+            for elem in node.elements:
+                if isinstance(elem, cst.DictElement):
+                    key = self._safe_extract_arg_value(elem.key)
+                    val = self._safe_extract_arg_value(elem.value)
+                    if key is not None:
+                        result[key] = val
+            return result
+
+        # Boolean/None literals
+        if isinstance(node, cst.Name):
+            if node.value == 'True':
+                return True
+            elif node.value == 'False':
+                return False
+            elif node.value == 'None':
+                return None
+
+        # Integer literal
+        if isinstance(node, cst.Integer):
+            return int(node.value)
+
+        # Float literal
+        if isinstance(node, cst.Float):
+            return float(node.value)
+
+        # var['key'] subscript - lookup in runtime_context
+        if m.matches(node, m.Subscript(value=m.Name())):
+            return self._safe_context_lookup_subscript(node)
+
+        # var.get('key', default) call - lookup in runtime_context
+        if m.matches(node, m.Call(func=m.Attribute(value=m.Name(), attr=m.Name('get')))):
+            return self._safe_context_lookup_get(node)
+
+        # Try ast.literal_eval as fallback for other literals
+        try:
+            code = cst.Module(body=[cst.Expr(value=node)]).code.strip()
+            return ast.literal_eval(code)
+        except (ValueError, SyntaxError):
+            pass
+
+        return None
+
+    def _safe_context_lookup_subscript(self, node: cst.Subscript) -> Optional[Any]:
+        """Safely lookup var['key'] in runtime_context."""
+        var_name = cst.ensure_type(node.value, cst.Name).value
+        context_var = self.runtime_context.get(var_name)
+        if context_var is None or not isinstance(context_var, dict):
+            return None
+
+        if len(node.slice) != 1:
+            return None
+
+        slice_elem = node.slice[0]
+        if not isinstance(slice_elem, cst.SubscriptElement):
+            return None
+
+        slice_val = slice_elem.slice
+        if not isinstance(slice_val, cst.Index):
+            return None
+
+        key_node = slice_val.value
+        if isinstance(key_node, cst.SimpleString):
+            key = key_node.value.strip('\'"')
+            return context_var.get(key)
+
+        return None
+
+    def _safe_context_lookup_get(self, node: cst.Call) -> Optional[Any]:
+        """Safely lookup var.get('key', default) in runtime_context."""
+        attr_node = cst.ensure_type(node.func, cst.Attribute)
+        var_name = cst.ensure_type(attr_node.value, cst.Name).value
+
+        context_var = self.runtime_context.get(var_name)
+        if context_var is None or not isinstance(context_var, dict):
+            return None
+
+        if len(node.args) < 1:
+            return None
+
+        key_arg = node.args[0].value
+        if not isinstance(key_arg, cst.SimpleString):
+            return None
+        key = key_arg.value.strip('\'"')
+
+        # Extract default value if present
+        default = None
+        if len(node.args) >= 2:
+            default = self._safe_extract_arg_value(node.args[1].value)
+
+        return context_var.get(key, default)
+
     def leave_Call(
         self,
         original_node: cst.Call,
@@ -114,20 +297,10 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             return updated_node
 
         try:
-            # Convert CST node to executable code string
-            temp_module = cst.Module(body=[cst.Expr(value=updated_node)])
-            call_code = temp_module.code.strip()
-
-            # Prepare restricted eval globals
-            eval_globals = {
-                'Allow': Allow,
-                'Exclude': Exclude,
-                'pl': pl,
-                **self.runtime_context
-            }
-
-            # Evaluate to get instance
-            instance = eval(call_code, eval_globals)
+            # Safely construct Allow/Exclude instance from CST
+            instance = self._safe_construct_allow_exclude(updated_node)
+            if instance is None:
+                return updated_node
 
             # Get resolved columns and create appropriate output
             if self.output_type == 'polar_col':
@@ -200,18 +373,10 @@ class ReplaceContextWithTableColumns(cst.CSTTransformer):
             return None
 
         try:
-            # Evaluate the Allow/Exclude call
-            temp_module = cst.Module(body=[cst.Expr(value=allow_exclude_arg)])
-            call_code = temp_module.code.strip()
-
-            eval_globals = {
-                'Allow': Allow,
-                'Exclude': Exclude,
-                'pl': pl,
-                **self.runtime_context
-            }
-
-            instance = eval(call_code, eval_globals)
+            # Safely construct Allow/Exclude instance from CST
+            instance = self._safe_construct_allow_exclude(allow_exclude_arg)
+            if instance is None:
+                return None
 
             # Only handle sort contexts
             if instance.context_type != 'sort':

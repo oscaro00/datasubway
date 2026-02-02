@@ -211,9 +211,12 @@ class ReplaceTableCalls(cst.CSTTransformer):
 
     def _try_eval_expression(self, node: cst.BaseExpression) -> Optional[Any]:
         """
-        Attempt to evaluate a CST expression using eval().
+        Safely evaluate a CST expression for known safe patterns.
 
-        This is used as a fallback for complex expressions like qc.get('key', default).
+        Only evaluates:
+        - Simple literals (via ast.literal_eval)
+        - qc.get('key', default) calls
+        - qc['key'] subscripts
 
         Args:
             node: The CST expression node to evaluate
@@ -222,19 +225,106 @@ class ReplaceTableCalls(cst.CSTTransformer):
             The evaluated Python value, or None if evaluation fails
 
         Warning:
-            Emits a RuntimeWarning if evaluation fails.
+            Emits a RuntimeWarning if evaluation fails or pattern is not supported.
         """
+        import ast
+
+        temp_module = cst.Module(body=[cst.Expr(value=node)])
+        call_code = temp_module.code.strip()
+
+        # Try ast.literal_eval first for simple literals
         try:
-            temp_module = cst.Module(body=[cst.Expr(value=node)])
-            call_code = temp_module.code.strip()
-            return eval(call_code, {}, self.runtime_context)
-        except Exception as e:
-            warnings.warn(
-                f"Failed to evaluate expression: {type(e).__name__}: {e}",
-                RuntimeWarning,
-                stacklevel=3
-            )
-            return None
+            return ast.literal_eval(call_code)
+        except (ValueError, SyntaxError):
+            pass
+
+        # For qc.get() and qc[] patterns, manually extract and lookup
+        result = self._safe_context_lookup(node)
+        if result is not None:
+            return result
+
+        # Reject anything else
+        warnings.warn(
+            f"Cannot safely evaluate expression: {call_code}",
+            RuntimeWarning,
+            stacklevel=3
+        )
+        return None
+
+    def _safe_context_lookup(self, node: cst.BaseExpression) -> Optional[Any]:
+        """Safely extract value from qc.get() or qc[] patterns.
+
+        Args:
+            node: CST expression node to evaluate
+
+        Returns:
+            The looked-up value, or None if pattern doesn't match
+        """
+        # Handle var.get('key', default) pattern
+        if m.matches(node, m.Call(func=m.Attribute(value=m.Name(), attr=m.Name('get')))):
+            call_node = cst.ensure_type(node, cst.Call)
+            attr_node = cst.ensure_type(call_node.func, cst.Attribute)
+            var_name = cst.ensure_type(attr_node.value, cst.Name).value
+
+            # Get the context variable
+            context_var = self.runtime_context.get(var_name)
+            if context_var is None or not isinstance(context_var, dict):
+                return None
+
+            # Extract key (first argument)
+            if len(call_node.args) < 1:
+                return None
+
+            key_arg = call_node.args[0].value
+            if not isinstance(key_arg, cst.SimpleString):
+                return None
+            key = key_arg.value.strip('\'"')
+
+            # Extract default (second argument, if present)
+            default = None
+            if len(call_node.args) >= 2:
+                default_arg = call_node.args[1].value
+                # Try to evaluate default as a literal
+                default_code = cst.Module(body=[cst.Expr(value=default_arg)]).code.strip()
+                try:
+                    import ast
+                    default = ast.literal_eval(default_code)
+                except (ValueError, SyntaxError):
+                    # If default can't be parsed as literal, use None
+                    default = None
+
+            return context_var.get(key, default)
+
+        # Handle var['key'] subscript pattern
+        if m.matches(node, m.Subscript(value=m.Name())):
+            subscript_node = cst.ensure_type(node, cst.Subscript)
+            var_name = cst.ensure_type(subscript_node.value, cst.Name).value
+
+            # Get the context variable
+            context_var = self.runtime_context.get(var_name)
+            if context_var is None or not isinstance(context_var, dict):
+                return None
+
+            # Extract key from subscript
+            if len(subscript_node.slice) != 1:
+                return None
+
+            slice_elem = subscript_node.slice[0]
+            if not isinstance(slice_elem, cst.SubscriptElement):
+                return None
+
+            slice_val = slice_elem.slice
+            if not isinstance(slice_val, cst.Index):
+                return None
+
+            key_node = slice_val.value
+            if not isinstance(key_node, cst.SimpleString):
+                return None
+
+            key = key_node.value.strip('\'"')
+            return context_var.get(key)
+
+        return None
 
     def _evaluate_list_arg(self, node: cst.BaseExpression) -> Optional[list[str]]:
         """Evaluate a list argument."""
