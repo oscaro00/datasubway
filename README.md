@@ -34,8 +34,6 @@ The purpose of this library is to define a data model using python focusing on t
 
 - Add a license file
 - Benchmark system
-- Logging solution
-  - Timestamp of call, execution time, query_context, transformed measure before execution, output_type for query()
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
   - Could also display logs
   - Probably makes sense to expose methods from data_model.py that will print this info (leave the UI to users)

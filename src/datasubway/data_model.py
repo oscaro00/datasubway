@@ -27,7 +27,7 @@ PARALLEL_THRESHOLD = 10
 
 class DataModel:
 
-    def __init__(self: Self, tables: Dict[str, pl.LazyFrame], joins: List[Dict[str, Any]], pre_aggregations: Dict[str, Any], pre_agg_directory: Optional[Path]) -> Self:
+    def __init__(self: Self, tables: Dict[str, pl.LazyFrame], joins: List[Dict[str, Any]], pre_aggregations: Dict[str, Any], pre_agg_directory: Optional[Path], logging_directory: Optional[Path] = None) -> Self:
         """
         Expected join format:
         [
@@ -84,6 +84,11 @@ class DataModel:
             self.join_lookup
         )
         self.pre_agg_metadata = self._pre_agg_manager.metadata
+
+        # Initialize query logging
+        self._logging_directory = logging_directory
+        if logging_directory:
+            logging_directory.mkdir(parents=True, exist_ok=True)
 
 
     def validate_tables(self: Self) -> None:
@@ -222,6 +227,14 @@ class DataModel:
             ...     output_type='data'
             ... )
         """
+        # Start timing for logging
+        import time
+        start_time = time.perf_counter()
+        query_id = None
+        if self._logging_directory:
+            import uuid
+            query_id = str(uuid.uuid4())
+
         # Validate output_type
         if output_type not in ['explain', 'query', 'data']:
             raise ValueError(
@@ -245,7 +258,8 @@ class DataModel:
                 )
 
         # Process measures (parallel or sequential based on count)
-        if len(measure_names) >= PARALLEL_THRESHOLD:
+        used_parallel = len(measure_names) >= PARALLEL_THRESHOLD
+        if used_parallel:
             results = self._process_measures_parallel(measure_names, qc)
         else:
             results = self._process_measures_sequential(measure_names, qc)
@@ -256,6 +270,18 @@ class DataModel:
         for i, (code, lazy_frame) in enumerate(results):
             transformed_codes[measure_names[i]] = code
             lazy_frames.append(lazy_frame)
+
+        # Log query if logging is enabled
+        if self._logging_directory:
+            execution_time_ms = (time.perf_counter() - start_time) * 1000
+            self._log_query(
+                query_id=query_id,
+                execution_time_ms=execution_time_ms,
+                output_type=output_type,
+                query_context=qc.context,
+                transformed_codes=transformed_codes,
+                used_parallel=used_parallel
+            )
 
         # Handle 'query' output type
         if output_type == 'query':
@@ -508,3 +534,44 @@ class DataModel:
             results.append((transformed_code, lazy_frame))
 
         return results
+
+    def _log_query(
+        self: Self,
+        query_id: str,
+        execution_time_ms: float,
+        output_type: str,
+        query_context: Dict[str, Any],
+        transformed_codes: Dict[str, str],
+        used_parallel: bool
+    ) -> None:
+        """Write query log entry to parquet file.
+
+        Each query is logged to a separate parquet file with timestamp and UUID.
+        Files can be read together with: pl.scan_parquet("logs/*.parquet")
+
+        Args:
+            query_id: UUID string identifying this query
+            execution_time_ms: Total query execution time in milliseconds
+            output_type: One of 'explain', 'query', or 'data'
+            query_context: The validated query context dictionary
+            transformed_codes: Dict mapping measure names to transformed source code
+            used_parallel: Whether parallel processing was used for measures
+        """
+        import json
+        from datetime import datetime, timezone
+
+        timestamp = datetime.now(timezone.utc)
+
+        log_entry = pl.DataFrame({
+            "query_id": [query_id],
+            "timestamp": [timestamp],
+            "execution_time_ms": [execution_time_ms],
+            "output_type": [output_type],
+            "measure_count": [len(transformed_codes)],
+            "used_parallel": [used_parallel],
+            "query_context": [json.dumps(query_context)],
+            "transformed_measures": [json.dumps(transformed_codes)]
+        })
+
+        filename = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{query_id[:8]}.parquet"
+        log_entry.write_parquet(self._logging_directory / filename)
