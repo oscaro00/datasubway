@@ -22,7 +22,7 @@ from datasubway.measure_processing import (
 
 # Threshold for parallel vs sequential measure processing
 # Below this count, process overhead exceeds parallelization benefit
-PARALLEL_THRESHOLD = 10
+PARALLEL_THRESHOLD = 50
 
 
 class DataModel:
