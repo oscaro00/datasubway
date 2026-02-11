@@ -3,6 +3,8 @@
 Run: python src2/demo_serialize.py
 """
 
+# TODO: use this file for a reference to create tests that verify the serialization hasn't changed when polars versions change
+
 from __future__ import annotations
 
 import json

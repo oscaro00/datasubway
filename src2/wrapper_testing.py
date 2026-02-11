@@ -79,8 +79,9 @@ def rewrite_agg_expr(expr: pl.Expr, schema: pl.Schema) -> pl.Expr:
     tree = json.loads(expr.meta.serialize(format="json"))
     rewritten = walk_agg_expr(tree, schema)
     if (
+        # TODO: check if this is inefficient (i.e. comparing json objects)
         rewritten == tree
-    ):  # TODO: check if this is inefficient (i.e. comparing json objects)
+    ):
         return expr
     return pl.Expr.deserialize(json.dumps(rewritten).encode(), format="json")
 
