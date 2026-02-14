@@ -1,14 +1,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Iterable, Self
+from typing import Any, Callable
 
-import numpy as np
 import polars as pl
-from polars._typing import EngineType, ExplainFormat, IntoExpr, IntoExprColumn
-from polars.lazyframe.group_by import LazyGroupBy
-from polars.lazyframe.in_process import InProcessQuery
-from polars.lazyframe.opt_flags import QueryOptFlags
 
 
 def serialize_expr(expr: pl.Expr) -> dict:

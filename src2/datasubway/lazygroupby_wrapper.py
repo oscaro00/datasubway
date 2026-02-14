@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import json
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Self
+from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
     from datasubway.lazyframe_wrapper import LazyFrameWrapper
 
-import numpy as np
 import polars as pl
-from polars._typing import EngineType, ExplainFormat, IntoExpr, IntoExprColumn
+from polars._typing import IntoExpr
 from polars.lazyframe.group_by import LazyGroupBy
-from polars.lazyframe.in_process import InProcessQuery
-from polars.lazyframe.opt_flags import QueryOptFlags
-from pre_agg_expr import rewrite_agg_expr
+
+from datasubway.pre_agg_expr import rewrite_agg_expr
 
 
 class LazyGroupByWrapper:
@@ -35,4 +32,6 @@ class LazyGroupByWrapper:
             k: rewrite_agg_expr(v, self.schema) if isinstance(v, pl.Expr) else v
             for k, v in named_aggs.items()
         }
+        from datasubway.lazyframe_wrapper import LazyFrameWrapper
+
         return LazyFrameWrapper(self.lgb.agg(*rewritten, **named_rewritten))

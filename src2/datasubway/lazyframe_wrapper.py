@@ -8,10 +8,10 @@ if TYPE_CHECKING:
 import numpy as np
 import polars as pl
 from polars._typing import EngineType, ExplainFormat, IntoExpr, IntoExprColumn
-from polars.lazyframe.group_by import LazyGroupBy
 from polars.lazyframe.in_process import InProcessQuery
 from polars.lazyframe.opt_flags import QueryOptFlags
-from pre_agg_expr import rewrite_agg_expr
+
+from datasubway.pre_agg_expr import rewrite_agg_expr
 
 
 class LazyFrameWrapper:
@@ -46,6 +46,8 @@ class LazyFrameWrapper:
         if len(by) == 0 and len(named_by) == 0:
             return self.__class__(self.lf)
         else:
+            from datasubway.lazygroupby_wrapper import LazyGroupByWrapper
+
             return LazyGroupByWrapper(
                 self.lf.group_by(*by, maintain_order=maintain_order, **named_by),
                 self.lf,  # need this for access to the schema
