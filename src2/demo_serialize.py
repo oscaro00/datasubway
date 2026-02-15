@@ -50,6 +50,15 @@ show("var (ddof=1)", pl.col("revenue").var())
 show("first", pl.col("revenue").first())
 show("last", pl.col("revenue").last())
 show("median", pl.col("revenue").median())
+show("any", pl.col("revenue").any())
+show("all", pl.col("revenue").all())
+show("n unique", pl.col("revenue").n_unique())
+show("approx n unique", pl.col("revenue").approx_n_unique())
+show("arg max", pl.col("revenue").arg_max())
+show("arg min", pl.col("revenue").arg_min())
+show("len", pl.col("revenue").len())
+show("null count", pl.col("revenue").null_count())
+show("product", pl.col("revenue").product())
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. FUNCTIONS — wrapped in {"Function": {"input": [...], "function": ...}}
