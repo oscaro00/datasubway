@@ -22,8 +22,9 @@ from datasubway.pre_agg_expr import rewrite_agg_expr
 
 
 class LazyFrameWrapper:
-    def __init__(self, lf: pl.LazyFrame) -> None:
+    def __init__(self, lf: pl.LazyFrame, from_pre_agg: bool = False) -> None:
         self.lf = lf
+        self.from_pre_agg = from_pre_agg
 
     # This allows polars LazyFrame methods that don't need custom functionality to work as expect
     # without having to explicitly write them as methods for LazyFrameWrapper
@@ -53,7 +54,9 @@ class LazyFrameWrapper:
         if len(predicates) == 0 and len(constraints) == 0:
             return self
         else:
-            return self.__class__(self.lf.filter(*predicates, **constraints))
+            return self.__class__(
+                self.lf.filter(*predicates, **constraints), self.from_pre_agg
+            )
 
     def group_by(
         self,
@@ -63,13 +66,13 @@ class LazyFrameWrapper:
     ) -> LazyFrameWrapper | LazyGroupByWrapper:
 
         if len(by) == 0 and len(named_by) == 0:
-            return self.__class__(self.lf)
+            return self.__class__(self.lf, self.from_pre_agg)
         else:
             from datasubway.lazygroupby_wrapper import LazyGroupByWrapper
 
             return LazyGroupByWrapper(
                 self.lf.group_by(*by, maintain_order=maintain_order, **named_by),
-                self.lf,  # need this for access to the schema
+                self.from_pre_agg,
             )
 
     def group_by_dynamic(
@@ -103,7 +106,7 @@ class LazyFrameWrapper:
                     group_by=group_by,
                     start_by=start_by,
                 ),
-                self.lf,
+                self.from_pre_agg,
             )
 
     def rolling(
@@ -117,7 +120,7 @@ class LazyFrameWrapper:
     ) -> LazyFrameWrapper | LazyGroupByWrapper:
 
         if index_column is None:
-            return self.__class__(self.lf)
+            return self.__class__(self.lf, self.from_pre_agg)
         else:
             from datasubway.lazygroupby_wrapper import LazyGroupByWrapper
 
@@ -129,7 +132,7 @@ class LazyFrameWrapper:
                     closed=closed,
                     group_by=group_by,
                 ),
-                self.lf,
+                self.from_pre_agg,
             )
 
     def sort(
@@ -153,7 +156,8 @@ class LazyFrameWrapper:
                     nulls_last=nulls_last,
                     maintain_order=maintain_order,
                     multithreaded=multithreaded,
-                )
+                ),
+                self.from_pre_agg,
             )
 
     """
@@ -172,18 +176,28 @@ class LazyFrameWrapper:
     ) -> LazyFrameWrapper:
         # TODO: the table() method of DataModel could emit a LazyFrameWrapper object with a parameter
         # is_pre_agg. This would avoid a potenial expensive collect_schema() call
-        schema = self.lf.collect_schema()
-        rewritten = [
-            rewrite_agg_expr(a, schema) if isinstance(a, pl.Expr) else a for a in aggs
-        ]
-        named_rewritten = {
-            k: rewrite_agg_expr(v, schema) if isinstance(v, pl.Expr) else v
-            for k, v in named_aggs.items()
-        }
-        return LazyFrameWrapper(self.lf.select(*rewritten, **named_rewritten))
+
+        if not self.from_pre_agg:
+            return LazyFrameWrapper(
+                self.lf.select(*aggs, **named_aggs), self.from_pre_agg
+            )
+
+        # if self.from_pre_agg == true, then all aggregations need to be rewritten to match
+        # either new column names and potentially corrected calculations
+        else:
+            rewritten = [
+                rewrite_agg_expr(a) if isinstance(a, pl.Expr) else a for a in aggs
+            ]
+            named_rewritten = {
+                k: rewrite_agg_expr(v) if isinstance(v, pl.Expr) else v
+                for k, v in named_aggs.items()
+            }
+            return LazyFrameWrapper(
+                self.lf.select(*rewritten, **named_rewritten), self.from_pre_agg
+            )
 
     def all(self) -> LazyFrameWrapper:
-        return LazyFrameWrapper(self.lf.select(pl.all().list.all()))
+        return LazyFrameWrapper(self.lf.select(pl.all().list.all()), self.from_pre_agg)
 
     def having(self, *predicates: IntoExpr | Iterable[IntoExpr]) -> LazyFrameWrapper:
         """This method only makes sense on a LazyGroupBy or LazyGroupByWrapper object,
@@ -193,14 +207,18 @@ class LazyFrameWrapper:
     def len(self, name: str | None = None) -> LazyFrameWrapper:
         if name is None:
             name = "len"
-        return LazyFrameWrapper(self.lf.select(pl.all().len().alias(name)))
+        return LazyFrameWrapper(
+            self.lf.select(pl.all().len().alias(name)), self.from_pre_agg
+        )
 
     def map_groups(
         self,
         function: Callable[[pl.DataFrame], pl.DataFrame],
         schema: SchemaDict | None,
     ) -> LazyFrameWrapper:
-        return LazyFrameWrapper(self.lf.map_batches(function, schema=schema))
+        return LazyFrameWrapper(
+            self.lf.map_batches(function, schema=schema), self.from_pre_agg
+        )
 
     def n_unique(self) -> LazyFrameWrapper:
-        return LazyFrameWrapper(self.lf.select(pl.all().n_unique()))
+        return LazyFrameWrapper(self.lf.select(pl.all().n_unique()), self.from_pre_agg)

@@ -161,7 +161,7 @@ def get_pre_agg_transform(agg_type: str) -> Callable:
     return pre_agg_transformations[agg_type]
 
 
-def walk_agg_expr(node: Any, schema: pl.Schema) -> Any:
+def walk_agg_expr(node: Any) -> Any:
     """Recursively walk the serialized expression tree and rewrite Agg/Function nodes."""
     if isinstance(node, dict):
         # ── Agg pattern ──────────────────────────────────────────────────
@@ -175,7 +175,7 @@ def walk_agg_expr(node: Any, schema: pl.Schema) -> Any:
                     include_nulls = agg_value.get("include_nulls", False)
                     agg_type = "Len" if include_nulls else "Count"
 
-                if col_name not in schema and agg_type in pre_agg_transformations:
+                if agg_type in pre_agg_transformations:
                     return get_pre_agg_transform(agg_type)(col_name)
 
         # ── Function pattern (Any, All, Product, NullCount, etc.) ────────
@@ -183,23 +183,23 @@ def walk_agg_expr(node: Any, schema: pl.Schema) -> Any:
             agg_type = get_function_agg_type(node)
             if agg_type is not None and agg_type in pre_agg_transformations:
                 col_name = get_col_name(node["Function"]["input"])
-                if col_name is not None and col_name not in schema:
+                if col_name is not None:
                     return get_pre_agg_transform(agg_type)(col_name)
 
         # Recurse into inner dict
-        return {k: walk_agg_expr(v, schema) for k, v in node.items()}
+        return {k: walk_agg_expr(v) for k, v in node.items()}
 
     # Recurse into list
     if isinstance(node, list):
-        return [walk_agg_expr(item, schema) for item in node]
+        return [walk_agg_expr(item) for item in node]
 
     return node
 
 
-def rewrite_agg_expr(expr: pl.Expr, schema: pl.Schema) -> pl.Expr:
+def rewrite_agg_expr(expr: pl.Expr) -> pl.Expr:
     """Rewrite a Polars expression to use pre-aggregated columns where available"""
     tree = json.loads(expr.meta.serialize(format="json"))
-    rewritten = walk_agg_expr(tree, schema)
+    rewritten = walk_agg_expr(tree)
     if (
         # TODO: check if this is inefficient (i.e. comparing json objects)
         rewritten == tree
