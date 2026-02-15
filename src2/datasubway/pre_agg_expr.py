@@ -23,6 +23,18 @@ def pre_agg_transform(agg_type: str) -> Callable:
     return decorator
 
 
+@pre_agg_transform("All")
+def all_pre_agg_expr(col: str, *, ignore_nulls: bool = True) -> dict:
+    expr = pl.col(f"{col}-all").all(ignore_nulls=ignore_nulls)
+    return serialize_expr(expr)
+
+
+@pre_agg_transform("Any")
+def any_pre_agg_expr(col: str, *, ignore_nulls: bool = True) -> dict:
+    expr = pl.col(f"{col}-any").any(ignore_nulls=ignore_nulls)
+    return serialize_expr(expr)
+
+
 @pre_agg_transform("Sum")
 def sum_pre_agg_expr(col: str) -> dict:
     expr = pl.col(f"{col}-sum").sum()
