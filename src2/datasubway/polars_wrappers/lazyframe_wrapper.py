@@ -3,12 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 if TYPE_CHECKING:
-    from datasubway.lazygroupby_wrapper import LazyGroupByWrapper
+    from datasubway.polars_wrappers.lazygroupby_wrapper import LazyGroupByWrapper
 
 from datetime import timedelta
 
 import numpy as np
 import polars as pl
+from datasubway.polars_wrappers.pre_agg_expr import rewrite_agg_expr
 from polars._typing import (
     ClosedInterval,
     IntoExpr,
@@ -17,8 +18,6 @@ from polars._typing import (
     SchemaDict,
     StartBy,
 )
-
-from datasubway.pre_agg_expr import rewrite_agg_expr
 
 
 class LazyFrameWrapper:
@@ -68,7 +67,9 @@ class LazyFrameWrapper:
         if len(by) == 0 and len(named_by) == 0:
             return self.__class__(self.lf, self.from_pre_agg)
         else:
-            from datasubway.lazygroupby_wrapper import LazyGroupByWrapper
+            from datasubway.polars_wrappers.lazygroupby_wrapper import (
+                LazyGroupByWrapper,
+            )
 
             return LazyGroupByWrapper(
                 self.lf.group_by(*by, maintain_order=maintain_order, **named_by),
@@ -92,7 +93,9 @@ class LazyFrameWrapper:
         if index_column is None:
             return self.__class__(self.lf)
         else:
-            from datasubway.lazygroupby_wrapper import LazyGroupByWrapper
+            from datasubway.polars_wrappers.lazygroupby_wrapper import (
+                LazyGroupByWrapper,
+            )
 
             return LazyGroupByWrapper(
                 self.lf.group_by_dynamic(
@@ -122,7 +125,9 @@ class LazyFrameWrapper:
         if index_column is None:
             return self.__class__(self.lf, self.from_pre_agg)
         else:
-            from datasubway.lazygroupby_wrapper import LazyGroupByWrapper
+            from datasubway.polars_wrappers.lazygroupby_wrapper import (
+                LazyGroupByWrapper,
+            )
 
             return LazyGroupByWrapper(
                 self.lf.rolling(

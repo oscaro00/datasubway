@@ -3,13 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
-    from datasubway.lazyframe_wrapper import LazyFrameWrapper
+    from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
 
 import polars as pl
+from datasubway.polars_wrappers.pre_agg_expr import rewrite_agg_expr
 from polars._typing import IntoExpr
 from polars.lazyframe.group_by import LazyGroupBy
-
-from datasubway.pre_agg_expr import rewrite_agg_expr
 
 
 class LazyGroupByWrapper:
@@ -25,7 +24,7 @@ class LazyGroupByWrapper:
             return attr
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            from datasubway.lazyframe_wrapper import LazyFrameWrapper
+            from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
 
             result = attr(*args, **kwargs)
             if isinstance(result, pl.LazyFrame):
@@ -40,7 +39,7 @@ class LazyGroupByWrapper:
         **named_aggs: IntoExpr,
     ) -> LazyFrameWrapper:
 
-        from datasubway.lazyframe_wrapper import LazyFrameWrapper
+        from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
 
         if not self.from_pre_agg:
             return LazyFrameWrapper(

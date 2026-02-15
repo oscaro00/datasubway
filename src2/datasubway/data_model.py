@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Literal, Optional, Self, Union
 
 import polars as pl
 
-from src2.datasubway.lazyframe_wrapper import LazyFrameWrapper
+from src2.datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
 
 
 def __init__(

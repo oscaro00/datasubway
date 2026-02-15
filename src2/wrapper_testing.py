@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import polars as pl
-from datasubway.lazyframe_wrapper import LazyFrameWrapper
+from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
 
 if __name__ == "__main__":
     lf = pl.LazyFrame(
