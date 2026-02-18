@@ -8,12 +8,20 @@ and save it to the data model object upon @measure decorator validation.
 """
 
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Optional, TypedDict, cast
 
 import libcst as cst
 from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
 
 GROUP_BY_VARIANTS = {"group_by", "group_by_dynamic", "rolling"}
+KEYWORD_GROUP_BY_VARIANTS = {"group_by_dynamic", "rolling"}  # use group_by= kwarg
+
+
+class GroupingContext(TypedDict):
+    type: str  # "allow" or "exclude"
+    pattern: str  # source code of the pattern arg
+    context: str  # source code of the context arg
+    include: str | None  # source code of include arg (with index_column merged), or None
 
 
 @dataclass
@@ -128,7 +136,7 @@ class MeasureGroupingValidator(cst.CSTVisitor):
 
 
 def _extract_allow_exclude(call_node: cst.Call, method_name: str) -> Optional[cst.Call]:
-    if method_name == "group_by":
+    if method_name not in KEYWORD_GROUP_BY_VARIANTS:
         # First positional arg should be allow()/exclude()
         for arg in call_node.args:
             if arg.keyword is None:
@@ -138,7 +146,7 @@ def _extract_allow_exclude(call_node: cst.Call, method_name: str) -> Optional[cs
                     if arg.value.func.value in ("allow", "exclude"):
                         return arg.value
                 return None
-    elif method_name in ("group_by_dynamic", "rolling"):
+    elif method_name in KEYWORD_GROUP_BY_VARIANTS:
         # group_by= keyword arg
         for arg in call_node.args:
             if arg.keyword and arg.keyword.value == "group_by":
@@ -154,7 +162,7 @@ def _extract_allow_exclude(call_node: cst.Call, method_name: str) -> Optional[cs
 def _extract_index_column(
     call_node: cst.Call, method_name: str
 ) -> Optional[cst.BaseExpression]:
-    if method_name not in ("group_by_dynamic", "rolling"):
+    if method_name not in KEYWORD_GROUP_BY_VARIANTS:
         return None
 
     # Check for index_column= keyword arg
@@ -171,70 +179,55 @@ def _extract_index_column(
     return None
 
 
-def _merge_index_column(
-    ae_node: cst.Call, index_col_node: cst.BaseExpression
-) -> cst.Call:
-    """Merge index_column into the include= parameter of allow()/exclude()."""
-    new_args = list(ae_node.args)
+def _extract_grouping_context(
+    tree: cst.Module,
+    ae_node: cst.Call,
+    index_col_node: Optional[cst.BaseExpression],
+    method_name: str,
+) -> GroupingContext:
+    """Extract a structured GroupingContext from the allow()/exclude() call node."""
+    # type from the function name
+    assert isinstance(ae_node.func, cst.Name)
+    ctx_type = ae_node.func.value  # "allow" or "exclude"
 
-    for i, arg in enumerate(new_args):
-        if arg.keyword and arg.keyword.value == "include":
-            existing = arg.value
-            if isinstance(existing, cst.List):
-                new_elements = list(existing.elements)
-                if new_elements and isinstance(
-                    new_elements[-1].comma, cst.MaybeSentinel
-                ):
-                    new_elements[-1] = new_elements[-1].with_changes(
-                        comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
-                    )
-                new_elements.append(cst.Element(value=index_col_node))
-                new_args[i] = arg.with_changes(
-                    value=existing.with_changes(elements=new_elements)
-                )
-            else:
-                # Wrap existing + index_col into a list
-                new_args[i] = arg.with_changes(
-                    value=cst.List(
-                        elements=[
-                            cst.Element(
-                                value=existing,
-                                comma=cst.Comma(
-                                    whitespace_after=cst.SimpleWhitespace(" ")
-                                ),
-                            ),
-                            cst.Element(value=index_col_node),
-                        ]
-                    )
-                )
-            return ae_node.with_changes(args=new_args)
+    pattern: str | None = None
+    context: str | None = None
+    include: str | None = None
 
-    # No include= found, add it
-    if new_args:
-        last = new_args[-1]
-        if isinstance(last.comma, cst.MaybeSentinel):
-            new_args[-1] = last.with_changes(
-                comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
-            )
-    new_args.append(
-        cst.Arg(
-            keyword=cst.Name("include"),
-            value=index_col_node,
-            equal=cst.AssignEqual(
-                whitespace_before=cst.SimpleWhitespace(""),
-                whitespace_after=cst.SimpleWhitespace(""),
-            ),
-        )
+    for arg in ae_node.args:
+        if arg.keyword and arg.keyword.value == "pattern":
+            pattern = tree.code_for_node(arg.value)
+        elif arg.keyword and arg.keyword.value == "context":
+            context = tree.code_for_node(arg.value)
+        elif arg.keyword and arg.keyword.value == "include":
+            include = tree.code_for_node(arg.value)
+
+    assert pattern is not None, "allow()/exclude() missing pattern= argument"
+    assert context is not None, "allow()/exclude() missing context= argument"
+
+    # Merge index_column into include for keyword group_by variants
+    if method_name in KEYWORD_GROUP_BY_VARIANTS and index_col_node is not None:
+        index_col_src = tree.code_for_node(index_col_node)
+        if include is not None:
+            include = f"[{include}, {index_col_src}]"
+        else:
+            include = index_col_src
+
+    return GroupingContext(
+        type=ctx_type,
+        pattern=pattern,
+        context=context,
+        include=include,
     )
 
-    return ae_node.with_changes(args=new_args)
 
-
-def validate_and_extract_grouping_context(source_code: str, function_name: str) -> str:
+def validate_and_extract_grouping_context(
+    source_code: str, function_name: str
+) -> GroupingContext:
     """Validate that a measure function follows the correct polars grouping pattern.
 
-    Raises ValueError if invalid. Returns the allow()/exclude() source string if valid.
-    For group_by_dynamic/rolling, merges index_column into include= of the allow/exclude call.
+    Raises ValueError if invalid. Returns a GroupingContext dict if valid.
+    For group_by_dynamic/rolling, merges index_column into include.
     """
     tree = cst.parse_module(source_code)
     wrapper = MetadataWrapper(tree)
@@ -242,15 +235,12 @@ def validate_and_extract_grouping_context(source_code: str, function_name: str) 
     wrapper.visit(validator)
     grouping_info = validator.validate()
 
-    node = grouping_info.allow_exclude_node
-    assert node is not None  # guaranteed by validate()
-    if grouping_info.index_column_node is not None and grouping_info.method_name in (
-        "group_by_dynamic",
-        "rolling",
-    ):
-        node = _merge_index_column(node, grouping_info.index_column_node)
+    ae_node = grouping_info.allow_exclude_node
+    assert ae_node is not None  # guaranteed by validate()
 
-    return tree.code_for_node(node)
+    return _extract_grouping_context(
+        tree, ae_node, grouping_info.index_column_node, grouping_info.method_name
+    )
 
 
 if __name__ == "__main__":
@@ -307,11 +297,11 @@ if __name__ == "__main__":
 
     print("=== Testing valid_measure1 ===")
     result = validate_and_extract_grouping_context(source_code, "valid_measure1")
-    print(f"  Result: {result}")
+    print(f"  Result: {dict(result)}")
 
     print("\n=== Testing valid_measure2 ===")
     result = validate_and_extract_grouping_context(source_code, "valid_measure2")
-    print(f"  Result: {result}")
+    print(f"  Result: {dict(result)}")
 
     for name in ["invalid_measure1", "invalid_measure2", "invalid_measure3"]:
         print(f"\n=== Testing {name} ===")
