@@ -6,6 +6,7 @@ from typing import Any
 
 import polars as pl
 
+from datasubway.joins_meta import Join, parse_joins
 from datasubway.polars_wrappers.proxy import LazyFrameProxy
 from datasubway.pre_agg_meta import (
     PreAggregation,
@@ -67,6 +68,8 @@ class DataModel:
             tbl_name: lf.collect_schema().names()
             for tbl_name, lf in self.tables.items()
         }
+
+        self.joins_lookup: dict[str, dict[str, list[Join]]] = parse_joins(self.joins)
 
         self.measures: dict[str, Any] = {}
 
