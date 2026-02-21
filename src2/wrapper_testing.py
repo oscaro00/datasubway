@@ -235,7 +235,7 @@ if __name__ == "__main__":
     proxy_join = (
         dm_join.table("orders")
         .join(
-            dm_join.table("products").filter(pl.col("active") == True),
+            dm_join.table("products").filter(pl.col("active")),
             left_on="product_id",
             right_on="product_id",
         )

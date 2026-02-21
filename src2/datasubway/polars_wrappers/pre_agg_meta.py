@@ -57,7 +57,7 @@ AGG_EXPANSION: dict[str, set[str]] = {
 class PreAggregation:
     name: str
     group_by: list[str]              # fully-qualified: ['orders.date', 'orders.region']
-    aggregations: dict[str, list[str]]  # {'orders.revenue': ['sum', 'count'], ...}
+    aggregations: dict[str, str | list[str]]  # {'orders.revenue': 'mean'} or ['mean', 'max']
     file_path: Path
     row_count: int = 0               # smaller = more aggregated = preferred; set on write
     written_at: datetime | None = None  # set on write

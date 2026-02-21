@@ -7,8 +7,10 @@ Additionally, get the allow() or exclude() call from the final grouping method (
 and save it to the data model object upon @measure decorator validation.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, TypedDict, cast
+from typing import TypedDict, cast
 
 import libcst as cst
 from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
@@ -21,22 +23,24 @@ class GroupingContext(TypedDict):
     type: str  # "allow" or "exclude"
     pattern: str  # source code of the pattern arg
     context: str  # source code of the context arg
-    include: str | None  # source code of include arg (with index_column merged), or None
+    include: (
+        str | None
+    )  # source code of include arg (with index_column merged), or None
 
 
 @dataclass
 class GroupingCallInfo:
     method_name: str
     line: int
-    allow_exclude_node: Optional[cst.Call]
-    index_column_node: Optional[cst.BaseExpression]
+    allow_exclude_node: cst.Call | None
+    index_column_node: cst.BaseExpression | None
 
 
 @dataclass
 class ChainInfo:
     methods: list[str]
     end_line: int
-    grouping_info: Optional[GroupingCallInfo]
+    grouping_info: GroupingCallInfo | None
 
 
 class MeasureGroupingValidator(cst.CSTVisitor):
@@ -48,7 +52,7 @@ class MeasureGroupingValidator(cst.CSTVisitor):
         self.chains: list[ChainInfo] = []
         self._visited_calls: set[int] = set()
 
-    def visit_FunctionDef(self, node: cst.FunctionDef) -> Optional[bool]:
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool | None:
         if node.name.value == self.function_name:
             self.in_target_function = True
         return None
@@ -57,7 +61,7 @@ class MeasureGroupingValidator(cst.CSTVisitor):
         if original_node.name.value == self.function_name:
             self.in_target_function = False
 
-    def visit_Call(self, node: cst.Call) -> Optional[bool]:
+    def visit_Call(self, node: cst.Call) -> bool | None:
         if not self.in_target_function:
             return None
         if id(node) in self._visited_calls:
@@ -135,7 +139,7 @@ class MeasureGroupingValidator(cst.CSTVisitor):
         return grouping_info
 
 
-def _extract_allow_exclude(call_node: cst.Call, method_name: str) -> Optional[cst.Call]:
+def _extract_allow_exclude(call_node: cst.Call, method_name: str) -> cst.Call | None:
     if method_name not in KEYWORD_GROUP_BY_VARIANTS:
         # First positional arg should be allow()/exclude()
         for arg in call_node.args:
@@ -161,7 +165,7 @@ def _extract_allow_exclude(call_node: cst.Call, method_name: str) -> Optional[cs
 
 def _extract_index_column(
     call_node: cst.Call, method_name: str
-) -> Optional[cst.BaseExpression]:
+) -> cst.BaseExpression | None:
     if method_name not in KEYWORD_GROUP_BY_VARIANTS:
         return None
 
@@ -182,7 +186,7 @@ def _extract_index_column(
 def _extract_grouping_context(
     tree: cst.Module,
     ae_node: cst.Call,
-    index_col_node: Optional[cst.BaseExpression],
+    index_col_node: cst.BaseExpression | None,
     method_name: str,
 ) -> GroupingContext:
     """Extract a structured GroupingContext from the allow()/exclude() call node."""

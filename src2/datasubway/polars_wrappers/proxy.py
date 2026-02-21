@@ -272,7 +272,9 @@ class LazyFrameProxy:
             # Strip table prefixes from all string args and kwarg values — Polars only
             # knows unqualified column names, and the analysis phase is already done.
             resolved_args = tuple(strip_table_prefix(a) for a in resolved_args)
-            resolved_kwargs = {k: strip_table_prefix(v) for k, v in resolved_kwargs.items()}
+            resolved_kwargs = {
+                k: strip_table_prefix(v) for k, v in resolved_kwargs.items()
+            }
 
             result = getattr(result, op.method)(*resolved_args, **resolved_kwargs)
 

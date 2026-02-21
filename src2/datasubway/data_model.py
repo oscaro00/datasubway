@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import polars as pl
 
@@ -18,11 +18,12 @@ from datasubway.polars_wrappers.proxy import LazyFrameProxy
 class DataModel:
     def __init__(
         self,
-        tables: Dict[str, pl.LazyFrame],
-        joins: List[Dict[str, Any]] = [],
-        pre_aggregations: Dict[str, Any] = {},
-        pre_agg_directory: Optional[Path] = None,
-        logging_directory: Optional[Path] = None,
+        tables: dict[str, pl.LazyFrame],
+        *,
+        joins: list[dict[str, Any]] | None = None,
+        pre_aggregations: dict[str, Any] | None = None,
+        pre_agg_directory: Path | None = None,
+        logging_directory: Path | None = None,
     ) -> None:
         """
         Expected join format:
@@ -58,19 +59,20 @@ class DataModel:
         inside pre_agg_directory.
         """
         self.tables = tables
-        self.joins = joins
+        self.joins = joins if joins is not None else []
         self.pre_agg_directory = pre_agg_directory or Path("_pre_aggregations/")
         self.logging_directory = logging_directory
 
-        self.table_schemas: Dict[str, list[str]] = {
+        self.table_schemas: dict[str, list[str]] = {
             tbl_name: lf.collect_schema().names()
             for tbl_name, lf in self.tables.items()
         }
 
-        self.measures: Dict[str, Any] = {}
+        self.measures: dict[str, Any] = {}
 
         self.pre_agg_objects: list[PreAggregation] = parse_pre_aggregations(
-            pre_aggregations, self.pre_agg_directory
+            pre_aggregations if pre_aggregations is not None else {},
+            self.pre_agg_directory,
         )
 
     def table(self, table_name: str) -> LazyFrameProxy:
