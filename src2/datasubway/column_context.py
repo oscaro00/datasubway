@@ -47,7 +47,7 @@ def allow(
     context: str | list[str],
     include: str | list[str] = [],
     *,
-    include_tables: bool = False,
+    include_tables: bool = True,
 ) -> list[str]:
     if isinstance(pattern, str):
         pattern = [pattern]
@@ -89,7 +89,7 @@ def exclude(
     context: str | list[str],
     include: str | list[str] = [],
     *,
-    include_tables: bool = False,
+    include_tables: bool = True,
 ) -> list[str]:
     if isinstance(pattern, str):
         pattern = [pattern]

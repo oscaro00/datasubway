@@ -161,38 +161,38 @@ def get_pre_agg_transform(agg_type: str) -> Callable:
     return pre_agg_transformations[agg_type]
 
 
+def match_agg_node(node: dict) -> tuple[str, str] | None:
+    """If node is a recognized Agg or Function pattern, return (col_name, agg_type), else None."""
+    if "Agg" in node and len(node) == 1:
+        for agg_type, agg_value in node["Agg"].items():
+            col = get_col_name(agg_value)
+            # Count vs Len: both serialize as Count, differentiated by include_nulls
+            if agg_type == "Count":
+                include_nulls = agg_value.get("include_nulls", False)
+                agg_type = "Len" if include_nulls else "Count"
+            if col and agg_type in pre_agg_transformations:
+                return col, agg_type
+
+    if "Function" in node and len(node) == 1:
+        agg_type = get_function_agg_type(node)
+        if agg_type and agg_type in pre_agg_transformations:
+            col = get_col_name(node["Function"]["input"])
+            if col:
+                return col, agg_type
+
+    return None
+
+
 def walk_agg_expr(node: Any) -> Any:
     """Recursively walk the serialized expression tree and rewrite Agg/Function nodes."""
     if isinstance(node, dict):
-        # ── Agg pattern ──────────────────────────────────────────────────
-        if "Agg" in node and len(node) == 1:
-            agg_dict = node["Agg"]
-            for agg_type, agg_value in agg_dict.items():
-                col_name = get_col_name(agg_value)
-
-                # Count vs Len: both serialize as Count, differentiated by include_nulls
-                if agg_type == "Count":
-                    include_nulls = agg_value.get("include_nulls", False)
-                    agg_type = "Len" if include_nulls else "Count"
-
-                if agg_type in pre_agg_transformations:
-                    return get_pre_agg_transform(agg_type)(col_name)
-
-        # ── Function pattern (Any, All, Product, NullCount, etc.) ────────
-        if "Function" in node and len(node) == 1:
-            agg_type = get_function_agg_type(node)
-            if agg_type is not None and agg_type in pre_agg_transformations:
-                col_name = get_col_name(node["Function"]["input"])
-                if col_name is not None:
-                    return get_pre_agg_transform(agg_type)(col_name)
-
-        # Recurse into inner dict
+        match = match_agg_node(node)
+        if match:
+            col, agg_type = match
+            return get_pre_agg_transform(agg_type)(col)
         return {k: walk_agg_expr(v) for k, v in node.items()}
-
-    # Recurse into list
     if isinstance(node, list):
         return [walk_agg_expr(item) for item in node]
-
     return node
 
 
@@ -206,3 +206,29 @@ def rewrite_agg_expr(expr: pl.Expr) -> pl.Expr:
     ):
         return expr
     return pl.Expr.deserialize(json.dumps(rewritten).encode(), format="json")
+
+
+def extract_agg_requirements(expr: pl.Expr) -> dict[str, set[str]]:
+    """Walk a Polars expression and return {col_name: {PolarsAggType}} pairs.
+
+    Used by LazyFrameProxy.resolve() to determine what pre-aggregation components
+    are needed to satisfy the aggregations in a measure's .agg() call.
+    """
+    tree = json.loads(expr.meta.serialize(format="json"))
+    requirements: dict[str, set[str]] = {}
+    walk_for_requirements(tree, requirements)
+    return requirements
+
+
+def walk_for_requirements(node: Any, requirements: dict[str, set[str]]) -> None:
+    if isinstance(node, dict):
+        match = match_agg_node(node)
+        if match:
+            col, agg_type = match
+            requirements.setdefault(col, set()).add(agg_type)
+            return
+        for v in node.values():
+            walk_for_requirements(v, requirements)
+    elif isinstance(node, list):
+        for item in node:
+            walk_for_requirements(item, requirements)

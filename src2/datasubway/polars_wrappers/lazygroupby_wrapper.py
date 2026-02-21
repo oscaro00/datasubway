@@ -14,7 +14,7 @@ from polars.lazyframe.group_by import LazyGroupBy
 class LazyGroupByWrapper:
     def __init__(self, lgb: LazyGroupBy, from_pre_agg: bool = False) -> None:
         self.lgb = lgb
-        self.from_pre_agg
+        self.from_pre_agg = from_pre_agg
 
     # This allows polars LazyGroupBy methods that don't need custom functionality to work as expect
     # without having to explicitly write them as methods for LazyGroupByWrapper

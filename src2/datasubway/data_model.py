@@ -1,88 +1,134 @@
-import os
+from __future__ import annotations
+
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Self, Union
+from typing import Any, Dict, List, Optional
 
 import polars as pl
 
-from src2.datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
+from datasubway.polars_wrappers.pre_agg_meta import (
+    PreAggregation,
+    load_metadata,
+    parse_pre_aggregations,
+    save_metadata,
+)
+from datasubway.polars_wrappers.proxy import LazyFrameProxy
 
 
-def __init__(
-    self,
-    tables: Dict[str, pl.LazyFrame],
-    joins: List[Dict[str, Any]],
-    pre_aggregations: Dict[str, Any],
-    pre_agg_directory: Optional[Path],
-    logging_directory: Optional[Path] = None,
-) -> None:
-    """
-    Expected join format:
-    [
+class DataModel:
+    def __init__(
+        self,
+        tables: Dict[str, pl.LazyFrame],
+        joins: List[Dict[str, Any]] = [],
+        pre_aggregations: Dict[str, Any] = {},
+        pre_agg_directory: Optional[Path] = None,
+        logging_directory: Optional[Path] = None,
+    ) -> None:
+        """
+        Expected join format:
+        [
+            {
+                'left':'table1', 'right':'table2',
+                'left_on':['col1', 'col3'], 'right_on':['col1', 'col2'],
+                'how':'inner', 'direction':'right2left' # direction can also be 'both'
+            },
+        ]
+
+        Expected pre_aggregations format:
         {
-            'left':'table1', 'right':'table2',
-            'left_on':['col1', 'col3'], 'right_on':['col1', 'col2'],
-            'how':'inner', 'direction':'right2left' # direction can also be 'both'
-            # left joins only make sense if direction is right2left
-        },
-        {} # more join edges
-    ]
-
-    Expected pre_aggregations format:
-    {
-        'pre_agg1_name' : {
-            'group_by' : ['tbl1.col10', 'tbl2.col11'],
-            'aggregations' : {
-                'tbl1.col1' : 'sum',           # Single function
-                'tbl1.col2' : ['max', 'min'],  # Multiple functions
-                'tbl2.col3' : ['mean']
+            'pre_agg_name': {
+                'group_by': ['tbl1.col1', 'tbl2.col2'],
+                'aggregations': {
+                    'tbl1.col3': 'sum',
+                    'tbl1.col4': ['mean', 'max'],
+                    'tbl2.col5': 'std',
+                },
             }
         }
-    }
 
-    Note: Aggregation values can be either:
-    - A single function string (e.g., 'sum', 'max', 'mean')
-    - A list of function strings (e.g., ['sum', 'max', 'mean'])
-    Both formats are supported and will be normalized internally.
+        Aggregation values are standard aggregation names: 'sum', 'min', 'max', 'count',
+        'len', 'mean', 'std', 'var', 'first', 'last', 'product', 'null_count', 'all',
+        'any', 'n_unique', 'median'. Compound aggregations like 'mean' and 'std' are
+        automatically expanded to the required stored components (e.g. 'mean' → sum + count).
 
-    Expected data in pre_agg_metadata:
-    - name, file path, last modified timestamp, group by columns, aggregated columns with type of aggregation, row count (sort key)
+        row_count and written_at are recorded automatically by write_pre_agg() and
+        should not be specified in the config.
 
-    The pre_agg_metadata list should be sorted in ascending order of row count
-    """
+        Pre-aggregation names must be unique — they determine the parquet file name
+        inside pre_agg_directory.
+        """
+        self.tables = tables
+        self.joins = joins
+        self.pre_agg_directory = pre_agg_directory or Path("_pre_aggregations/")
+        self.logging_directory = logging_directory
 
-    self.tables = tables
-    self.joins = joins
-    self.pre_aggregations = pre_aggregations
-    self.pre_agg_directory = pre_agg_directory or Path("_pre_aggregations/")
+        self.table_schemas: Dict[str, list[str]] = {
+            tbl_name: lf.collect_schema().names()
+            for tbl_name, lf in self.tables.items()
+        }
 
-    self.table_schemas = {
-        tbl_name: lf.collect_schema().names() for tbl_name, lf in self.tables.items()
-    }
+        self.measures: Dict[str, Any] = {}
 
-    self.measures = {}
+        self.pre_agg_objects: list[PreAggregation] = parse_pre_aggregations(
+            pre_aggregations, self.pre_agg_directory
+        )
 
-    def table(
-        self,
-        table_name: str,
-        non_agg_context: list[str],
-        agg_context: dict[str, str],
-        *,
-        allow_pre_aggs: bool = True,
-        query_context: dict,
-    ) -> LazyFrameWrapper:
-        # Validate inputs
+    def table(self, table_name: str) -> LazyFrameProxy:
+        """Return a LazyFrameProxy for the named table.
+
+        The proxy records the method chain and resolves to the optimal source
+        (pre-agg or raw table) when .resolve() is called.
+        """
         if table_name not in self.tables:
             raise KeyError(
                 f"Table '{table_name}' not found. Available: {list(self.tables.keys())}"
             )
+        return LazyFrameProxy(table_name, self)
 
-        # TODO: Resolve allow() and exclude() to know needed columns
+    def find_best_pre_agg(
+        self,
+        table_name: str,
+        group_by: list[str],
+        agg_reqs: dict[str, set[str]],
+    ) -> PreAggregation | None:
+        """Return the most-aggregated pre-agg that covers the requested group-by and aggs.
 
-        # TODO: If allow_pre_aggs, look for a potential pre aggregation
-        # Add a lazyframewrapper parameter to say if a pre agg was returned or not
+        Returns None if no pre-agg qualifies.
+        """
+        candidates = [p for p in self.pre_agg_objects if p.covers(group_by, agg_reqs)]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda p: p.row_count)
 
-        # TODO: Otherwise, fallback on building from the source tables with joins
+    def write_pre_agg(self, name: str, lf: pl.LazyFrame) -> PreAggregation:
+        """Write a pre-aggregated LazyFrame to parquet and record metadata.
 
-        # this return is just a temporary solution to get something working
-        # there is more complex logic that is described above
-        return LazyFrameWrapper(self.tables[table_name], from_pre_agg=False)
+        Collects the frame, writes it to pre_agg_directory/{name}.parquet, then
+        updates the metadata file with the row count and write timestamp. The
+        in-memory PreAggregation object is updated to match.
+        """
+        pre_agg = next((p for p in self.pre_agg_objects if p.name == name), None)
+        if pre_agg is None:
+            raise KeyError(
+                f"Pre-aggregation '{name}' not defined. "
+                f"Available: {[p.name for p in self.pre_agg_objects]}"
+            )
+
+        df = lf.collect()
+        row_count = len(df)
+        written_at = datetime.now()
+
+        self.pre_agg_directory.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(pre_agg.file_path)
+
+        metadata = load_metadata(self.pre_agg_directory)
+        metadata[name] = {
+            "row_count": row_count,
+            "written_at": written_at.isoformat(),
+        }
+        save_metadata(self.pre_agg_directory, metadata)
+
+        pre_agg.row_count = row_count
+        pre_agg.written_at = written_at
+
+        return pre_agg
