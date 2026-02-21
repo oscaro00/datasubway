@@ -65,14 +65,14 @@ if __name__ == "__main__":
     print("\n=== Scenario 1: PreAggregation.covers() ===")
     from pathlib import Path
 
-    from datasubway.polars_wrappers.pre_agg_meta import PreAggregation
+    from datasubway.pre_agg_meta import PreAggregation
 
     pa = PreAggregation(
         name="orders_daily",
         group_by=["orders.date", "orders.region"],
-        aggregations={"orders.revenue": "mean"},  # expands to ['count', 'sum']
-        file_path=Path("_pre_aggregations/orders_daily.parquet"),
-        row_count=100,
+        raw_aggregations={"orders.revenue": "mean"},  # expands to ['count', 'sum']
+        # file_path=Path("_pre_aggregations/orders_daily.parquet"),
+        # row_count=100,
     )
     assert pa.aggregations == {"orders.revenue": ["count", "sum"]}, (
         f"'mean' should expand to ['count', 'sum'], got {pa.aggregations}"
@@ -97,7 +97,7 @@ if __name__ == "__main__":
     pa_mean_only = PreAggregation(
         name="orders_mean_only",
         group_by=["orders.date"],
-        aggregations={"orders.revenue": "mean"},  # expands to sum+count, no sumsq
+        raw_aggregations={"orders.revenue": "mean"},  # expands to sum+count, no sumsq
         file_path=Path("_pre_aggregations/orders_mean_only.parquet"),
     )
     assert not pa_mean_only.covers(["orders.date"], {"orders.revenue": {"Std"}}), (

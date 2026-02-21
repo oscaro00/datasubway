@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import polars as pl
-
 
 # What pre-agg stored component types are needed to use each Polars agg function.
 # Keys match Polars JSON serialization (capitalized). Values match metadata format (lowercase).
@@ -56,17 +55,20 @@ AGG_EXPANSION: dict[str, set[str]] = {
 @dataclass
 class PreAggregation:
     name: str
-    group_by: list[str]              # fully-qualified: ['orders.date', 'orders.region']
-    aggregations: dict[str, str | list[str]]  # {'orders.revenue': 'mean'} or ['mean', 'max']
-    file_path: Path
-    row_count: int = 0               # smaller = more aggregated = preferred; set on write
+    group_by: list[str]  # fully-qualified: ['orders.date', 'orders.region']
+    raw_aggregations: InitVar[
+        dict[str, str | list[str]]
+    ]  # {'orders.revenue': 'mean'} or ['mean', 'max']
+    file_path: Path = field(default_factory=Path)
+    row_count: int = 0  # smaller = more aggregated = preferred; set on write
     written_at: datetime | None = None  # set on write
+    aggregations: dict[str, list[str]] = field(init=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, raw_aggregations: dict[str, str | list[str]]) -> None:
         # Expand user-specified aggregation names to stored component names.
         # e.g. 'mean' → ['count', 'sum'], 'std' → ['count', 'sum', 'sumsq']
         expanded: dict[str, list[str]] = {}
-        for col, aggs in self.aggregations.items():
+        for col, aggs in raw_aggregations.items():
             if isinstance(aggs, str):
                 aggs = [aggs]
             components: set[str] = set()
@@ -135,10 +137,12 @@ def parse_pre_aggregations(
             PreAggregation(
                 name=name,
                 group_by=config.get("group_by", []),
-                aggregations=config.get("aggregations", {}),
+                raw_aggregations=config.get("aggregations", {}),
                 file_path=pre_agg_directory / f"{name}.parquet",
                 row_count=meta.get("row_count", 0),
-                written_at=datetime.fromisoformat(written_at_raw) if written_at_raw else None,
+                written_at=datetime.fromisoformat(written_at_raw)
+                if written_at_raw
+                else None,
             )
         )
     return result

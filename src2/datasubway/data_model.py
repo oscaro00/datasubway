@@ -6,13 +6,13 @@ from typing import Any
 
 import polars as pl
 
-from datasubway.polars_wrappers.pre_agg_meta import (
+from datasubway.polars_wrappers.proxy import LazyFrameProxy
+from datasubway.pre_agg_meta import (
     PreAggregation,
     load_metadata,
     parse_pre_aggregations,
     save_metadata,
 )
-from datasubway.polars_wrappers.proxy import LazyFrameProxy
 
 
 class DataModel:

@@ -7,7 +7,7 @@ import polars as pl
 
 if TYPE_CHECKING:
     from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
-    from datasubway.polars_wrappers.pre_agg_meta import PreAggregation
+    from datasubway.pre_agg_meta import PreAggregation
 
 
 class _DataModelLike(Protocol):
