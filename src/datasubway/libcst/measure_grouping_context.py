@@ -250,7 +250,7 @@ def validate_and_extract_grouping_context(
 if __name__ == "__main__":
     import polars as pl
 
-    from src2.datasubway.column_context import allow, exclude
+    from src.datasubway.column_context import allow, exclude
 
     lf = pl.LazyFrame(
         {
