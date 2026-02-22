@@ -10,9 +10,7 @@ def parse_table_column(table_column_str: str) -> tuple[str, str]:
     regex_find = re.findall(table_column_pattern, table_column_str)
 
     if len(regex_find) == 0:
-        raise Exception(
-            f"Invalid table column string in allow()/exclude(): {table_column_str}"
-        )
+        raise Exception(f"Invalid table column string: {table_column_str}")
     # regex_find should be an object like: [('table_name', 'column_name')]
     return regex_find[0][0], regex_find[0][1]
 

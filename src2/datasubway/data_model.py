@@ -6,6 +6,7 @@ from typing import Any
 
 import polars as pl
 
+from datasubway.column_context import parse_table_columns, parse_table_column
 from datasubway.joins_meta import Join, parse_joins
 from datasubway.polars_wrappers.proxy import LazyFrameProxy
 from datasubway.pre_agg_meta import (
@@ -14,6 +15,7 @@ from datasubway.pre_agg_meta import (
     parse_pre_aggregations,
     save_metadata,
 )
+from datasubway.query_context import QueryContext
 
 
 class DataModel:
@@ -137,3 +139,37 @@ class DataModel:
         pre_agg.written_at = written_at
 
         return pre_agg
+
+    def validate_query_context(self, qc: QueryContext) -> bool:
+        for measure in qc.measures:
+            if measure not in self.measures.keys():
+                raise KeyError(f"measure '{measure}' not an available measure")
+
+        # TODO: need to parse the table columns in filters
+
+        parsed_groups = parse_table_columns(qc.groups)
+        for table, column in parsed_groups:
+            if table not in self.table_schemas.keys():
+                raise KeyError(f"grouping '{table.column}' does not have a valid table")
+            if column not in self.table_schemas[table]
+                raise ValueError(f"grouping '{table.column}' does not have a valid column")
+
+        # TODO: need to parse the table columns in havings (should be similar to filters)
+
+        for table_column, direction in qc.sorts:
+            table, column = parse_table_column(table_column)
+            if table not in self.table_schemas.keys():
+                raise KeyError(f"sorting '{table.column}' does not have a valid table")
+            if column not in self.table_schemas[table]
+                raise ValueError(f"sorting '{table.column}' does not have a valid column")
+
+            if direction not in ['asc', 'desc']:
+                raise ValueError(f"sorting direction '{direction}' is not allowed")
+
+        if not isinstance(qc.limit, int) or qc.limit < 1:
+            raise ValueError(f"limit '{qc.limit}' must be a positive integer")
+
+        if not isinstance(qc.offset, int) or qc.offset < 0:
+            raise ValueError(f"offset '{qc.offset}' must be a non-negative integer")
+
+        return True
