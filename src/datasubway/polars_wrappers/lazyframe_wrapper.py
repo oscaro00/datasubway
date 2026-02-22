@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from datasubway.polars_wrappers.lazygroupby_wrapper import LazyGroupByWrapper
 
 from datetime import timedelta
 
-import numpy as np
 import polars as pl
 from datasubway.polars_wrappers.pre_agg_expr import rewrite_agg_expr
 from polars._typing import (
