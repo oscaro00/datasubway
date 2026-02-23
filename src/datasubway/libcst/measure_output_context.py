@@ -9,6 +9,7 @@ and save it to the data model object upon @measure decorator validation.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from typing import TypedDict, cast
 
@@ -41,6 +42,13 @@ class ChainInfo:
     methods: list[str]
     end_line: int
     grouping_info: GroupingCallInfo | None
+    agg_node: cst.Call | None
+
+
+@dataclass
+class ValidatedMeasureInfo:
+    grouping_info: GroupingCallInfo
+    agg_node: cst.Call
 
 
 class MeasureGroupingValidator(cst.CSTVisitor):
@@ -74,12 +82,16 @@ class MeasureGroupingValidator(cst.CSTVisitor):
         # Extract the full method chain walking inward
         methods = []
         grouping_info = None
+        agg_call_node: cst.Call | None = None
         current = node
 
         while isinstance(current, cst.Call) and isinstance(current.func, cst.Attribute):
             method_name = current.func.attr.value
             methods.append(method_name)
             self._visited_calls.add(id(current))
+
+            if method_name == "agg":
+                agg_call_node = current
 
             if method_name in GROUP_BY_VARIANTS:
                 allow_exclude = _extract_allow_exclude(current, method_name)
@@ -103,12 +115,13 @@ class MeasureGroupingValidator(cst.CSTVisitor):
                     methods=methods,
                     end_line=pos.end.line,
                     grouping_info=grouping_info,
+                    agg_node=agg_call_node,
                 )
             )
 
         return None
 
-    def validate(self) -> GroupingCallInfo:
+    def validate(self) -> ValidatedMeasureInfo:
         if not self.chains:
             raise ValueError(
                 f"No method chains found in function '{self.function_name}'."
@@ -136,7 +149,13 @@ class MeasureGroupingValidator(cst.CSTVisitor):
                 f"call in the grouping method."
             )
 
-        return grouping_info
+        agg_node = last_chain.agg_node
+        assert agg_node is not None  # guaranteed since methods[-1] == "agg"
+
+        return ValidatedMeasureInfo(
+            grouping_info=grouping_info,
+            agg_node=agg_node,
+        )
 
 
 def _extract_allow_exclude(call_node: cst.Call, method_name: str) -> cst.Call | None:
@@ -225,32 +244,131 @@ def _extract_grouping_context(
     )
 
 
-def validate_and_extract_grouping_context(
+def _extract_string_value(node: cst.BaseExpression) -> str:
+    """Extract a plain string value from a CST node.
+
+    Raises ValueError for f-strings, concatenated strings, or non-strings.
+    """
+    if not isinstance(node, cst.SimpleString):
+        raise ValueError(
+            f"Expected a simple string literal, got: {type(node).__name__}"
+        )
+    val = ast.literal_eval(node.value)
+    if not isinstance(val, str):
+        raise ValueError(f"Expected a string, got: {type(val).__name__}")
+    return val
+
+
+def _extract_column_name_from_expr(expr: cst.BaseExpression) -> list[str]:
+    """Extract output column name(s) from a single agg expression.
+
+    Walks the method chain outer to inner. If .alias() is found, uses its arg.
+    Otherwise walks to innermost pl.col(...) and uses column names.
+    """
+    if not isinstance(expr, cst.Call):
+        raise ValueError(
+            f"Expected a Call expression in agg argument, got: {type(expr).__name__}"
+        )
+
+    # First pass: walk outer to inner looking for .alias()
+    current: cst.BaseExpression = expr
+    while isinstance(current, cst.Call) and isinstance(current.func, cst.Attribute):
+        method_name = current.func.attr.value
+        if method_name == "alias":
+            positional_args = [arg for arg in current.args if arg.keyword is None]
+            if not positional_args:
+                raise ValueError("alias() called with no arguments")
+            return [_extract_string_value(positional_args[0].value)]
+        current = current.func.value
+
+    # No alias found — walk expr to innermost call (while inner value is still a Call)
+    current = expr
+    while (
+        isinstance(current, cst.Call)
+        and isinstance(current.func, cst.Attribute)
+        and isinstance(current.func.value, cst.Call)
+    ):
+        current = current.func.value
+
+    # current should now be pl.col(...) or pl.all()
+    if not isinstance(current, cst.Call):
+        raise ValueError(
+            f"Expected a function call at innermost level, got: {type(current).__name__}"
+        )
+
+    func = current.func
+    if not isinstance(func, cst.Attribute):
+        raise ValueError(
+            f"Unresolvable innermost expression type: {type(func).__name__}"
+        )
+
+    func_name = func.attr.value
+    if func_name == "all":
+        raise ValueError("pl.all() is not resolvable to specific column names")
+    if func_name == "col":
+        result = []
+        for arg in current.args:
+            if arg.keyword is None:
+                val = _extract_string_value(arg.value)
+                if val == "*":
+                    raise ValueError(
+                        "pl.col('*') is not resolvable to specific column names"
+                    )
+                result.append(val)
+        if not result:
+            raise ValueError("pl.col() called with no positional string arguments")
+        return result
+
+    raise ValueError(f"Unresolvable innermost expression: pl.{func_name}()")
+
+
+def _extract_agg_output_columns(agg_node: cst.Call) -> list[str]:
+    """Extract all output column names from the positional args of a .agg() call node."""
+    result = []
+    for arg in agg_node.args:
+        if arg.keyword is None:
+            cols = _extract_column_name_from_expr(arg.value)
+            result.extend(cols)
+    return result
+
+
+def _run_validator(
     source_code: str, function_name: str
-) -> GroupingContext:
+) -> tuple[cst.Module, ValidatedMeasureInfo]:
+    tree = cst.parse_module(source_code)
+    wrapper = MetadataWrapper(tree)
+    validator = MeasureGroupingValidator(function_name)
+    wrapper.visit(validator)
+    return tree, validator.validate()
+
+
+def extract_grouping_context(source_code: str, function_name: str) -> GroupingContext:
     """Validate that a measure function follows the correct polars grouping pattern.
 
     Raises ValueError if invalid. Returns a GroupingContext dict if valid.
     For group_by_dynamic/rolling, merges index_column into include.
     """
-    tree = cst.parse_module(source_code)
-    wrapper = MetadataWrapper(tree)
-    validator = MeasureGroupingValidator(function_name)
-    wrapper.visit(validator)
-    grouping_info = validator.validate()
-
-    ae_node = grouping_info.allow_exclude_node
-    assert ae_node is not None  # guaranteed by validate()
-
+    tree, validated = _run_validator(source_code, function_name)
+    ae_node = validated.grouping_info.allow_exclude_node
+    assert ae_node is not None
     return _extract_grouping_context(
-        tree, ae_node, grouping_info.index_column_node, grouping_info.method_name
+        tree,
+        ae_node,
+        validated.grouping_info.index_column_node,
+        validated.grouping_info.method_name,
     )
+
+
+def extract_agg_output_columns(source_code: str, function_name: str) -> list[str]:
+    """Extract the output column names produced by the .agg() call of a measure function."""
+    _, validated = _run_validator(source_code, function_name)
+    return _extract_agg_output_columns(validated.agg_node)
 
 
 if __name__ == "__main__":
     import polars as pl
 
-    from src.datasubway.column_context import allow, exclude
+    from datasubway.column_context import allow, exclude
 
     lf = pl.LazyFrame(
         {
@@ -270,7 +388,7 @@ if __name__ == "__main__":
         return (
             lf.filter(pl.col("c"))
             .group_by(allow(pattern="*", context=qc["groups"]))
-            .agg(pl.col("a").sum().alias("sum_a"))
+            .agg(pl.col("a").sum().alias("sum_a"), pl.col("b").first())
         )
 
     def valid_measure2(qc):
@@ -300,17 +418,21 @@ if __name__ == "__main__":
     # --- Run tests ---
 
     print("=== Testing valid_measure1 ===")
-    result = validate_and_extract_grouping_context(source_code, "valid_measure1")
-    print(f"  Result: {dict(result)}")
+    result = extract_grouping_context(source_code, "valid_measure1")
+    print(f"  Grouping context: {dict(result)}")
+    cols = extract_agg_output_columns(source_code, "valid_measure1")
+    print(f"  Agg output columns: {cols}")
 
     print("\n=== Testing valid_measure2 ===")
-    result = validate_and_extract_grouping_context(source_code, "valid_measure2")
-    print(f"  Result: {dict(result)}")
+    result = extract_grouping_context(source_code, "valid_measure2")
+    print(f"  Grouping context: {dict(result)}")
+    cols = extract_agg_output_columns(source_code, "valid_measure2")
+    print(f"  Agg output columns: {cols}")
 
     for name in ["invalid_measure1", "invalid_measure2", "invalid_measure3"]:
         print(f"\n=== Testing {name} ===")
         try:
-            validate_and_extract_grouping_context(source_code, name)
+            extract_grouping_context(source_code, name)
             print("  ERROR: Should have raised ValueError!")
         except ValueError as e:
             print(f"  Correctly raised: {e}")

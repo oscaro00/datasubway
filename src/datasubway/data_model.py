@@ -6,8 +6,12 @@ from typing import Any
 
 import polars as pl
 
-from datasubway.column_context import parse_table_columns, parse_table_column
+from datasubway.column_context import parse_table_column, parse_table_columns
 from datasubway.joins_meta import Join, parse_joins
+from datasubway.libcst.measure_output_context import GroupingContext
+from datasubway.polars_wrappers.filter_expr import (
+    extract_table_columns_from_filter_dict,
+)
 from datasubway.polars_wrappers.proxy import LazyFrameProxy
 from datasubway.pre_agg_meta import (
     PreAggregation,
@@ -74,6 +78,8 @@ class DataModel:
         self.joins_lookup: dict[str, dict[str, list[Join]]] = parse_joins(self.joins)
 
         self.measures: dict[str, Any] = {}
+        self.measure_grouping_contexts: dict[str, GroupingContext] = {}
+        self.measure_output_cols: dict[str, list[str]] = {}
 
         self.pre_agg_objects: list[PreAggregation] = parse_pre_aggregations(
             pre_aggregations if pre_aggregations is not None else {},
@@ -145,25 +151,56 @@ class DataModel:
             if measure not in self.measures.keys():
                 raise KeyError(f"measure '{measure}' not an available measure")
 
-        # TODO: need to parse the table columns in filters
+        filter_table_columns = list(
+            set(extract_table_columns_from_filter_dict(qc.filters))
+        )
+        parsed_filters = parse_table_columns(filter_table_columns)
+        for table, column in parsed_filters:
+            if table not in self.table_schemas.keys():
+                raise KeyError(f"filter '{table}.{column}' does not have a valid table")
+            if column not in self.table_schemas[table]:
+                raise ValueError(
+                    f"filter '{table}.{column}' does not have a valid column"
+                )
 
         parsed_groups = parse_table_columns(qc.groups)
         for table, column in parsed_groups:
             if table not in self.table_schemas.keys():
-                raise KeyError(f"grouping '{table.column}' does not have a valid table")
-            if column not in self.table_schemas[table]
-                raise ValueError(f"grouping '{table.column}' does not have a valid column")
+                raise KeyError(
+                    f"grouping '{table}.{column}' does not have a valid table"
+                )
+            if column not in self.table_schemas[table]:
+                raise ValueError(
+                    f"grouping '{table}.{column}' does not have a valid column"
+                )
 
-        # TODO: need to parse the table columns in havings (should be similar to filters)
+        candidate_havings_cols = qc.groups
+        for measure in qc.measures:
+            candidate_havings_cols.extend(self.measure_output_cols[measure])
+        having_table_columns = list(
+            set(extract_table_columns_from_filter_dict(qc.havings))
+        )
+        parsed_havings = parse_table_columns(having_table_columns)
+        for table, column in parsed_havings:
+            if table not in self.table_schemas.keys():
+                raise KeyError(f"having '{table}.{column}' does not have a valid table")
+            if column not in self.table_schemas[table]:
+                raise ValueError(
+                    f"having '{table}.{column}' does not have a valid column"
+                )
 
         for table_column, direction in qc.sorts:
             table, column = parse_table_column(table_column)
             if table not in self.table_schemas.keys():
-                raise KeyError(f"sorting '{table.column}' does not have a valid table")
-            if column not in self.table_schemas[table]
-                raise ValueError(f"sorting '{table.column}' does not have a valid column")
+                raise KeyError(
+                    f"sorting '{table}.{column}' does not have a valid table"
+                )
+            if column not in self.table_schemas[table]:
+                raise ValueError(
+                    f"sorting '{table}.{column}' does not have a valid column"
+                )
 
-            if direction not in ['asc', 'desc']:
+            if direction not in ["asc", "desc"]:
                 raise ValueError(f"sorting direction '{direction}' is not allowed")
 
         if not isinstance(qc.limit, int) or qc.limit < 1:

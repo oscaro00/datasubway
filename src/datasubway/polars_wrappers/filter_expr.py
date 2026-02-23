@@ -51,6 +51,25 @@ def build_filter_expr(spec: dict | tuple) -> pl.Expr:
     )
 
 
+def extract_table_columns_from_filter_dict(spec: dict | tuple) -> list[str]:
+    """Recursively extract all 'table.column' references from a filter spec."""
+    if isinstance(spec, tuple):
+        return [spec[0]]
+    if "AND" in spec:
+        return [
+            col
+            for s in spec["AND"]
+            for col in extract_table_columns_from_filter_dict(s)
+        ]
+    if "OR" in spec:
+        return [
+            col for s in spec["OR"] for col in extract_table_columns_from_filter_dict(s)
+        ]
+    raise ValueError(
+        f"Invalid filter spec; expected tuple or dict with 'AND'/'OR', got: {spec!r}"
+    )
+
+
 if __name__ == "__main__":
     df = pl.DataFrame(
         {

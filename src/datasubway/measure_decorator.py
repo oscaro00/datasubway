@@ -5,8 +5,9 @@ import textwrap
 from typing import Callable
 
 from datasubway.data_model import DataModel
-from datasubway.libcst.measure_grouping_context import (
-    validate_and_extract_grouping_context,
+from datasubway.libcst.measure_output_context import (
+    extract_agg_output_columns,
+    extract_grouping_context,
 )
 
 
@@ -27,12 +28,15 @@ def measure(data_model: DataModel) -> Callable:
 
         # Validate the measure ends in some type of group_by, then agg
         # and get the grouping context
-        grouping_context = validate_and_extract_grouping_context(
-            dedented_source, func_name
-        )
+        grouping_context = extract_grouping_context(dedented_source, func_name)
 
         # Add the grouping context to the data model instance
-        data_model.grouping_contexts[func_name] = grouping_context
+        data_model.measure_grouping_contexts[func_name] = grouping_context
+
+        # Get the names of output columns as lists
+        output_cols = extract_agg_output_columns(dedented_source, func_name)
+
+        data_model.measure_output_cols[func_name] = output_cols
 
         # add the measure to the list of measures in the function
         data_model.measures[func_name] = func
