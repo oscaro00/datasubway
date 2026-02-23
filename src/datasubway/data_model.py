@@ -10,6 +10,7 @@ from datasubway.column_context import parse_table_column, parse_table_columns
 from datasubway.joins_meta import Join, parse_joins
 from datasubway.libcst.measure_output_context import GroupingContext
 from datasubway.polars_wrappers.filter_expr import (
+    build_filter_expr,
     extract_table_columns_from_filter_dict,
 )
 from datasubway.polars_wrappers.proxy import LazyFrameProxy
@@ -210,3 +211,38 @@ class DataModel:
             raise ValueError(f"offset '{qc.offset}' must be a non-negative integer")
 
         return True
+
+    def query(self, query_context_dict: dict) -> pl.DataFrame:
+        query_context = QueryContext(query_context_dict)
+
+        self.validate_query_context(query_context)
+
+        lazy_result = self.measures[query_context.measures[0]]
+
+        for measure in query_context.measures[1:]:
+            curr_measure = self.measures[measure]
+            # If the query context has no groupings, assume all measures return one row,
+            # so cross join the results
+            if len(query_context.groups) == 0:
+                lazy_result = lazy_result.join(curr_measure, how="cross")
+            # Else the query context has groupings, so measures may return multiple rows,
+            # so full join the results
+            else:
+                lazy_result = lazy_result.join(
+                    curr_measure, on=query_context.groups, how="full"
+                )
+
+        if query_context.havings != {}:
+            havings_filter_expr = build_filter_expr(query_context.havings)
+            lazy_result = lazy_result.filter(havings_filter_expr)
+
+        if len(query_context.sorts) > 0:
+            sort_cols = parse_table_columns([col for col, _ in query_context.sorts])
+            sort_directions = parse_table_columns(
+                [dir for _, dir in query_context.sorts]
+            )
+            lazy_result = lazy_result.sort(sort_cols, sort_directions)
+
+        lazy_result = lazy_result.slice(query_context.offset, query_context.limit)
+
+        return lazy_result.async_collect()

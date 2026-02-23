@@ -27,7 +27,8 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## TO DO
 
-- Add a query method to DataModel
+- Update table() method to do autojoins and select the pre aggregations correctly
+- Do more validation in QueryContext __init__
 - Tests
 
 - Add a license file

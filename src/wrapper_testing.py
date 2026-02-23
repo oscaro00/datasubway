@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import polars as pl
+
 from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
+from datasubway.polars_wrappers.proxy import LazyFrameProxy
 
 if __name__ == "__main__":
     lf = pl.LazyFrame(
@@ -265,7 +267,7 @@ if __name__ == "__main__":
 
     dm_multi = DataModel(tables={"sales": sales_lf})
 
-    def measure_revenue(dm: DataModel) -> "LazyFrameProxy":
+    def measure_revenue(dm: DataModel) -> LazyFrameProxy:
         return (
             dm.table("sales")
             .group_by(["date"])
