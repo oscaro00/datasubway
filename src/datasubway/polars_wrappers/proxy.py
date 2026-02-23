@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import polars as pl
 
 if TYPE_CHECKING:
+    from polars._typing import JoinStrategy
+
+    from datasubway.joins_meta import Join
     from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
     from datasubway.pre_agg_meta import PreAggregation
 
@@ -19,6 +22,7 @@ class _DataModelLike(Protocol):
 
     table_schemas: dict[str, list[str]]
     tables: dict[str, pl.LazyFrame]
+    joins_lookup: dict[str, dict[str, list["Join"]]]
 
     def find_best_pre_agg(
         self,
@@ -96,13 +100,16 @@ class LazyFrameProxy:
     to a LazyFrameWrapper with the optimal pre-agg source on .resolve().
     """
 
-    def __init__(self, table_name: str, dm: _DataModelLike) -> None:
+    def __init__(
+        self, table_name: str, dm: _DataModelLike, *, use_pre_agg: bool = True
+    ) -> None:
         self.table_name = table_name
         self.dm = dm
         self.ops: list[RecordedOp] = []
         self.group_by_cols: list[str] = []  # captured from group_by() call
         self.agg_exprs: list[pl.Expr] = []  # captured from agg() call
-        self.has_join: bool = False
+        self._unjoined_tables: set[str] = set()
+        self.use_pre_agg = use_pre_agg
 
     def filter(self, *predicates: Any, **constraints: Any) -> LazyFrameProxy:
         self.ops.append(RecordedOp("filter", predicates, constraints))
@@ -193,7 +200,6 @@ class LazyFrameProxy:
         return LazyGroupByProxy(self)
 
     def join(self, other: Any, **kwargs: Any) -> LazyFrameProxy:
-        self.has_join = True
         self.ops.append(RecordedOp("join", (other,), kwargs))
         return self
 
@@ -204,8 +210,10 @@ class LazyFrameProxy:
             "group_by_cols",
             "agg_exprs",
             "has_join",
+            "_unjoined_tables",
             "table_name",
             "dm",
+            "use_pre_agg",
         ):
             raise AttributeError(name)
 
@@ -214,6 +222,87 @@ class LazyFrameProxy:
             return self
 
         return record_and_return
+
+    def _collect_foreign_tables(self) -> set[str]:
+        """Scan group_by_cols and recorded op expressions for foreign-table prefixes."""
+        foreign: set[str] = set()
+
+        for col in self.group_by_cols:
+            if "." in col:
+                tbl = col.split(".", 1)[0]
+                if tbl != self.table_name:
+                    foreign.add(tbl)
+
+        all_exprs: list[pl.Expr] = list(self.agg_exprs)
+        for op in self.ops:
+            for arg in op.args:
+                if isinstance(arg, pl.Expr):
+                    all_exprs.append(arg)
+            for v in op.kwargs.values():
+                if isinstance(v, pl.Expr):
+                    all_exprs.append(v)
+
+        for expr in all_exprs:
+            for name in expr.meta.root_names():
+                if "." in name:
+                    tbl = name.split(".", 1)[0]
+                    if tbl != self.table_name:
+                        foreign.add(tbl)
+
+        return foreign
+
+    def _build_joined_source(self) -> tuple["LazyFrameWrapper", set[str]]:
+        """Join reachable foreign tables into the raw base source.
+
+        Returns the built source and the set of foreign tables that could NOT be
+        joined (no path in joins_lookup). Callers use this to drop unreachable
+        expressions in replay.
+        """
+        from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
+
+        base = LazyFrameWrapper(self.dm.tables[self.table_name], from_pre_agg=False)
+        foreign_tables = self._collect_foreign_tables()
+        unjoined: set[str] = set()
+
+        # Collect all join steps across all paths
+        all_join_steps: list[Join] = []
+        for foreign_table in foreign_tables:
+            join_path = self.dm.joins_lookup.get(self.table_name, {}).get(foreign_table)
+            if join_path is None:
+                unjoined.add(foreign_table)
+                continue
+            all_join_steps.extend(join_path)
+
+        # Deduplicate: remove any join step whose (left, right, left_on, right_on, how)
+        # tuple has already been seen, preserving order of first occurrence.
+        seen: set[tuple] = set()
+        deduped: list[Join] = []
+        for join in all_join_steps:
+            key = (
+                join.left,
+                join.right,
+                tuple(join.left_on_cols),
+                tuple(join.right_on_cols),
+                join.how,
+            )
+            if key not in seen:
+                seen.add(key)
+                deduped.append(join)
+
+        # Apply the deduplicated join sequence
+        for join in deduped:
+            right_lf = self.dm.tables[join.right]
+            base = LazyFrameWrapper(
+                base.lf.join(
+                    right_lf,
+                    left_on=join.left_on_cols,
+                    right_on=join.right_on_cols,
+                    how=cast("JoinStrategy", join.how),
+                ),
+                from_pre_agg=False,
+            )
+
+        return base, unjoined
 
     def resolve(self) -> "LazyFrameWrapper":
         """Two-phase resolution: analyze the recorded chain, select the best source,
@@ -232,26 +321,27 @@ class LazyFrameProxy:
                 qualified = qualify_col(col, self.table_name, self.dm.table_schemas)
                 agg_reqs.setdefault(qualified, set()).update(types)
 
-        # 3. Select source
-        if not self.has_join:
-            pre_agg = self.dm.find_best_pre_agg(self.table_name, my_cols, agg_reqs)
-            if pre_agg:
-                source = LazyFrameWrapper(pre_agg.load(), from_pre_agg=True)
-            else:
-                source = LazyFrameWrapper(
-                    self.dm.tables[self.table_name], from_pre_agg=False
-                )
+        # 3. Select source — try pre-agg first unless use_pre_agg is False
+        pre_agg = (
+            self.dm.find_best_pre_agg(self.table_name, my_cols, agg_reqs)
+            if self.use_pre_agg
+            else None
+        )
+        if pre_agg:
+            source = LazyFrameWrapper(pre_agg.load(), from_pre_agg=True)
+            self._unjoined_tables = set()  # no joins needed; replay unaffected
         else:
-            # TODO: extend to join-aware pre-agg selection
-            source = LazyFrameWrapper(
-                self.dm.tables[self.table_name], from_pre_agg=False
-            )
+            source, self._unjoined_tables = self._build_joined_source()
 
         return self.replay(source)
 
     def replay(self, source: "LazyFrameWrapper") -> "LazyFrameWrapper":
         """Replay all recorded ops against a real LazyFrameWrapper source."""
         from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
+        from datasubway.polars_wrappers.pre_agg_expr import (
+            drop_unjoined_table_refs,
+            strip_col_table_prefixes,
+        )
         from datasubway.polars_wrappers.proxy import LazyFrameProxy as _Proxy
 
         result = source
@@ -269,12 +359,37 @@ class LazyFrameProxy:
                     for arg in resolved_args
                 )
 
-            # Strip table prefixes from all string args and kwarg values — Polars only
-            # knows unqualified column names, and the analysis phase is already done.
-            resolved_args = tuple(strip_table_prefix(a) for a in resolved_args)
-            resolved_kwargs = {
-                k: strip_table_prefix(v) for k, v in resolved_kwargs.items()
-            }
+            # For Polars expressions: drop refs to unjoinable tables, then strip prefixes.
+            # For strings: strip table prefix (existing behaviour).
+            cleaned_args = []
+            for a in resolved_args:
+                if isinstance(a, pl.Expr):
+                    cleaned = drop_unjoined_table_refs(a, self._unjoined_tables)
+                    if cleaned is not None:
+                        cleaned_args.append(strip_col_table_prefixes(cleaned))
+                    # else: expression references only unjoinable tables — drop silently
+                else:
+                    cleaned_args.append(strip_table_prefix(a))
+            resolved_args = tuple(cleaned_args)
+
+            cleaned_kwargs: dict[str, Any] = {}
+            for k, v in resolved_kwargs.items():
+                if isinstance(v, pl.Expr):
+                    cleaned = drop_unjoined_table_refs(v, self._unjoined_tables)
+                    if cleaned is not None:
+                        cleaned_kwargs[k] = strip_col_table_prefixes(cleaned)
+                    # else: drop silently
+                else:
+                    cleaned_kwargs[k] = strip_table_prefix(v)
+            resolved_kwargs = cleaned_kwargs
+
+            # If a filter op had all its args dropped, skip the op entirely
+            if (
+                op.method == "filter"
+                and len(resolved_args) == 0
+                and len(resolved_kwargs) == 0
+            ):
+                continue
 
             result = getattr(result, op.method)(*resolved_args, **resolved_kwargs)
 

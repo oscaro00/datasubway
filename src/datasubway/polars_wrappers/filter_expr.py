@@ -10,9 +10,10 @@ def _strip_table_prefix(col: str) -> str:
     return col.rsplit(".", 1)[-1]
 
 
-def _build_leaf_expr(condition: tuple) -> pl.Expr:
+def _build_leaf_expr(condition: tuple, strip_prefixes: bool = True) -> pl.Expr:
     col, op, value = condition
-    col_expr = pl.col(_strip_table_prefix(col))
+    col_name = _strip_table_prefix(col) if strip_prefixes else col
+    col_expr = pl.col(col_name)
     match op:
         case "=":
             return col_expr == value
@@ -38,14 +39,20 @@ def _build_leaf_expr(condition: tuple) -> pl.Expr:
             raise ValueError(f"Unsupported filter operator: {op!r}")
 
 
-def build_filter_expr(spec: dict | tuple) -> pl.Expr:
+def build_filter_expr(spec: dict | tuple, strip_prefixes: bool = True) -> pl.Expr:
     """Convert a filter/having specification to a polars expression."""
     if isinstance(spec, tuple):
-        return _build_leaf_expr(spec)
+        return _build_leaf_expr(spec, strip_prefixes=strip_prefixes)
     if "AND" in spec:
-        return reduce(lambda a, b: a & b, [build_filter_expr(s) for s in spec["AND"]])
+        return reduce(
+            lambda a, b: a & b,
+            [build_filter_expr(s, strip_prefixes=strip_prefixes) for s in spec["AND"]],
+        )
     if "OR" in spec:
-        return reduce(lambda a, b: a | b, [build_filter_expr(s) for s in spec["OR"]])
+        return reduce(
+            lambda a, b: a | b,
+            [build_filter_expr(s, strip_prefixes=strip_prefixes) for s in spec["OR"]],
+        )
     raise ValueError(
         f"Invalid filter spec; expected tuple or dict with 'AND'/'OR', got: {spec!r}"
     )

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
 
 import polars as pl
 
@@ -217,19 +220,24 @@ class DataModel:
 
         self.validate_query_context(query_context)
 
-        lazy_result = self.measures[query_context.measures[0]]
+        def _resolve_measure(name: str) -> "LazyFrameWrapper":
+            proxy: LazyFrameProxy = self.measures[name](self)
+            proxy.use_pre_agg = query_context.use_pre_agg
+            return proxy.resolve()
+
+        lazy_result = _resolve_measure(query_context.measures[0])
 
         for measure in query_context.measures[1:]:
-            curr_measure = self.measures[measure]
+            curr_resolved = _resolve_measure(measure)
             # If the query context has no groupings, assume all measures return one row,
             # so cross join the results
             if len(query_context.groups) == 0:
-                lazy_result = lazy_result.join(curr_measure, how="cross")
+                lazy_result = lazy_result.join(curr_resolved, how="cross")
             # Else the query context has groupings, so measures may return multiple rows,
             # so full join the results
             else:
                 lazy_result = lazy_result.join(
-                    curr_measure, on=query_context.groups, how="full"
+                    curr_resolved, on=query_context.groups, how="full"
                 )
 
         if query_context.havings != {}:

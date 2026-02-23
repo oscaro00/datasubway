@@ -44,3 +44,7 @@ class QueryContext:
                 "Query context offset component must be a non-negative integer"
             )
         self.offset: int = qc_dict.get("offset", 0)
+
+        if not isinstance(qc_dict.get("use_pre_agg", True), bool):
+            raise ValueError("Query context use_pre_agg component must be a boolean")
+        self.use_pre_agg: bool = qc_dict.get("use_pre_agg", True)

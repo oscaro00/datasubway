@@ -208,6 +208,128 @@ def rewrite_agg_expr(expr: pl.Expr) -> pl.Expr:
     return pl.Expr.deserialize(json.dumps(rewritten).encode(), format="json")
 
 
+def _strip_prefixes_in_tree(node: Any) -> Any:
+    """Walk a serialized expression tree and strip 'table.' prefix from Column nodes."""
+    if isinstance(node, dict):
+        result = {}
+        for k, v in node.items():
+            if k == "Column" and isinstance(v, str) and "." in v:
+                result[k] = v.split(".", 1)[1]
+            else:
+                result[k] = _strip_prefixes_in_tree(v)
+        return result
+    if isinstance(node, list):
+        return [_strip_prefixes_in_tree(item) for item in node]
+    return node
+
+
+def strip_col_table_prefixes(expr: pl.Expr) -> pl.Expr:
+    """Rename col("table.col") → col("col") throughout an expression tree."""
+    tree = json.loads(expr.meta.serialize(format="json"))
+    rewritten = _strip_prefixes_in_tree(tree)
+    if rewritten == tree:
+        return expr
+    return pl.Expr.deserialize(json.dumps(rewritten).encode(), format="json")
+
+
+def _collect_col_names_from_tree(node: Any) -> list[str]:
+    """Collect all column names from a serialized expression tree."""
+    if isinstance(node, dict):
+        if "Column" in node:
+            return [node["Column"]]
+        result = []
+        for v in node.values():
+            result.extend(_collect_col_names_from_tree(v))
+        return result
+    if isinstance(node, list):
+        result = []
+        for item in node:
+            result.extend(_collect_col_names_from_tree(item))
+        return result
+    return []
+
+
+def _all_unjoinable_in_node(node: Any, unjoined_tables: set[str]) -> bool:
+    """True if all qualified column refs in a JSON node are from unjoinable tables."""
+    names = _collect_col_names_from_tree(node)
+    qualified = [n for n in names if "." in n]
+    if not qualified:
+        return False
+    return all(n.split(".", 1)[0] in unjoined_tables for n in qualified)
+
+
+def _drop_unjoined_in_tree(node: Any, unjoined_tables: set[str]) -> Any | None:
+    """Recursively remove sub-trees that reference only unjoinable tables.
+
+    Returns None if the entire node should be dropped.
+    """
+    if not isinstance(node, dict) or "BinaryExpr" not in node:
+        if _all_unjoinable_in_node(node, unjoined_tables):
+            return None
+        return node
+
+    binary = node["BinaryExpr"]
+    op = binary.get("op")
+
+    if op in ["And", "Or"]:
+        left = _drop_unjoined_in_tree(binary["left"], unjoined_tables)
+        right = _drop_unjoined_in_tree(binary["right"], unjoined_tables)
+        if left is None and right is None:
+            return None
+        if left is None:
+            return right
+        if right is None:
+            return left
+        return {"BinaryExpr": {"left": left, "op": op, "right": right}}
+
+    # Other binary expression: drop only if all refs are unjoinable
+    if _all_unjoinable_in_node(node, unjoined_tables):
+        return None
+    return node
+
+
+def drop_unjoined_table_refs(
+    expr: pl.Expr,
+    unjoined_tables: set[str],
+) -> pl.Expr | None:
+    """Remove sub-expressions that exclusively reference unjoinable tables.
+
+    Returns None if the whole expression should be dropped.
+
+    Rules:
+    - If no column reference is from an unjoinable table → return expr unchanged.
+    - If all column references are from unjoinable tables → return None.
+    - AND compounds: drop branches from unjoinable tables; reconstruct from survivors.
+    - OR compounds: drop branches from unjoinable tables; reconstruct from survivors.
+    - Other compounds: drop if all refs unjoinable, else return unchanged.
+    """
+    if not unjoined_tables:
+        return expr
+
+    root_names = expr.meta.root_names()
+
+    has_unjoinable = any(
+        "." in n and n.split(".", 1)[0] in unjoined_tables for n in root_names
+    )
+    if not has_unjoinable:
+        return expr
+
+    all_unjoinable = len(root_names) > 0 and all(
+        "." in n and n.split(".", 1)[0] in unjoined_tables for n in root_names
+    )
+    if all_unjoinable:
+        return None
+
+    # Mixed: use JSON tree walk to separate AND branches
+    tree = json.loads(expr.meta.serialize(format="json"))
+    cleaned = _drop_unjoined_in_tree(tree, unjoined_tables)
+    if cleaned is None:
+        return None
+    if cleaned == tree:
+        return expr
+    return pl.Expr.deserialize(json.dumps(cleaned).encode(), format="json")
+
+
 def extract_agg_requirements(expr: pl.Expr) -> dict[str, set[str]]:
     """Walk a Polars expression and return {col_name: {PolarsAggType}} pairs.
 

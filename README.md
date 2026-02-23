@@ -27,7 +27,6 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## TO DO
 
-- Update table() method to do autojoins and select the pre aggregations correctly
 - Do more validation in QueryContext __init__
 - Tests
 
@@ -35,6 +34,9 @@ The purpose of this library is to define a data model using python focusing on t
 - Logging
 - Benchmark system
 - Remove libcst dependency?
+  - Extracting the last group_by and agg is probably easy with the proxy system
+  - Making sure measures end in .group_by().agg() is harder without libcst
+  - Also will want to get docstrings from measures at some point, which could be difficult
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
   - Could also display logs
   - Probably makes sense to expose methods from data_model.py that will print this info (leave the UI to users)
