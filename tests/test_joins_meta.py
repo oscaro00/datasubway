@@ -1,6 +1,6 @@
 import pytest
 
-from datasubway.joins_meta import Join, parse_joins
+from datasubway.joins_meta import parse_joins
 
 # ---------------------------------------------------------------------------
 # Shared test data
@@ -43,37 +43,6 @@ BIDIRECTIONAL = [
         "direction": "right2left",
     },
 ]
-
-
-# ---------------------------------------------------------------------------
-# 1. Join dataclass — __post_init__ normalisation
-# ---------------------------------------------------------------------------
-
-
-def test_join_string_left_on_normalized_to_list():
-    j = Join(
-        left="a",
-        right="b",
-        left_on="x",
-        right_on="y",
-        how="inner",
-        direction="right2left",
-    )
-    assert j.left_on_cols == ["x"]
-    assert j.right_on_cols == ["y"]
-
-
-def test_join_list_left_on_preserved():
-    j = Join(
-        left="a",
-        right="b",
-        left_on=["x", "z"],
-        right_on=["y", "w"],
-        how="inner",
-        direction="right2left",
-    )
-    assert j.left_on_cols == ["x", "z"]
-    assert j.right_on_cols == ["y", "w"]
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +220,8 @@ def test_parse_joins_multi_key_join_columns_preserved():
     ]
     result = parse_joins(joins)
     join_obj = result["orders"]["line_items"][0]
-    assert join_obj.left_on_cols == ["order_id", "tenant_id"]
-    assert join_obj.right_on_cols == ["order_fk", "tenant_fk"]
+    assert join_obj.left_on == ["order_id", "tenant_id"]
+    assert join_obj.right_on == ["order_fk", "tenant_fk"]
 
 
 def test_parse_joins_right2left_is_strictly_one_directional():

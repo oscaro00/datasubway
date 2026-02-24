@@ -1,25 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, InitVar
+from dataclasses import dataclass
 
 
 @dataclass
 class Join:
     left: str
     right: str
-    left_on: InitVar[str | list[str]]
-    right_on: InitVar[str | list[str]]
+    left_on: str | list[str]
+    right_on: str | list[str]
     how: str
     direction: str
-    left_on_cols: list[str] = field(init=False)
-    right_on_cols: list[str] = field(init=False)
-
-    def __post_init__(
-        self, left_on: str | list[str], right_on: str | list[str]
-    ) -> None:
-        """Standardize left_on and right_on to lists and store on the instance."""
-        self.left_on_cols = [left_on] if isinstance(left_on, str) else left_on
-        self.right_on_cols = [right_on] if isinstance(right_on, str) else right_on
 
 
 def parse_joins(joins_list: list[dict]) -> dict[str, dict[str, list[Join]]]:
@@ -106,9 +97,7 @@ def _print_lookup(join_lookup: dict[str, dict[str, list[Join]]]) -> None:
         for end, joins in sorted(destinations.items()):
             hops = " → ".join(
                 f"[{j.left} JOIN {j.right} on "
-                f"{','.join(j.left_on_cols)}={','.join(j.right_on_cols)} ({j.how})]"
+                f"{','.join(j.left_on)}={','.join(j.right_on)} ({j.how})]"
                 for j in joins
             )
             print(f"  {start} → {end}  :  {hops}")
-
-
