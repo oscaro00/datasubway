@@ -11,22 +11,39 @@ class QueryContext:
             raise ValueError(
                 "Query context measures component must be a list of strings"
             )
+        for measure in qc_dict["measures"]:
+            if not isinstance(measure, str):
+                raise ValueError(
+                    "Query context measures component must be a list of strings"
+                )
         self.measures: list[str] = qc_dict["measures"]
 
         if not isinstance(qc_dict.get("filters", {}), dict):
             raise ValueError("Query context filters component must be a dictionary")
+        # TODO: should check that keys are AND or OR, and leafs are tuples
         self.filters: dict = qc_dict.get("filters", {})
 
         if not isinstance(qc_dict.get("groups", []), list):
             raise ValueError("Query context groups component must be a list of strings")
+        for group in qc_dict.get("groups", []):
+            if not isinstance(group, str):
+                raise ValueError(
+                    "Query context groups component must be a list of strings"
+                )
         self.groups: list[str] = qc_dict.get("groups", [])
 
         if not isinstance(qc_dict.get("havings", {}), dict):
             raise ValueError("Query context havings component must be a dictionary")
+        # TODO: should check that keys are AND or OR, and leafs are tuples
         self.havings: dict = qc_dict.get("havings", {})
 
         if not isinstance(qc_dict.get("sorts", []), list):
             raise ValueError("Query context sorts component must be a list of tuples")
+        for sort in qc_dict.get("sorts", []):
+            if not isinstance(sort, str):
+                raise ValueError(
+                    "Query context sorts component must be a list of strings"
+                )
         self.sorts: list[tuple[str, str]] = qc_dict.get("sorts", [])
 
         if (
