@@ -65,6 +65,14 @@ class PreAggregation:
     aggregations: dict[str, list[str]] = field(init=False)
 
     def __post_init__(self, raw_aggregations: dict[str, str | list[str]]) -> None:
+        if not self.group_by:
+            raise ValueError("PreAggregation 'group_by' must contain at least one column.")
+        if not raw_aggregations:
+            raise ValueError("PreAggregation 'raw_aggregations' must contain at least one aggregation.")
+        for col, aggs in raw_aggregations.items():
+            for agg in ([aggs] if isinstance(aggs, str) else aggs):
+                if agg not in AGG_EXPANSION:
+                    raise ValueError(f"Unknown aggregation '{agg}' for column '{col}'.")
         # Expand user-specified aggregation names to stored component names.
         # e.g. 'mean' → ['count', 'sum'], 'std' → ['count', 'sum', 'sumsq']
         expanded: dict[str, list[str]] = {}
