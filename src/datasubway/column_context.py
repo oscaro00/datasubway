@@ -113,11 +113,11 @@ def exclude(
                     column == pattern_column or pattern_column == "*"
                 ):
                     break
-
-            if include_tables:
-                allowed_context.append(f"{table}.{column}")
             else:
-                allowed_context.append(column)
+                if include_tables:
+                    allowed_context.append(f"{table}.{column}")
+                else:
+                    allowed_context.append(column)
 
     result_columns.extend(allowed_context)
 
