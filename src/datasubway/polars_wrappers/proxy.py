@@ -281,8 +281,8 @@ class LazyFrameProxy:
             key = (
                 join.left,
                 join.right,
-                tuple(join.left_on_cols),
-                tuple(join.right_on_cols),
+                tuple(join.left_on),
+                tuple(join.right_on),
                 join.how,
             )
             if key not in seen:
@@ -295,8 +295,8 @@ class LazyFrameProxy:
             base = LazyFrameWrapper(
                 base.lf.join(
                     right_lf,
-                    left_on=join.left_on_cols,
-                    right_on=join.right_on_cols,
+                    left_on=join.left_on,
+                    right_on=join.right_on,
                     how=cast("JoinStrategy", join.how),
                 ),
                 from_pre_agg=False,
