@@ -180,21 +180,19 @@ class DataModel:
                     f"grouping '{table}.{column}' does not have a valid column"
                 )
 
-        candidate_havings_cols = list(qc.groups)
+        # Valid post-aggregation columns: group-by cols (column name only) + measure output cols
+        valid_having_cols = {parse_table_column(g)[1] for g in qc.groups}
         for measure in qc.measures:
-            candidate_havings_cols.extend(self.measure_output_cols[measure])
-        having_table_columns = (
+            valid_having_cols.update(self.measure_output_cols[measure])
+        having_col_refs = (
             list(set(extract_table_columns_from_filter_dict(qc.havings)))
             if qc.havings
             else []
         )
-        parsed_havings = parse_table_columns(having_table_columns)
-        for table, column in parsed_havings:
-            if table not in self.table_schemas.keys():
-                raise KeyError(f"having '{table}.{column}' does not have a valid table")
-            if column not in self.table_schemas[table]:
+        for col in having_col_refs:
+            if col not in valid_having_cols:
                 raise ValueError(
-                    f"having '{table}.{column}' does not have a valid column"
+                    f"having column '{col}' is not a valid group-by or measure output column"
                 )
 
         for table_column, direction in qc.sorts:
@@ -225,7 +223,7 @@ class DataModel:
         self.validate_query_context(query_context)
 
         def _resolve_measure(name: str) -> "LazyFrameWrapper":
-            proxy: LazyFrameProxy = self.measures[name](self)
+            proxy: LazyFrameProxy = self.measures[name](query_context)
             proxy.use_pre_agg = query_context.use_pre_agg
             return proxy.resolve()
 

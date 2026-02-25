@@ -42,7 +42,7 @@ def parse_patterns(pattern_list: list[str]) -> list[tuple[str, str]]:
 
 def allow(
     pattern: str | list[str],
-    context: str | list[str],
+    context: str | list[str] | dict,
     include: str | list[str] = [],
     *,
     include_tables: bool = True,
@@ -84,7 +84,7 @@ def allow(
 
 def exclude(
     pattern: str | list[str],
-    context: str | list[str],
+    context: str | list[str] | dict,
     include: str | list[str] = [],
     *,
     include_tables: bool = True,

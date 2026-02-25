@@ -6,7 +6,9 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from datasubway.column_context import allow, exclude
 from datasubway.data_model import DataModel
+from datasubway.measure_decorator import measure
 from datasubway.polars_wrappers.proxy import LazyFrameProxy
 from datasubway.pre_agg_meta import PreAggregation
 from datasubway.query_context import QueryContext
@@ -57,47 +59,39 @@ def _make_qc(**kwargs):
 
 
 def _dm_with_measures():
-    """Return a DataModel with 'revenue' and 'unique_customers' measures registered."""
+    """Return a DataModel with 'revenue', 'order_count', and 'unique_customers' measures registered."""
     dm = DataModel(tables={"orders": ORDERS_LF})
 
-    def revenue(d):
+    @measure(dm)
+    def revenue(qc: QueryContext):
         return (
-            d.table("orders")
-            .group_by("orders.region")
-            .agg(pl.col("orders.amount").sum())
+            dm.table("orders")
+            .filter(allow(pattern="*", context=qc.filters))
+            .group_by(allow(pattern="*", context=qc.groups))
+            .agg(pl.col("orders.amount").sum().alias("revenue"))
         )
 
-    def unique_customers(d):
+    @measure(dm)
+    def order_count(qc: QueryContext):
         return (
-            d.table("orders")
-            .group_by("orders.region")
-            .agg(pl.col("orders.customer_id").n_unique())
+            dm.table("orders")
+            .filter(allow(pattern="*", context=qc.filters))
+            .group_by(allow(pattern="*", context=qc.groups))
+            .agg(pl.col("orders.order_id").count().alias("order_count"))
         )
 
-    dm.measures["revenue"] = revenue
-    dm.measure_output_cols["revenue"] = ["orders.amount"]
-
-    dm.measures["unique_customers"] = unique_customers
-    dm.measure_output_cols["unique_customers"] = ["orders.customer_id"]
-
-    return dm
-
-
-def _dm_with_scalar_measures():
-    """Return a DataModel with two scalar (no group_by) measures."""
-    dm = DataModel(tables={"orders": ORDERS_LF})
-
-    def total_amount(d):
-        return d.table("orders").select(pl.col("orders.amount").sum())
-
-    def order_count(d):
-        return d.table("orders").select(pl.len())
-
-    dm.measures["total_amount"] = total_amount
-    dm.measure_output_cols["total_amount"] = ["orders.amount"]
-
-    dm.measures["order_count"] = order_count
-    dm.measure_output_cols["order_count"] = ["orders.order_id"]
+    @measure(dm)
+    def unique_customers_by_region(qc: QueryContext):
+        return (
+            dm.table("orders")
+            .filter(allow(pattern="*", context=qc.filters))
+            .group_by(exclude(pattern="*", include="orders.region", context=qc.groups))
+            .agg(
+                pl.col("orders.customer_id")
+                .n_unique()
+                .alias("unique_customers_by_region")
+            )
+        )
 
     return dm
 
@@ -399,13 +393,13 @@ class TestValidateQueryContext:
         with pytest.raises(ValueError, match="bad_col"):
             dm.validate_query_context(qc)
 
-    def test_having_invalid_table_raises_key_error(self):
+    def test_having_invalid_column_raises_value_error_unknown(self):
         dm = _dm_with_measures()
         qc = _make_qc(
             measures=["revenue"],
-            havings={"AND": [("bad_table.amount", ">", 0)]},
+            havings={"AND": [("not_a_measure_or_group", ">", 0)]},
         )
-        with pytest.raises(KeyError, match="bad_table"):
+        with pytest.raises(ValueError, match="not_a_measure_or_group"):
             dm.validate_query_context(qc)
 
     def test_having_invalid_column_raises_value_error(self):
@@ -460,22 +454,22 @@ class TestQuery:
         dm = _dm_with_measures()
         result = asyncio.run(dm.query({"measures": ["revenue"]}))
         assert isinstance(result, pl.DataFrame)
-        assert len(result) == 2  # US and CA
+        assert len(result) == 1
 
     def test_query_multiple_measures_no_groups_cross_join(self):
-        dm = _dm_with_scalar_measures()
-        result = asyncio.run(dm.query({"measures": ["total_amount", "order_count"]}))
+        dm = _dm_with_measures()
+        result = asyncio.run(dm.query({"measures": ["revenue", "order_count"]}))
         assert isinstance(result, pl.DataFrame)
         assert len(result) == 1  # scalar × scalar cross join = 1 row
-        assert "amount" in result.columns
-        assert "len" in result.columns
+        assert "revenue" in result.columns
+        assert "order_count" in result.columns
 
     def test_query_multiple_measures_with_groups_full_join(self):
         dm = _dm_with_measures()
         result = asyncio.run(
             dm.query(
                 {
-                    "measures": ["revenue", "unique_customers"],
+                    "measures": ["revenue", "unique_customers_by_region"],
                     "groups": ["orders.region"],
                 }
             )
@@ -503,7 +497,7 @@ class TestQuery:
             dm.query(
                 {
                     "measures": ["revenue"],
-                    "havings": {"AND": [("orders.amount", ">", 400)]},
+                    "havings": {"AND": [("revenue", ">", 400)]},
                 }
             )
         )

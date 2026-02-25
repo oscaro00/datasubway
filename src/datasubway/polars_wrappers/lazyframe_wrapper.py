@@ -10,7 +10,6 @@ if TYPE_CHECKING:
 from datetime import timedelta
 
 import polars as pl
-from datasubway.polars_wrappers.pre_agg_expr import rewrite_agg_expr
 from polars._typing import (
     ClosedInterval,
     IntoExpr,
@@ -19,6 +18,8 @@ from polars._typing import (
     SchemaDict,
     StartBy,
 )
+
+from datasubway.polars_wrappers.pre_agg_expr import rewrite_agg_expr
 
 
 class LazyFrameWrapper:
@@ -51,7 +52,14 @@ class LazyFrameWrapper:
         **constraints: Any,
     ) -> LazyFrameWrapper:
 
-        if len(predicates) == 0 and len(constraints) == 0:
+        if len(constraints) == 0 and (
+            len(predicates) == 0
+            or (
+                len(predicates) == 1
+                and isinstance(predicates[0], list)
+                and len(predicates[0]) == 0
+            )
+        ):
             return self
         else:
             return self.__class__(
@@ -65,7 +73,10 @@ class LazyFrameWrapper:
         **named_by: IntoExpr,
     ) -> LazyFrameWrapper | LazyGroupByWrapper:
 
-        if len(by) == 0 and len(named_by) == 0:
+        _empty_by = len(by) == 0 or (
+            len(by) == 1 and isinstance(by[0], list) and len(by[0]) == 0
+        )
+        if _empty_by and len(named_by) == 0:
             return self.__class__(self.lf, self.from_pre_agg)
         else:
             from datasubway.polars_wrappers.lazygroupby_wrapper import (
@@ -180,8 +191,6 @@ class LazyFrameWrapper:
         *aggs: IntoExpr | Iterable[IntoExpr],
         **named_aggs: IntoExpr,
     ) -> LazyFrameWrapper:
-        # TODO: the table() method of DataModel could emit a LazyFrameWrapper object with a parameter
-        # is_pre_agg. This would avoid a potenial expensive collect_schema() call
 
         if not self.from_pre_agg:
             return LazyFrameWrapper(
