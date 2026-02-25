@@ -155,8 +155,10 @@ class DataModel:
             if measure not in self.measures.keys():
                 raise KeyError(f"measure '{measure}' not an available measure")
 
-        filter_table_columns = list(
-            set(extract_table_columns_from_filter_dict(qc.filters))
+        filter_table_columns = (
+            list(set(extract_table_columns_from_filter_dict(qc.filters)))
+            if qc.filters
+            else []
         )
         parsed_filters = parse_table_columns(filter_table_columns)
         for table, column in parsed_filters:
@@ -178,11 +180,13 @@ class DataModel:
                     f"grouping '{table}.{column}' does not have a valid column"
                 )
 
-        candidate_havings_cols = qc.groups
+        candidate_havings_cols = list(qc.groups)
         for measure in qc.measures:
             candidate_havings_cols.extend(self.measure_output_cols[measure])
-        having_table_columns = list(
-            set(extract_table_columns_from_filter_dict(qc.havings))
+        having_table_columns = (
+            list(set(extract_table_columns_from_filter_dict(qc.havings)))
+            if qc.havings
+            else []
         )
         parsed_havings = parse_table_columns(having_table_columns)
         for table, column in parsed_havings:
@@ -215,7 +219,7 @@ class DataModel:
 
         return True
 
-    def query(self, query_context_dict: dict) -> pl.DataFrame:
+    async def query(self, query_context_dict: dict) -> pl.DataFrame:
         query_context = QueryContext(query_context_dict)
 
         self.validate_query_context(query_context)
@@ -232,13 +236,15 @@ class DataModel:
             # If the query context has no groupings, assume all measures return one row,
             # so cross join the results
             if len(query_context.groups) == 0:
-                lazy_result = lazy_result.join(curr_resolved, how="cross")
+                lazy_result = lazy_result.join(curr_resolved.lf, how="cross")
             # Else the query context has groupings, so measures may return multiple rows,
             # so full join the results
             else:
-                lazy_result = lazy_result.join(
-                    curr_resolved, on=query_context.groups, how="full"
-                )
+                on_cols = [
+                    col.split(".", 1)[1] if "." in col else col
+                    for col in query_context.groups
+                ]
+                lazy_result = lazy_result.join(curr_resolved.lf, on=on_cols, how="full")
 
         if query_context.havings != {}:
             havings_filter_expr = build_filter_expr(query_context.havings)
@@ -253,4 +259,4 @@ class DataModel:
 
         lazy_result = lazy_result.slice(query_context.offset, query_context.limit)
 
-        return lazy_result.async_collect()
+        return await lazy_result.collect_async()

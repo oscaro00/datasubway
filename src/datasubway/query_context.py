@@ -40,9 +40,13 @@ class QueryContext:
         if not isinstance(qc_dict.get("sorts", []), list):
             raise ValueError("Query context sorts component must be a list of tuples")
         for sort in qc_dict.get("sorts", []):
-            if not isinstance(sort, str):
+            if not (
+                isinstance(sort, (tuple, list))
+                and len(sort) == 2
+                and all(isinstance(s, str) for s in sort)
+            ):
                 raise ValueError(
-                    "Query context sorts component must be a list of strings"
+                    "Query context sorts component must be a list of (column, direction) pairs"
                 )
         self.sorts: list[tuple[str, str]] = qc_dict.get("sorts", [])
 

@@ -7,7 +7,7 @@ VALID_FULL = {
     "filters": {"AND": [("orders.status", "=", "complete")]},
     "groups": ["orders.region", "orders.category"],
     "havings": {"AND": [("orders.total", ">", 100)]},
-    "sorts": ["orders.total", "orders.region"],
+    "sorts": [("orders.total", "asc"), ("orders.region", "desc")],
     "limit": 500,
     "offset": 10,
     "use_pre_agg": False,
@@ -34,7 +34,7 @@ def test_full_valid_dict_stores_all_fields():
     assert qc.filters == {"AND": [("orders.status", "=", "complete")]}
     assert qc.groups == ["orders.region", "orders.category"]
     assert qc.havings == {"AND": [("orders.total", ">", 100)]}
-    assert qc.sorts == ["orders.total", "orders.region"]
+    assert qc.sorts == [("orders.total", "asc"), ("orders.region", "desc")]
     assert qc.limit == 500
     assert qc.offset == 10
     assert qc.use_pre_agg is False
@@ -143,8 +143,8 @@ def test_sorts_omitted_defaults_to_empty_list():
 
 
 def test_sorts_valid_list_stored():
-    qc = QueryContext({"measures": ["orders.total"], "sorts": ["orders.total"]})
-    assert qc.sorts == ["orders.total"]
+    qc = QueryContext({"measures": ["orders.total"], "sorts": [("orders.total", "asc")]})
+    assert qc.sorts == [("orders.total", "asc")]
 
 
 # --- Limit validation ---
