@@ -289,15 +289,21 @@ class LazyFrameProxy:
                 seen.add(key)
                 deduped.append(join)
 
+        def _qualify_keys(keys: Any, table: str) -> list[str]:
+            if isinstance(keys, list):
+                return [f"{table}.{c}" for c in keys]
+            return [f"{table}.{keys}"]
+
         # Apply the deduplicated join sequence
         for join in deduped:
             right_lf = self.dm.tables[join.right]
             base = LazyFrameWrapper(
                 base.lf.join(
                     right_lf,
-                    left_on=join.left_on,
-                    right_on=join.right_on,
+                    left_on=_qualify_keys(join.left_on, join.left),
+                    right_on=_qualify_keys(join.right_on, join.right),
                     how=cast("JoinStrategy", join.how),
+                    coalesce=False,
                 ),
                 from_pre_agg=False,
             )
@@ -315,11 +321,11 @@ class LazyFrameProxy:
         my_cols = self.group_by_cols
 
         # 2. Extract agg requirements from recorded expressions
+        # Columns are already qualified since tables are renamed at DataModel init
         agg_reqs: dict[str, set[str]] = {}
         for expr in self.agg_exprs:
             for col, types in extract_agg_requirements(expr).items():
-                qualified = qualify_col(col, self.table_name, self.dm.table_schemas)
-                agg_reqs.setdefault(qualified, set()).update(types)
+                agg_reqs.setdefault(col, set()).update(types)
 
         # 3. Select source — try pre-agg first unless use_pre_agg is False
         pre_agg = (
@@ -338,10 +344,7 @@ class LazyFrameProxy:
     def replay(self, source: "LazyFrameWrapper") -> "LazyFrameWrapper":
         """Replay all recorded ops against a real LazyFrameWrapper source."""
         from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
-        from datasubway.polars_wrappers.pre_agg_expr import (
-            drop_unjoined_table_refs,
-            strip_col_table_prefixes,
-        )
+        from datasubway.polars_wrappers.pre_agg_expr import drop_unjoined_table_refs
         from datasubway.polars_wrappers.proxy import LazyFrameProxy as _Proxy
 
         result = source
@@ -359,17 +362,17 @@ class LazyFrameProxy:
                     for arg in resolved_args
                 )
 
-            # For Polars expressions: drop refs to unjoinable tables, then strip prefixes.
-            # For strings: strip table prefix (existing behaviour).
+            # For Polars expressions: drop refs to unjoinable tables; pass through unchanged.
+            # Columns are already fully qualified since tables are renamed at DataModel init.
             cleaned_args = []
             for a in resolved_args:
                 if isinstance(a, pl.Expr):
                     cleaned = drop_unjoined_table_refs(a, self._unjoined_tables)
                     if cleaned is not None:
-                        cleaned_args.append(strip_col_table_prefixes(cleaned))
+                        cleaned_args.append(cleaned)
                     # else: expression references only unjoinable tables — drop silently
                 else:
-                    cleaned_args.append(strip_table_prefix(a))
+                    cleaned_args.append(a)
             resolved_args = tuple(cleaned_args)
 
             cleaned_kwargs: dict[str, Any] = {}
@@ -377,10 +380,10 @@ class LazyFrameProxy:
                 if isinstance(v, pl.Expr):
                     cleaned = drop_unjoined_table_refs(v, self._unjoined_tables)
                     if cleaned is not None:
-                        cleaned_kwargs[k] = strip_col_table_prefixes(cleaned)
+                        cleaned_kwargs[k] = cleaned
                     # else: drop silently
                 else:
-                    cleaned_kwargs[k] = strip_table_prefix(v)
+                    cleaned_kwargs[k] = v
             resolved_kwargs = cleaned_kwargs
 
             # If a filter op had all its args dropped, skip the op entirely

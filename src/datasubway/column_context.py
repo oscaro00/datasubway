@@ -15,7 +15,7 @@ def parse_table_column(table_column_str: str) -> tuple[str, str]:
     return regex_find[0][0], regex_find[0][1]
 
 
-def parse_table_columns(table_column_list: list[str]) -> list[tuple[str, str]]:
+def parse_table_columns(table_column_list: list[str] | dict) -> list[tuple[str, str]]:
     return [
         parse_table_column(table_column_str) for table_column_str in table_column_list
     ]

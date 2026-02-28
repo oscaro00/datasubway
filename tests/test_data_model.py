@@ -113,10 +113,10 @@ class TestDataModelInit:
     def test_table_schemas_populated(self):
         dm = DataModel(tables={"orders": ORDERS_LF})
         assert set(dm.table_schemas["orders"]) == {
-            "order_id",
-            "customer_id",
-            "amount",
-            "region",
+            "orders.order_id",
+            "orders.customer_id",
+            "orders.amount",
+            "orders.region",
         }
 
     def test_default_pre_agg_directory(self):
@@ -281,7 +281,7 @@ class TestFindBestPreAgg:
 
 
 # ---------------------------------------------------------------------------
-# TestWritePreAgg
+# TestWritePreAggs
 # ---------------------------------------------------------------------------
 
 
@@ -299,40 +299,38 @@ def _dm_with_pre_agg(tmp_path):
     )
 
 
-def _sample_pre_agg_lf():
-    return pl.LazyFrame({"region": ["US", "CA"], "amount": [350.0, 450.0]})
-
-
-class TestWritePreAgg:
+class TestWritePreAggs:
     def test_write_creates_parquet_file(self, tmp_path):
         dm = _dm_with_pre_agg(tmp_path)
-        dm.write_pre_agg("region_summary", _sample_pre_agg_lf())
+        dm.write_pre_aggs(["region_summary"])
         assert (tmp_path / "region_summary.parquet").exists()
 
-    def test_write_returns_pre_agg_object(self, tmp_path):
+    def test_write_returns_list_of_pre_agg_objects(self, tmp_path):
         dm = _dm_with_pre_agg(tmp_path)
-        result = dm.write_pre_agg("region_summary", _sample_pre_agg_lf())
-        assert isinstance(result, PreAggregation)
-        assert result.name == "region_summary"
+        result = dm.write_pre_aggs(["region_summary"])
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], PreAggregation)
+        assert result[0].name == "region_summary"
 
     def test_write_updates_in_memory_row_count(self, tmp_path):
         dm = _dm_with_pre_agg(tmp_path)
-        dm.write_pre_agg("region_summary", _sample_pre_agg_lf())
+        dm.write_pre_aggs(["region_summary"])
         assert dm.pre_agg_objects[0].row_count == 2
 
     def test_write_updates_written_at(self, tmp_path):
         dm = _dm_with_pre_agg(tmp_path)
-        dm.write_pre_agg("region_summary", _sample_pre_agg_lf())
+        dm.write_pre_aggs(["region_summary"])
         assert isinstance(dm.pre_agg_objects[0].written_at, datetime)
 
     def test_write_creates_metadata_json(self, tmp_path):
         dm = _dm_with_pre_agg(tmp_path)
-        dm.write_pre_agg("region_summary", _sample_pre_agg_lf())
+        dm.write_pre_aggs(["region_summary"])
         assert (tmp_path / "_metadata.json").exists()
 
     def test_write_metadata_has_row_count_and_written_at(self, tmp_path):
         dm = _dm_with_pre_agg(tmp_path)
-        dm.write_pre_agg("region_summary", _sample_pre_agg_lf())
+        dm.write_pre_aggs(["region_summary"])
         metadata = json.loads((tmp_path / "_metadata.json").read_text())
         assert "region_summary" in metadata
         assert "row_count" in metadata["region_summary"]
@@ -341,9 +339,29 @@ class TestWritePreAgg:
 
     def test_write_unknown_name_raises_key_error(self, tmp_path):
         dm = DataModel(tables={"orders": ORDERS_LF}, pre_agg_directory=tmp_path)
-        lf = pl.LazyFrame({"region": ["US"], "amount": [100.0]})
         with pytest.raises(KeyError, match="unknown"):
-            dm.write_pre_agg("unknown", lf)
+            dm.write_pre_aggs(["unknown"])
+
+    def test_write_multiple_names(self, tmp_path):
+        pre_aggs = {
+            "region_summary": {
+                "group_by": ["orders.region"],
+                "aggregations": {"orders.amount": "sum"},
+            },
+            "customer_summary": {
+                "group_by": ["orders.region"],
+                "aggregations": {"orders.customer_id": "count"},
+            },
+        }
+        dm = DataModel(
+            tables={"orders": ORDERS_LF},
+            pre_aggregations=pre_aggs,
+            pre_agg_directory=tmp_path,
+        )
+        result = dm.write_pre_aggs(["region_summary", "customer_summary"])
+        assert len(result) == 2
+        assert (tmp_path / "region_summary.parquet").exists()
+        assert (tmp_path / "customer_summary.parquet").exists()
 
 
 # ---------------------------------------------------------------------------

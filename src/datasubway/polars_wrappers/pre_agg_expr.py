@@ -208,30 +208,6 @@ def rewrite_agg_expr(expr: pl.Expr) -> pl.Expr:
     return pl.Expr.deserialize(json.dumps(rewritten).encode(), format="json")
 
 
-def _strip_prefixes_in_tree(node: Any) -> Any:
-    """Walk a serialized expression tree and strip 'table.' prefix from Column nodes."""
-    if isinstance(node, dict):
-        result = {}
-        for k, v in node.items():
-            if k == "Column" and isinstance(v, str) and "." in v:
-                result[k] = v.split(".", 1)[1]
-            else:
-                result[k] = _strip_prefixes_in_tree(v)
-        return result
-    if isinstance(node, list):
-        return [_strip_prefixes_in_tree(item) for item in node]
-    return node
-
-
-def strip_col_table_prefixes(expr: pl.Expr) -> pl.Expr:
-    """Rename col("table.col") → col("col") throughout an expression tree."""
-    tree = json.loads(expr.meta.serialize(format="json"))
-    rewritten = _strip_prefixes_in_tree(tree)
-    if rewritten == tree:
-        return expr
-    return pl.Expr.deserialize(json.dumps(rewritten).encode(), format="json")
-
-
 def _collect_col_names_from_tree(node: Any) -> list[str]:
     """Collect all column names from a serialized expression tree."""
     if isinstance(node, dict):

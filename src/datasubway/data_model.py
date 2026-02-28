@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,9 +18,7 @@ from datasubway.polars_wrappers.filter_expr import (
 from datasubway.polars_wrappers.proxy import LazyFrameProxy
 from datasubway.pre_agg_meta import (
     PreAggregation,
-    load_metadata,
     parse_pre_aggregations,
-    save_metadata,
 )
 from datasubway.query_context import QueryContext
 
@@ -69,14 +66,18 @@ class DataModel:
         Pre-aggregation names must be unique — they determine the parquet file name
         inside pre_agg_directory.
         """
-        self.tables = tables
         self.joins = joins if joins is not None else []
         self.pre_agg_directory = pre_agg_directory or Path("_pre_aggregations/")
         self.logging_directory = logging_directory
 
+        # Rename all columns to {table}.{col} for unambiguous downstream references
+        self.tables: dict[str, pl.LazyFrame] = {
+            name: lf.rename({col: f"{name}.{col}" for col in lf.collect_schema().names()})
+            for name, lf in tables.items()
+        }
+        # Schemas are derived from the renamed tables; validation checks f"{table}.{column}"
         self.table_schemas: dict[str, list[str]] = {
-            tbl_name: lf.collect_schema().names()
-            for tbl_name, lf in self.tables.items()
+            name: lf.collect_schema().names() for name, lf in self.tables.items()
         }
 
         self.joins_lookup: dict[str, dict[str, list[Join]]] = parse_joins(self.joins)
@@ -117,38 +118,22 @@ class DataModel:
             return None
         return min(candidates, key=lambda p: p.row_count)
 
-    def write_pre_agg(self, name: str, lf: pl.LazyFrame) -> PreAggregation:
-        """Write a pre-aggregated LazyFrame to parquet and record metadata.
+    def write_pre_aggs(self, names: list[str]) -> list[PreAggregation]:
+        """Compute and write the named pre-aggregations to parquet.
 
-        Collects the frame, writes it to pre_agg_directory/{name}.parquet, then
-        updates the metadata file with the row count and write timestamp. The
-        in-memory PreAggregation object is updated to match.
+        names must be a list of pre-aggregation names defined in this DataModel.
+        Computing pre-aggs can be expensive, so there is no default to write all.
         """
-        pre_agg = next((p for p in self.pre_agg_objects if p.name == name), None)
-        if pre_agg is None:
-            raise KeyError(
-                f"Pre-aggregation '{name}' not defined. "
-                f"Available: {[p.name for p in self.pre_agg_objects]}"
-            )
-
-        df = lf.collect()
-        row_count = len(df)
-        written_at = datetime.now()
-
-        self.pre_agg_directory.mkdir(parents=True, exist_ok=True)
-        df.write_parquet(pre_agg.file_path)
-
-        metadata = load_metadata(self.pre_agg_directory)
-        metadata[name] = {
-            "row_count": row_count,
-            "written_at": written_at.isoformat(),
-        }
-        save_metadata(self.pre_agg_directory, metadata)
-
-        pre_agg.row_count = row_count
-        pre_agg.written_at = written_at
-
-        return pre_agg
+        results = []
+        for name in names:
+            pre_agg = next((p for p in self.pre_agg_objects if p.name == name), None)
+            if pre_agg is None:
+                raise KeyError(
+                    f"Pre-aggregation '{name}' not defined. "
+                    f"Available: {[p.name for p in self.pre_agg_objects]}"
+                )
+            results.append(pre_agg.write(self.tables, self.joins_lookup))
+        return results
 
     def validate_query_context(self, qc: QueryContext) -> bool:
         for measure in qc.measures:
@@ -164,7 +149,7 @@ class DataModel:
         for table, column in parsed_filters:
             if table not in self.table_schemas.keys():
                 raise KeyError(f"filter '{table}.{column}' does not have a valid table")
-            if column not in self.table_schemas[table]:
+            if f"{table}.{column}" not in self.table_schemas[table]:
                 raise ValueError(
                     f"filter '{table}.{column}' does not have a valid column"
                 )
@@ -175,7 +160,7 @@ class DataModel:
                 raise KeyError(
                     f"grouping '{table}.{column}' does not have a valid table"
                 )
-            if column not in self.table_schemas[table]:
+            if f"{table}.{column}" not in self.table_schemas[table]:
                 raise ValueError(
                     f"grouping '{table}.{column}' does not have a valid column"
                 )
@@ -201,7 +186,7 @@ class DataModel:
                 raise KeyError(
                     f"sorting '{table}.{column}' does not have a valid table"
                 )
-            if column not in self.table_schemas[table]:
+            if f"{table}.{column}" not in self.table_schemas[table]:
                 raise ValueError(
                     f"sorting '{table}.{column}' does not have a valid column"
                 )
@@ -238,11 +223,9 @@ class DataModel:
             # Else the query context has groupings, so measures may return multiple rows,
             # so full join the results
             else:
-                on_cols = [
-                    col.split(".", 1)[1] if "." in col else col
-                    for col in query_context.groups
-                ]
-                lazy_result = lazy_result.join(curr_resolved.lf, on=on_cols, how="full")
+                lazy_result = lazy_result.join(
+                    curr_resolved.lf, on=query_context.groups, how="full"
+                )
 
         if query_context.havings != {}:
             havings_filter_expr = build_filter_expr(query_context.havings)

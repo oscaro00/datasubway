@@ -88,6 +88,142 @@ class PreAggregation:
     def load(self) -> pl.LazyFrame:
         return pl.scan_parquet(self.file_path)
 
+    def compute(
+        self,
+        tables: dict[str, pl.LazyFrame],
+        joins_lookup: dict[str, dict[str, list]],
+    ) -> pl.LazyFrame:
+        """Build the pre-aggregated LazyFrame from already-qualified tables."""
+        from typing import cast
+
+        from polars._typing import JoinStrategy
+
+        # Fact tables = tables mentioned in aggregation column names
+        agg_tables: set[str] = {
+            col.split(".", 1)[0] for col in self.aggregations if "." in col
+        }
+        group_by_cols = self.group_by
+
+        def _qualify_keys(keys: str | list[str], table: str) -> list[str]:
+            if isinstance(keys, list):
+                return [f"{table}.{c}" for c in keys]
+            return [f"{table}.{keys}"]
+
+        def _build_source(fact_table: str) -> pl.LazyFrame:
+            base = tables[fact_table]
+            dim_tables = {
+                col.split(".", 1)[0]
+                for col in self.group_by
+                if "." in col and col.split(".", 1)[0] != fact_table
+            }
+            # Collect all join steps, deduplicate to avoid re-applying shared hops
+            all_join_steps = []
+            for dim_table in dim_tables:
+                join_path = joins_lookup.get(fact_table, {}).get(dim_table)
+                if join_path:
+                    all_join_steps.extend(join_path)
+                else:
+                    # Fallback: join on common (qualified) column names
+                    base_cols = set(base.collect_schema().names())
+                    dim_cols = set(tables[dim_table].collect_schema().names())
+                    common = list(base_cols & dim_cols)
+                    if common:
+                        base = base.join(
+                            tables[dim_table], on=common, how="left", coalesce=False
+                        )
+            seen: set[tuple] = set()
+            deduped = []
+            for join in all_join_steps:
+                left_key = tuple(join.left_on) if isinstance(join.left_on, list) else (join.left_on,)
+                right_key = tuple(join.right_on) if isinstance(join.right_on, list) else (join.right_on,)
+                key = (join.left, join.right, left_key, right_key, join.how)
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(join)
+            for join in deduped:
+                base = base.join(
+                    tables[join.right],
+                    left_on=_qualify_keys(join.left_on, join.left),
+                    right_on=_qualify_keys(join.right_on, join.right),
+                    how=cast("JoinStrategy", join.how),
+                    coalesce=False,
+                )
+            return base
+
+        def _agg_exprs(fact_table: str) -> list[pl.Expr]:
+            exprs = []
+            for qualified_col, components in self.aggregations.items():
+                if "." in qualified_col and qualified_col.split(".", 1)[0] != fact_table:
+                    continue
+                alias_prefix = qualified_col
+                for comp in components:
+                    alias = f"{alias_prefix}-{comp}"
+                    if comp == "sum":
+                        exprs.append(pl.col(qualified_col).sum().alias(alias))
+                    elif comp == "count":
+                        exprs.append(pl.col(qualified_col).count().alias(alias))
+                    elif comp == "sumsq":
+                        exprs.append(
+                            (pl.col(qualified_col).cast(pl.Float64) ** 2).sum().alias(alias)
+                        )
+                    elif comp == "min":
+                        exprs.append(pl.col(qualified_col).min().alias(alias))
+                    elif comp == "max":
+                        exprs.append(pl.col(qualified_col).max().alias(alias))
+                    elif comp == "first":
+                        exprs.append(pl.col(qualified_col).first().alias(alias))
+                    elif comp == "last":
+                        exprs.append(pl.col(qualified_col).last().alias(alias))
+                    elif comp == "product":
+                        exprs.append(pl.col(qualified_col).product().alias(alias))
+                    elif comp == "null_count":
+                        exprs.append(pl.col(qualified_col).null_count().alias(alias))
+                    elif comp == "all":
+                        exprs.append(pl.col(qualified_col).all().alias(alias))
+                    elif comp == "any":
+                        exprs.append(pl.col(qualified_col).any().alias(alias))
+                    elif comp == "unique_set":
+                        exprs.append(pl.col(qualified_col).unique().alias(alias))
+                    elif comp == "values_list":
+                        exprs.append(pl.col(qualified_col).implode().alias(alias))
+                    elif comp == "len":
+                        exprs.append(pl.col(qualified_col).len().alias(alias))
+            return exprs
+
+        if len(agg_tables) == 1:
+            fact_table = next(iter(agg_tables))
+            source = _build_source(fact_table)
+            return source.group_by(group_by_cols).agg(*_agg_exprs(fact_table))
+        else:
+            # Cross-table pre-agg: compute each fact table separately, join on group-by
+            parts = [
+                _build_source(ft).group_by(group_by_cols).agg(*_agg_exprs(ft))
+                for ft in sorted(agg_tables)
+            ]
+            result = parts[0]
+            for part in parts[1:]:
+                result = result.join(part, on=group_by_cols, how="full", coalesce=True)
+            return result
+
+    def write(
+        self,
+        tables: dict[str, pl.LazyFrame],
+        joins_lookup: dict[str, dict[str, list]],
+    ) -> "PreAggregation":
+        """Compute and write this pre-aggregation to parquet, updating metadata."""
+        pre_agg_directory = self.file_path.parent
+        pre_agg_directory.mkdir(parents=True, exist_ok=True)
+        df = self.compute(tables, joins_lookup).collect()
+        row_count = len(df)
+        written_at = datetime.now()
+        df.write_parquet(self.file_path)
+        metadata = load_metadata(pre_agg_directory)
+        metadata[self.name] = {"row_count": row_count, "written_at": written_at.isoformat()}
+        save_metadata(pre_agg_directory, metadata)
+        self.row_count = row_count
+        self.written_at = written_at
+        return self
+
     def covers(
         self,
         requested_group_by: list[str],

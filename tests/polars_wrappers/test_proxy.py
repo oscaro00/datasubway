@@ -20,7 +20,11 @@ from datasubway.polars_wrappers.proxy import (
 
 
 class _MockDM:
-    """Minimal _DataModelLike implementation for tests."""
+    """Minimal _DataModelLike implementation for tests.
+
+    Mirrors DataModel.__init__ by renaming all columns to {table}.{col}
+    and deriving table_schemas from the renamed tables.
+    """
 
     def __init__(
         self,
@@ -29,9 +33,13 @@ class _MockDM:
         joins_lookup: dict[str, dict[str, list[Join]]] | None = None,
         pre_agg: PreAggregation | None = None,
     ) -> None:
-        self.tables: dict[str, pl.LazyFrame] = tables
+        # Rename columns to {table}.{col} like DataModel does
+        self.tables: dict[str, pl.LazyFrame] = {
+            name: lf.rename({col: f"{name}.{col}" for col in lf.collect_schema().names()})
+            for name, lf in tables.items()
+        }
         self.table_schemas: dict[str, list[str]] = schemas or {
-            t: list(lf.collect_schema().names()) for t, lf in tables.items()
+            t: list(lf.collect_schema().names()) for t, lf in self.tables.items()
         }
         self.joins_lookup: dict[str, dict[str, list[Join]]] = joins_lookup or {}
         self._pre_agg: PreAggregation | None = pre_agg
@@ -141,8 +149,8 @@ def test_lazy_groupby_proxy_agg_extends_agg_exprs_and_returns_parent():
     lf = pl.LazyFrame({"a": [1, 2], "b": [3, 4]})
     dm = _MockDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
-    gbp = proxy.group_by("a")
-    expr = pl.col("b").sum()
+    gbp = proxy.group_by("tbl.a")
+    expr = pl.col("tbl.b").sum()
 
     result = gbp.agg(expr)
 
@@ -155,9 +163,9 @@ def test_lazy_groupby_proxy_having_appends_op_and_returns_self():
     lf = pl.LazyFrame({"a": [1, 2], "b": [3, 4]})
     dm = _MockDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
-    gbp = proxy.group_by("a")
+    gbp = proxy.group_by("tbl.a")
 
-    result = gbp.having(pl.col("b") > 1)
+    result = gbp.having(pl.col("tbl.b") > 1)
 
     assert result is gbp
     assert any(op.method == "having" for op in proxy.ops)
@@ -167,7 +175,7 @@ def test_lazy_groupby_proxy_map_groups_appends_op_and_returns_parent():
     lf = pl.LazyFrame({"a": [1, 2], "b": [3, 4]})
     dm = _MockDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
-    gbp = proxy.group_by("a")
+    gbp = proxy.group_by("tbl.a")
 
     def fn(df):
         return df
@@ -188,7 +196,7 @@ def test_lazy_frame_proxy_filter_records_op_and_returns_self():
     dm = _MockDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
 
-    result = proxy.filter(pl.col("a") > 1)
+    result = proxy.filter(pl.col("tbl.a") > 1)
 
     assert result is proxy
     assert proxy.ops[-1].method == "filter"
@@ -199,7 +207,7 @@ def test_lazy_frame_proxy_sort_records_op_and_returns_self():
     dm = _MockDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
 
-    result = proxy.sort("a")
+    result = proxy.sort("tbl.a")
 
     assert result is proxy
     assert proxy.ops[-1].method == "sort"
@@ -210,10 +218,10 @@ def test_lazy_frame_proxy_group_by_records_op_sets_cols_returns_groupby_proxy():
     dm = _MockDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
 
-    gbp = proxy.group_by("a")
+    gbp = proxy.group_by("tbl.a")
 
     assert isinstance(gbp, LazyGroupByProxy)
-    assert proxy.group_by_cols == ["a"]
+    assert proxy.group_by_cols == ["tbl.a"]
     assert proxy.ops[-1].method == "group_by"
 
 
@@ -250,7 +258,7 @@ def test_lazy_frame_proxy_join_records_op_and_returns_self():
     proxy = LazyFrameProxy("tbl", dm)
     other_proxy = LazyFrameProxy("other", dm)
 
-    result = proxy.join(other_proxy, left_on=["a"], right_on=["a"], how="inner")
+    result = proxy.join(other_proxy, left_on=["tbl.a"], right_on=["other.a"], how="inner")
 
     assert result is proxy
     assert proxy.ops[-1].method == "join"
@@ -284,7 +292,7 @@ def test_collect_foreign_tables_no_foreign_returns_empty_set():
     lf = pl.LazyFrame({"id": [1, 2]})
     dm = _MockDM({"orders": lf})
     proxy = LazyFrameProxy("orders", dm)
-    proxy.group_by_cols = ["id"]
+    proxy.group_by_cols = ["orders.id"]
 
     assert proxy._collect_foreign_tables() == set()
 
@@ -353,7 +361,7 @@ def test_build_joined_source_known_foreign_applies_join():
     source, unjoined = proxy._build_joined_source()
 
     assert unjoined == set()
-    assert "name" in source.lf.collect_schema().names()
+    assert "customers.name" in source.lf.collect_schema().names()
 
 
 def test_build_joined_source_unknown_foreign_added_to_unjoined_set():
@@ -407,8 +415,8 @@ def test_build_joined_source_deduplicates_shared_hop():
 
     assert unjoined == set()
     cols = source.lf.collect_schema().names()
-    assert "name" in cols
-    assert "region_name" in cols
+    assert "customers.name" in cols
+    assert "regions.region_name" in cols
 
 
 # ---------------------------------------------------------------------------
@@ -420,25 +428,25 @@ def test_resolve_simple_filter():
     lf = pl.LazyFrame({"id": [1, 2, 3], "val": [10, 20, 30]})
     dm = _MockDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
-    proxy.filter(pl.col("val") > 15)
+    proxy.filter(pl.col("tbl.val") > 15)
 
     rows = proxy.resolve().lf.collect().to_dicts()
 
-    assert rows == [{"id": 2, "val": 20}, {"id": 3, "val": 30}]
+    assert rows == [{"tbl.id": 2, "tbl.val": 20}, {"tbl.id": 3, "tbl.val": 30}]
 
 
 def test_resolve_filter_groupby_agg_chain():
     lf = pl.LazyFrame({"cat": ["a", "a", "b"], "val": [1, 2, 3]})
     dm = _MockDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
-    proxy.filter(pl.col("val") >= 1).group_by("cat", maintain_order=True).agg(
-        pl.col("val").sum()
+    proxy.filter(pl.col("tbl.val") >= 1).group_by("tbl.cat", maintain_order=True).agg(
+        pl.col("tbl.val").sum()
     )
 
     rows = proxy.resolve().lf.collect().to_dicts()
 
-    assert {"cat": "a", "val": 3} in rows
-    assert {"cat": "b", "val": 3} in rows
+    assert {"tbl.cat": "a", "tbl.val": 3} in rows
+    assert {"tbl.cat": "b", "tbl.val": 3} in rows
 
 
 def test_resolve_use_pre_agg_false_never_calls_find_best_pre_agg():
@@ -452,7 +460,7 @@ def test_resolve_use_pre_agg_false_never_calls_find_best_pre_agg():
     lf = pl.LazyFrame({"id": [1], "val": [10]})
     dm = _TrackingDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm, use_pre_agg=False)
-    proxy.filter(pl.col("val") > 5)
+    proxy.filter(pl.col("tbl.val") > 5)
     proxy.resolve()
 
     assert called == []
@@ -502,33 +510,36 @@ def test_resolve_passes_group_by_and_agg_reqs_to_find_best_pre_agg():
     lf = pl.LazyFrame({"cat": ["a", "b"], "val": [1, 2]})
     dm = _TrackingDM({"tbl": lf})
     proxy = LazyFrameProxy("tbl", dm)
-    proxy.group_by("cat").agg(pl.col("val").sum())
+    # Use qualified column names as real measure code would after DataModel init
+    proxy.group_by("tbl.cat").agg(pl.col("tbl.val").sum())
     proxy.resolve()
 
     assert received["table_name"] == "tbl"
-    assert received["group_by"] == ["cat"]
-    # qualify_col promotes "val" → "tbl.val" since "val" is in tbl's schema
+    assert received["group_by"] == ["tbl.cat"]
+    # Columns already qualified — no qualify_col needed
     assert "tbl.val" in received["agg_reqs"]
     assert "Sum" in received["agg_reqs"]["tbl.val"]
 
 
 # ---------------------------------------------------------------------------
-# LazyFrameProxy.replay — prefix stripping
+# LazyFrameProxy.replay — qualified columns passed through unchanged
 # ---------------------------------------------------------------------------
 
 
-def test_replay_strips_table_prefix_from_string_args():
+def test_replay_passes_qualified_string_args_unchanged():
+    """Qualified string args are passed through as-is; columns are already qualified."""
     lf = pl.LazyFrame({"id": [3, 1, 2], "val": [30, 10, 20]})
     dm = _MockDM({"orders": lf})
     proxy = LazyFrameProxy("orders", dm)
-    proxy.sort("orders.val")  # table-prefixed string arg
+    proxy.sort("orders.val")
 
     rows = proxy.resolve().lf.collect().to_dicts()
 
-    assert [r["val"] for r in rows] == [10, 20, 30]
+    assert [r["orders.val"] for r in rows] == [10, 20, 30]
 
 
-def test_replay_strips_col_table_prefix_in_polars_expr():
+def test_replay_qualified_col_expr_filters_correctly():
+    """Qualified pl.col expressions work directly against renamed column names."""
     lf = pl.LazyFrame({"val": [3, 1, 2]})
     dm = _MockDM({"orders": lf})
     proxy = LazyFrameProxy("orders", dm)
@@ -536,7 +547,7 @@ def test_replay_strips_col_table_prefix_in_polars_expr():
 
     rows = proxy.resolve().lf.collect().to_dicts()
 
-    assert set(r["val"] for r in rows) == {3, 2}
+    assert set(r["orders.val"] for r in rows) == {3, 2}
 
 
 def test_replay_drops_expr_referencing_only_unjoined_tables():
@@ -575,12 +586,15 @@ def test_replay_join_resolves_nested_proxy_before_joining():
     cust_proxy = LazyFrameProxy("customers", dm)
     orders_proxy = LazyFrameProxy("orders", dm)
     orders_proxy.join(
-        cust_proxy, left_on=["order_id"], right_on=["cust_id"], how="inner"
+        cust_proxy,
+        left_on=["orders.order_id"],
+        right_on=["customers.cust_id"],
+        how="inner",
     )
 
     result = orders_proxy.resolve().lf.collect()
 
-    assert "name" in result.columns
+    assert "customers.name" in result.columns
     assert len(result) == 2
 
 
@@ -600,16 +614,16 @@ def test_e2e_filter_sort_groupby_agg():
     proxy = LazyFrameProxy("facts", dm)
 
     rows = (
-        proxy.filter(pl.col("sales") >= 100)
-        .group_by("region", maintain_order=True)
-        .agg(pl.col("sales").sum())
+        proxy.filter(pl.col("facts.sales") >= 100)
+        .group_by("facts.region", maintain_order=True)
+        .agg(pl.col("facts.sales").sum())
         .resolve()
         .lf.collect()
         .to_dicts()
     )
 
-    assert {"region": "N", "sales": 300} in rows
-    assert {"region": "S", "sales": 150} in rows
+    assert {"facts.region": "N", "facts.sales": 300} in rows
+    assert {"facts.region": "S", "facts.sales": 150} in rows
 
 
 def test_e2e_cross_table_filter_with_known_join():
@@ -631,7 +645,7 @@ def test_e2e_cross_table_filter_with_known_join():
     proxy.filter(pl.col("customers.region") == "N")
 
     result = proxy.resolve().lf.collect()
-    amounts = sorted(r["amount"] for r in result.to_dicts())
+    amounts = sorted(r["orders.amount"] for r in result.to_dicts())
 
     assert amounts == [100, 300]
 
@@ -640,10 +654,10 @@ def test_e2e_unknown_foreign_col_filter_partially_dropped():
     lf = pl.LazyFrame({"val": [1, 2, 3]})
     dm = _MockDM({"orders": lf})
     proxy = LazyFrameProxy("orders", dm)
-    # AND expression: unknown.flag branch is dropped, val > 1 branch survives
-    proxy.filter((pl.col("unknown.flag")) & (pl.col("val") > 1))
+    # AND expression: unknown.flag branch is dropped, orders.val > 1 branch survives
+    proxy.filter((pl.col("unknown.flag")) & (pl.col("orders.val") > 1))
 
     rows = proxy.resolve().lf.collect().to_dicts()
-    vals = sorted(r["val"] for r in rows)
+    vals = sorted(r["orders.val"] for r in rows)
 
     assert vals == [2, 3]

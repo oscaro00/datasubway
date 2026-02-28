@@ -31,14 +31,18 @@ The purpose of this library is to define a data model using python focusing on t
 - Tests
   - tests for data_model
   - complex data model example
-
-- Add a license file
-- Logging
-- Benchmark system
 - Remove libcst dependency?
   - Extracting the last group_by and agg is probably easy with the proxy system
   - Making sure measures end in .group_by().agg() is harder without libcst (not really though...)
   - Also will want to get docstrings from measures at some point, which could be difficult (use built in __doc__())
+- Parameter to only look at pre aggregations within a certain time frame
+- Graph db for modeling and tracking table paths?
+  - https://duckdb.org/community_extensions/extensions/duckpgq (concern is not updated super frequently)
+
+
+- Add a license file
+- Logging
+- Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
   - Could also display logs
   - Probably makes sense to expose methods from data_model.py that will print this info (leave the UI to users)

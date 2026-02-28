@@ -32,7 +32,6 @@ from datasubway.polars_wrappers.pre_agg_expr import (
     rewrite_agg_expr,
     serialize_expr,
     std_pre_agg_expr,
-    strip_col_table_prefixes,
     sum_pre_agg_expr,
     var_pre_agg_expr,
 )
@@ -412,32 +411,6 @@ def test_rewrite_agg_expr_end_to_end():
     rewritten = rewrite_agg_expr(pl.col("revenue").sum())
     result = PRE_AGG_LF.select(rewritten).collect().item()
     assert result == 2800.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# strip_col_table_prefixes
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_strip_col_table_prefixes_removes_prefix():
-    expr = pl.col("orders.revenue").sum()
-    result = strip_col_table_prefixes(expr)
-    assert result.meta.root_names() == ["revenue"]
-
-
-def test_strip_col_table_prefixes_no_prefix_unchanged():
-    expr = pl.col("revenue").sum()
-    result = strip_col_table_prefixes(expr)
-    assert result is expr
-
-
-def test_strip_col_table_prefixes_multiple_columns():
-    expr = pl.col("orders.revenue") + pl.col("geo.amount")
-    result = strip_col_table_prefixes(expr)
-    root_names = result.meta.root_names()
-    assert "revenue" in root_names
-    assert "amount" in root_names
-    assert not any("." in n for n in root_names)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
