@@ -72,7 +72,9 @@ class DataModel:
 
         # Rename all columns to {table}.{col} for unambiguous downstream references
         self.tables: dict[str, pl.LazyFrame] = {
-            name: lf.rename({col: f"{name}.{col}" for col in lf.collect_schema().names()})
+            name: lf.rename(
+                {col: f"{name}.{col}" for col in lf.collect_schema().names()}
+            )
             for name, lf in tables.items()
         }
         # Schemas are derived from the renamed tables; validation checks f"{table}.{column}"
@@ -207,7 +209,9 @@ class DataModel:
 
         return True
 
-    async def query(self, query_context_dict: dict) -> pl.DataFrame:
+    async def query(
+        self, query_context_dict: dict, explain: bool = False
+    ) -> pl.DataFrame:
         query_context = QueryContext(query_context_dict)
 
         self.validate_query_context(query_context)
@@ -233,7 +237,9 @@ class DataModel:
                 )
 
         if query_context.havings != {}:
-            havings_filter_expr = build_filter_expr(query_context.havings, strip_prefixes=False)
+            havings_filter_expr = build_filter_expr(
+                query_context.havings, strip_prefixes=False
+            )
             lazy_result = lazy_result.filter(havings_filter_expr)
 
         if len(query_context.sorts) > 0:
@@ -243,4 +249,7 @@ class DataModel:
 
         lazy_result = lazy_result.slice(query_context.offset, query_context.limit)
 
-        return await lazy_result.collect_async()
+        if not explain:
+            return await lazy_result.collect_async()
+        else:
+            return lazy_result.explain()
