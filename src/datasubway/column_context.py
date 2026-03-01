@@ -3,6 +3,43 @@ to polars methods. It is assumed that QueryContext objects have already validate
 inputs are members of the DataModel"""
 
 import re
+from functools import reduce
+
+
+def _filter_spec_by_pattern(spec, parsed_patterns, keep_matching: bool):
+    """
+    Traverse a filter spec tree and collect leaf conditions whose column
+    matches (keep_matching=True) or does not match (keep_matching=False) the parsed patterns.
+    Returns a pl.Expr with the original AND/OR structure preserved, or None if nothing matches.
+    """
+    from datasubway.polars_wrappers.filter_expr import build_filter_expr
+
+    if isinstance(spec, tuple):
+        col = spec[0]
+        table, column = parse_table_column(col)
+        matches = any(
+            (pat_table == "*" or table == pat_table) and (pat_col == "*" or column == pat_col)
+            for pat_table, pat_col in parsed_patterns
+        )
+        if matches == keep_matching:
+            return build_filter_expr(spec, strip_prefixes=False)
+        return None
+
+    if "AND" in spec:
+        children = [_filter_spec_by_pattern(s, parsed_patterns, keep_matching) for s in spec["AND"]]
+        children = [c for c in children if c is not None]
+        if not children:
+            return None
+        return reduce(lambda a, b: a & b, children)
+
+    if "OR" in spec:
+        children = [_filter_spec_by_pattern(s, parsed_patterns, keep_matching) for s in spec["OR"]]
+        children = [c for c in children if c is not None]
+        if not children:
+            return None
+        return reduce(lambda a, b: a | b, children)
+
+    raise ValueError(f"Invalid filter spec: {spec!r}")
 
 
 def parse_table_column(table_column_str: str) -> tuple[str, str]:
@@ -49,8 +86,6 @@ def allow(
 ) -> list[str]:
     if isinstance(pattern, str):
         pattern = [pattern]
-    if isinstance(context, str):
-        context = [context]
     if isinstance(include, str):
         include = [include]
 
@@ -60,6 +95,17 @@ def allow(
         ]
     else:
         result_columns = [f"{column}" for table, column in parse_table_columns(include)]
+
+    if isinstance(context, dict):
+        if not context:
+            return list(set(result_columns))
+        expr = _filter_spec_by_pattern(context, parse_patterns(pattern), keep_matching=True)
+        if expr is None:
+            return list(set(result_columns))
+        return list(set(result_columns)) + [expr]
+
+    if isinstance(context, str):
+        context = [context]
 
     if "*" in pattern:
         allowed_context = context
@@ -91,8 +137,6 @@ def exclude(
 ) -> list[str]:
     if isinstance(pattern, str):
         pattern = [pattern]
-    if isinstance(context, str):
-        context = [context]
     if isinstance(include, str):
         include = [include]
 
@@ -102,6 +146,17 @@ def exclude(
         ]
     else:
         result_columns = [f"{column}" for table, column in parse_table_columns(include)]
+
+    if isinstance(context, dict):
+        if not context:
+            return list(set(result_columns))
+        expr = _filter_spec_by_pattern(context, parse_patterns(pattern), keep_matching=False)
+        if expr is None:
+            return list(set(result_columns))
+        return list(set(result_columns)) + [expr]
+
+    if isinstance(context, str):
+        context = [context]
 
     if "*" in pattern:
         allowed_context = []

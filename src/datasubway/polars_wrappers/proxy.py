@@ -238,6 +238,10 @@ class LazyFrameProxy:
             for arg in op.args:
                 if isinstance(arg, pl.Expr):
                     all_exprs.append(arg)
+                elif isinstance(arg, (list, tuple)):
+                    for item in arg:
+                        if isinstance(item, pl.Expr):
+                            all_exprs.append(item)
             for v in op.kwargs.values():
                 if isinstance(v, pl.Expr):
                     all_exprs.append(v)
@@ -371,6 +375,16 @@ class LazyFrameProxy:
                     if cleaned is not None:
                         cleaned_args.append(cleaned)
                     # else: expression references only unjoinable tables — drop silently
+                elif isinstance(a, list):
+                    cleaned_list = []
+                    for item in a:
+                        if isinstance(item, pl.Expr):
+                            cleaned = drop_unjoined_table_refs(item, self._unjoined_tables)
+                            if cleaned is not None:
+                                cleaned_list.append(cleaned)
+                        else:
+                            cleaned_list.append(item)
+                    cleaned_args.append(cleaned_list)
                 else:
                     cleaned_args.append(a)
             resolved_args = tuple(cleaned_args)

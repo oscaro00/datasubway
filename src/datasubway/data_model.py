@@ -166,7 +166,7 @@ class DataModel:
                 )
 
         # Valid post-aggregation columns: group-by cols (column name only) + measure output cols
-        valid_having_cols = {parse_table_column(g)[1] for g in qc.groups}
+        valid_having_cols = set(qc.groups)
         for measure in qc.measures:
             valid_having_cols.update(self.measure_output_cols[measure])
         having_col_refs = (
@@ -180,16 +180,21 @@ class DataModel:
                     f"having column '{col}' is not a valid group-by or measure output column"
                 )
 
+        valid_sort_cols = set(qc.groups)
+        for measure in qc.measures:
+            valid_sort_cols.update(self.measure_output_cols[measure])
+
         for table_column, direction in qc.sorts:
-            table, column = parse_table_column(table_column)
-            if table not in self.table_schemas.keys():
-                raise KeyError(
-                    f"sorting '{table}.{column}' does not have a valid table"
-                )
-            if f"{table}.{column}" not in self.table_schemas[table]:
-                raise ValueError(
-                    f"sorting '{table}.{column}' does not have a valid column"
-                )
+            if table_column not in valid_sort_cols:
+                table, column = parse_table_column(table_column)
+                if table not in self.table_schemas.keys():
+                    raise KeyError(
+                        f"sorting '{table}.{column}' does not have a valid table"
+                    )
+                if f"{table}.{column}" not in self.table_schemas[table]:
+                    raise ValueError(
+                        f"sorting '{table}.{column}' does not have a valid column"
+                    )
 
             if direction not in ["asc", "desc"]:
                 raise ValueError(f"sorting direction '{direction}' is not allowed")
@@ -228,15 +233,13 @@ class DataModel:
                 )
 
         if query_context.havings != {}:
-            havings_filter_expr = build_filter_expr(query_context.havings)
+            havings_filter_expr = build_filter_expr(query_context.havings, strip_prefixes=False)
             lazy_result = lazy_result.filter(havings_filter_expr)
 
         if len(query_context.sorts) > 0:
-            sort_cols = parse_table_columns([col for col, _ in query_context.sorts])
-            sort_directions = parse_table_columns(
-                [dir for _, dir in query_context.sorts]
-            )
-            lazy_result = lazy_result.sort(sort_cols, sort_directions)
+            sort_cols = [col for col, _ in query_context.sorts]
+            descending = [dir.lower() == "desc" for _, dir in query_context.sorts]
+            lazy_result = lazy_result.sort(sort_cols, descending=descending)
 
         lazy_result = lazy_result.slice(query_context.offset, query_context.limit)
 
