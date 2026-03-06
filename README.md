@@ -21,18 +21,24 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## Longer term vision:
 
-- I believe this combinations of structured yet flexible calculations is a great use case for small, local AI models to take natural language and execute reliable calculations. Passing measure descriptions along with measures will support domain specific calculations and terminology and a small model should be able to create a json-like query context. This will hopefully avoid the problem where models are great a writing simple queries, but are inconsistent on harder queries with domain specific knowledge especially across multiple users.
+- I believe this combinations of structured yet flexible calculations is a great use case for small, local AI models to take natural language and execute reliable calculations. Passing measure descriptions along with measures will support domain specific calculations and terminology and a small model should be able to create a json-like query context. This will hopefully avoid the problem where models are great at writing simple queries, but are inconsistent on harder queries with domain specific knowledge especially across multiple users.
 
 
 
 ## TO DO
 
-- Bigger change: feed the Allow() and Exclude() calls into the table() call when the measure is defined, then there are fewer moving parts when a measure is called
-  - Allow()/Exclude() calls from filter(), group_by(), with_columns(), select() [no aggregation applied] should go in the group_by part of table()
-  - Allow()/Exclude() calls from agg() and select() [with aggregation applied] should go in the agg part of table()
-  - It is important feeding Allow() and Exclude() into table() calls only happens within a polars method chain
+- Do more validation in QueryContext __init__
+- Remove libcst dependency?
+  - Extracting the last group_by and agg is probably easy with the proxy system
+  - Making sure measures end in .group_by().agg() is harder without libcst (not really though...)
+  - Also will want to get docstrings from measures at some point, which could be difficult (use built in __doc__())
+- Parameter to only look at pre aggregations within a certain time frame
+- Graph db for modeling and tracking table paths?
+  - https://duckdb.org/community_extensions/extensions/duckpgq (concern is not updated super frequently)
+
 
 - Add a license file
+- Logging
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
   - Could also display logs

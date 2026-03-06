@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "datasubway"
-version = "0.1.0"
+version = "0.2.0"
 description = "A semantic layer library for data modeling with Polars"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -23,3 +23,11 @@ dependencies = [
 dev = [
     "pytest>=9.0.2",
 ]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests"
+]
+pythonpath = ["."]

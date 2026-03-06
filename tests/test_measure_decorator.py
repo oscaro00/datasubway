@@ -1,290 +1,197 @@
-import pytest
 import polars as pl
+import pytest
 
-from datasubway import DataModel, measure
+from datasubway import allow, exclude
+from datasubway.data_model import DataModel
+from datasubway.measure_decorator import measure
+
+# Module-level LazyFrame referenced by measure function bodies
+lf = pl.LazyFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
 
 
-class TestMeasureDecorator:
-    """Test suite for the @measure decorator."""
+@pytest.fixture
+def dm():
+    return DataModel(tables={"test": lf})
 
-    @pytest.fixture
-    def simple_datamodel(self):
-        """Create a simple DataModel for testing."""
-        tables = {
-            'sales': pl.LazyFrame({
-                'item_id': [1, 2, 3],
-                'date': ['2024-01-01', '2024-01-02', '2024-01-03'],
-                'revenue': [100, 200, 300],
-                'quantity': [10, 20, 30]
-            }).with_columns(pl.col('date').str.to_date())
-        }
-        return DataModel(
-            tables=tables,
-            joins=[],
-            pre_aggregations={},
-            pre_agg_directory=None
+
+# ---------------------------------------------------------------------------
+# Group 1 — Basic registration
+# ---------------------------------------------------------------------------
+
+
+def test_measure_stored_in_measures(dm):
+    @measure(dm)
+    def my_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
         )
 
-    # ========================================================================
-    # VALID MEASURES (should succeed)
-    # ========================================================================
+    assert "my_measure" in dm.measures
 
-    def test_measure_with_group_by_agg(self, simple_datamodel):
-        """Test that valid measure with .group_by().agg() is registered."""
 
-        @measure(simple_datamodel)
-        def total_revenue():
-            return (
-                simple_datamodel.tables['sales']
-                .group_by('item_id')
-                .agg(pl.col('revenue').sum())
-            )
+def test_decorator_returns_original_function(dm):
+    def my_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-        assert 'total_revenue' in simple_datamodel.measures
-        assert simple_datamodel.measures['total_revenue'] == total_revenue
+    original = my_measure
+    decorated = measure(dm)(my_measure)
+    assert decorated is original
 
-    def test_measure_with_group_by_dynamic_agg(self, simple_datamodel):
-        """Test that .group_by_dynamic().agg() is accepted."""
 
-        @measure(simple_datamodel)
-        def dynamic_revenue():
-            return (
-                simple_datamodel.tables['sales']
-                .group_by_dynamic('date', every='1d')
-                .agg(pl.col('revenue').sum())
-            )
+def test_measure_grouping_context_populated(dm):
+    @measure(dm)
+    def my_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-        assert 'dynamic_revenue' in simple_datamodel.measures
+    assert "my_measure" in dm.measure_grouping_contexts
 
-    def test_measure_with_rolling_agg(self, simple_datamodel):
-        """Test that .rolling().agg() is accepted."""
 
-        @measure(simple_datamodel)
-        def rolling_revenue():
-            return (
-                simple_datamodel.tables['sales']
-                .rolling(index_column='date', period='3d')
-                .agg(pl.col('revenue').sum())
-            )
+def test_measure_output_cols_populated(dm):
+    @measure(dm)
+    def my_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-        assert 'rolling_revenue' in simple_datamodel.measures
+    assert "my_measure" in dm.measure_output_cols
 
-    def test_measure_registration(self, simple_datamodel):
-        """Test that measure is properly stored in data_model.measures."""
 
-        @measure(simple_datamodel)
-        def test_measure():
-            return (
-                simple_datamodel.tables['sales']
-                .group_by('item_id')
-                .agg(pl.col('revenue').max())
-            )
+# ---------------------------------------------------------------------------
+# Group 2 — GroupingContext content
+# ---------------------------------------------------------------------------
 
-        # Verify it's stored correctly
-        assert 'test_measure' in simple_datamodel.measures
-        assert callable(simple_datamodel.measures['test_measure'])
-        assert simple_datamodel.measures['test_measure'].__name__ == 'test_measure'
 
-    def test_multiple_measures_same_datamodel(self, simple_datamodel):
-        """Test registering multiple different measures in the same DataModel."""
+def test_grouping_context_allow_type(dm):
+    @measure(dm)
+    def allow_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-        @measure(simple_datamodel)
-        def measure1():
-            return (
-                simple_datamodel.tables['sales']
-                .group_by('item_id')
-                .agg(pl.col('revenue').sum())
-            )
+    assert dm.measure_grouping_contexts["allow_measure"]["type"] == "allow"
 
-        @measure(simple_datamodel)
-        def measure2():
-            return (
-                simple_datamodel.tables['sales']
-                .group_by('item_id')
-                .agg(pl.col('quantity').mean())
-            )
 
-        assert 'measure1' in simple_datamodel.measures
-        assert 'measure2' in simple_datamodel.measures
-        assert len(simple_datamodel.measures) == 2
+def test_grouping_context_exclude_type(dm):
+    @measure(dm)
+    def exclude_measure(qc):
+        return lf.group_by(exclude(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-    def test_measure_with_chained_methods_before_group_by(self, simple_datamodel):
-        """Test that methods chained BEFORE group_by are allowed."""
+    assert dm.measure_grouping_contexts["exclude_measure"]["type"] == "exclude"
 
-        @measure(simple_datamodel)
-        def filtered_revenue():
-            return (
-                simple_datamodel.tables['sales']
-                .filter(pl.col('revenue') > 100)
-                .select('item_id', 'revenue')
-                .group_by('item_id')
-                .agg(pl.col('revenue').sum())
-            )
 
-        assert 'filtered_revenue' in simple_datamodel.measures
+def test_grouping_context_pattern_extracted(dm):
+    @measure(dm)
+    def pattern_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-    def test_measure_with_multiple_chains_last_valid(self, simple_datamodel):
-        """Test that multiple chains are allowed if last one ends correctly."""
+    assert '"*"' in dm.measure_grouping_contexts["pattern_measure"]["pattern"]
 
-        @measure(simple_datamodel)
-        def multiple_chains():
-            # First chain - can have any structure
-            temp = simple_datamodel.tables['sales'].select('item_id', 'revenue')
 
-            # Last chain - must end with group_by/agg
-            return temp.group_by('item_id').agg(pl.col('revenue').sum())
+# ---------------------------------------------------------------------------
+# Group 3 — Output column extraction
+# ---------------------------------------------------------------------------
 
-        assert 'multiple_chains' in simple_datamodel.measures
 
-    def test_measure_with_early_invalid_chain(self, simple_datamodel):
-        """Test that early chains can have methods after .agg()."""
+def test_output_cols_with_alias(dm):
+    @measure(dm)
+    def alias_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-        @measure(simple_datamodel)
-        def early_invalid():
-            # First chain - has .sort() after .agg(), but that's OK
-            temp = (
-                simple_datamodel.tables['sales']
-                .group_by('item_id')
-                .agg(pl.col('revenue').sum())
-                .sort('item_id')  # Methods after agg - OK because not last chain
-            )
+    assert dm.measure_output_cols["alias_measure"] == ["sum_a"]
 
-            # Last chain - valid
-            return temp.filter(pl.col('revenue-sum') > 100).group_by('item_id').agg(pl.col('revenue-sum').max())
 
-        assert 'early_invalid' in simple_datamodel.measures
+def test_output_cols_without_alias(dm):
+    @measure(dm)
+    def no_alias_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("b").first()
+        )
 
-    def test_measure_with_multiline_agg(self, simple_datamodel):
-        """Test that multiline .agg() with multiple arguments works."""
+    assert dm.measure_output_cols["no_alias_measure"] == ["b"]
 
-        @measure(simple_datamodel)
-        def multiline_agg():
-            return (
-                simple_datamodel.tables['sales']
-                .group_by('item_id')
-                .agg(
-                    pl.col('revenue').sum().alias('total_revenue'),
-                    pl.col('quantity').mean().alias('avg_quantity')
-                )
-            )
 
-        assert 'multiline_agg' in simple_datamodel.measures
+def test_output_cols_multiple_columns(dm):
+    @measure(dm)
+    def multi_col_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a"),
+            pl.col("b").first(),
+        )
 
-    # ========================================================================
-    # DUPLICATE NAMES (should fail)
-    # ========================================================================
+    assert dm.measure_output_cols["multi_col_measure"] == ["sum_a", "b"]
 
-    def test_duplicate_measure_name(self, simple_datamodel):
-        """Test that duplicate measure names raise ValueError."""
 
-        @measure(simple_datamodel)
-        def revenue():
-            return (
-                simple_datamodel.tables['sales']
-                .group_by('item_id')
-                .agg(pl.col('revenue').sum())
-            )
+# ---------------------------------------------------------------------------
+# Group 4 — Error cases
+# ---------------------------------------------------------------------------
 
-        # Try to register another measure with same name
-        with pytest.raises(ValueError, match="already exists"):
-            @measure(simple_datamodel)
-            def revenue():  # Same name
-                return (
-                    simple_datamodel.tables['sales']
-                    .group_by('item_id')
-                    .agg(pl.col('revenue').max())
-                )
 
-    # ========================================================================
-    # INVALID METHOD CHAINS (should fail)
-    # ========================================================================
+def test_duplicate_measure_name_raises(dm):
+    """This is a bit messy, but it avoids linting errors for functions with duplicate names"""
 
-    def test_measure_without_group_by(self, simple_datamodel):
-        """Test that last chain with .agg() but no group_by variant fails."""
+    def dup_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-        with pytest.raises(ValueError, match="must end with one of"):
-            @measure(simple_datamodel)
-            def no_group_by():
-                return (
-                    simple_datamodel.tables['sales']
-                    .select('item_id', 'revenue')
-                    .agg(pl.col('revenue').sum())  # Missing group_by before agg
-                )
+    measure(dm)(dup_measure)
 
-    def test_measure_without_agg(self, simple_datamodel):
-        """Test that last chain with .group_by() but no .agg() fails."""
+    def dup_measure_copy(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
 
-        with pytest.raises(ValueError, match="must end with .agg"):
-            @measure(simple_datamodel)
-            def no_agg():
-                return (
-                    simple_datamodel.tables['sales']
-                    .group_by('item_id')
-                    # Missing .agg()
-                )
+    dup_measure_copy.__name__ = "dup_measure"
 
-    def test_measure_last_chain_with_method_after_agg(self, simple_datamodel):
-        """Test that methods after .agg() in the last chain fail."""
+    with pytest.raises(ValueError, match="already exists"):
+        measure(dm)(dup_measure_copy)
 
-        with pytest.raises(ValueError, match="must not have methods after .agg"):
-            @measure(simple_datamodel)
-            def method_after_agg():
-                return (
-                    simple_datamodel.tables['sales']
-                    .group_by('item_id')
-                    .agg(pl.col('revenue').sum())
-                    .sort('item_id')  # This should fail
-                )
 
-    def test_measure_last_chain_missing_agg(self, simple_datamodel):
-        """Test that if last chain doesn't end with group_by/agg, it fails."""
+def test_invalid_measure_no_agg_raises(dm):
+    def invalid_no_agg(qc):
+        return lf.select("a", "b")
 
-        with pytest.raises(ValueError, match="must end with"):
-            @measure(simple_datamodel)
-            def last_chain_invalid():
-                # First chain - valid
-                temp = (
-                    simple_datamodel.tables['sales']
-                    .group_by('item_id')
-                    .agg(pl.col('revenue').sum())
-                )
+    with pytest.raises(ValueError):
+        measure(dm)(invalid_no_agg)
 
-                # Last chain - doesn't end with group_by/agg
-                return temp.select('item_id')
 
-    def test_measure_with_select_after_agg(self, simple_datamodel):
-        """Test that .select() after .agg() in last chain fails."""
+def test_invalid_measure_no_allow_exclude_raises(dm):
+    def invalid_no_allow(qc):
+        return lf.group_by("a").agg(pl.col("b").sum().alias("sum_b"))
 
-        with pytest.raises(ValueError, match="must not have methods after .agg"):
-            @measure(simple_datamodel)
-            def select_after_agg():
-                return (
-                    simple_datamodel.tables['sales']
-                    .group_by('item_id')
-                    .agg(pl.col('revenue').sum().alias('total'))
-                    .select('item_id', 'total')  # This should fail
-                )
+    with pytest.raises(ValueError):
+        measure(dm)(invalid_no_allow)
 
-    def test_measure_with_filter_after_agg(self, simple_datamodel):
-        """Test that .filter() after .agg() in last chain fails."""
 
-        with pytest.raises(ValueError, match="must not have methods after .agg"):
-            @measure(simple_datamodel)
-            def filter_after_agg():
-                return (
-                    simple_datamodel.tables['sales']
-                    .group_by('item_id')
-                    .agg(pl.col('revenue').sum().alias('total'))
-                    .filter(pl.col('total') > 100)  # This should fail
-                )
+# ---------------------------------------------------------------------------
+# Group 5 — Multiple measures
+# ---------------------------------------------------------------------------
 
-    def test_measure_no_polars_chain(self, simple_datamodel):
-        """Test that a measure with no polars method chains fails."""
 
-        with pytest.raises(ValueError, match="must contain at least one polars method chain"):
-            @measure(simple_datamodel)
-            def no_polars():
-                # Just some non-polars code
-                x = 5
-                y = 10
-                return x + y
+def test_multiple_measures_on_same_data_model(dm):
+    @measure(dm)
+    def first_measure(qc):
+        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
+            pl.col("a").sum().alias("sum_a")
+        )
+
+    @measure(dm)
+    def second_measure(qc):
+        return lf.group_by(exclude(pattern="*", context=qc["groups"])).agg(
+            pl.col("b").first()
+        )
+
+    for name in ("first_measure", "second_measure"):
+        assert name in dm.measures
+        assert name in dm.measure_grouping_contexts
+        assert name in dm.measure_output_cols
