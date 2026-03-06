@@ -46,3 +46,6 @@ The purpose of this library is to define a data model using python focusing on t
 - Roll based access control?
   - Might make more sense for this to be a user implemented feature because it involves auth
 - Add optional AI dependency to get chat bot functionality working
+
+
+Run `uv sync --extra dev` to download the development environment

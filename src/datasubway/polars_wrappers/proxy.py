@@ -5,12 +5,17 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import polars as pl
 
+from datasubway.column_context import _AllowExcludeResult
+from datasubway.measure_meta import GroupingContext
+
 if TYPE_CHECKING:
     from polars._typing import JoinStrategy
 
     from datasubway.joins_meta import Join
     from datasubway.polars_wrappers.lazyframe_wrapper import LazyFrameWrapper
     from datasubway.pre_agg_meta import PreAggregation
+
+_GROUP_BY_VARIANTS = {"group_by", "group_by_dynamic", "rolling"}
 
 
 class _DataModelLike(Protocol):
@@ -110,6 +115,7 @@ class LazyFrameProxy:
         self.agg_exprs: list[pl.Expr] = []  # captured from agg() call
         self._unjoined_tables: set[str] = set()
         self.use_pre_agg = use_pre_agg
+        self.grouping_context: GroupingContext | None = None
 
     def filter(self, *predicates: Any, **constraints: Any) -> LazyFrameProxy:
         self.ops.append(RecordedOp("filter", predicates, constraints))
@@ -129,6 +135,14 @@ class LazyFrameProxy:
         self.ops.append(
             RecordedOp("group_by", by, {"maintain_order": maintain_order, **named_by})
         )
+        for arg in by:
+            if isinstance(arg, _AllowExcludeResult):
+                self.grouping_context = GroupingContext(
+                    type=arg.ae_type,
+                    pattern=arg.pattern,
+                    include=arg.include if arg.include else None,
+                )
+                break
         return LazyGroupByProxy(self)
 
     def group_by_dynamic(
@@ -167,6 +181,13 @@ class LazyFrameProxy:
                 },
             )
         )
+        if isinstance(group_by, _AllowExcludeResult):
+            merged_include = list(group_by.include or []) + [index_column]
+            self.grouping_context = GroupingContext(
+                type=group_by.ae_type,
+                pattern=group_by.pattern,
+                include=merged_include,
+            )
         return LazyGroupByProxy(self)
 
     def rolling(
@@ -197,11 +218,41 @@ class LazyFrameProxy:
                 },
             )
         )
+        if isinstance(group_by, _AllowExcludeResult):
+            merged_include = list(group_by.include or []) + [index_column]
+            self.grouping_context = GroupingContext(
+                type=group_by.ae_type,
+                pattern=group_by.pattern,
+                include=merged_include,
+            )
         return LazyGroupByProxy(self)
 
     def join(self, other: Any, **kwargs: Any) -> LazyFrameProxy:
         self.ops.append(RecordedOp("join", (other,), kwargs))
         return self
+
+    def validate_measure_chain(self) -> None:
+        """Raise ValueError if the recorded op chain is not a valid measure pattern."""
+        if not self.ops:
+            raise ValueError(
+                "Measure must return a LazyFrameProxy with method calls. "
+                "Got no recorded ops — did you call dm.table()?"
+            )
+        last_op = self.ops[-1]
+        if last_op.method != "agg":
+            raise ValueError(
+                f"Measure must end with .agg(). Last op was: .{last_op.method}()"
+            )
+        if len(self.ops) < 2 or self.ops[-2].method not in _GROUP_BY_VARIANTS:
+            raise ValueError(
+                f"Measure must have .group_by()/.group_by_dynamic()/.rolling() "
+                f"immediately before .agg(). "
+                f"Found chain: .{'().'.join(op.method for op in self.ops)}()"
+            )
+        if self.grouping_context is None:
+            raise ValueError(
+                "Measure must use allow() or exclude() in the grouping method."
+            )
 
     def __getattr__(self, name: str) -> Any:
         # Guard against infinite recursion for instance attributes not yet set
@@ -214,6 +265,7 @@ class LazyFrameProxy:
             "table_name",
             "dm",
             "use_pre_agg",
+            "grouping_context",
         ):
             raise AttributeError(name)
 

@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import inspect
-import textwrap
 from typing import Callable
 
 from datasubway.data_model import DataModel
-from datasubway.libcst.measure_output_context import (
-    extract_agg_output_columns,
-    extract_grouping_context,
-)
+from datasubway.polars_wrappers.proxy import LazyFrameProxy
+from datasubway.query_context import QueryContext
 
 
 def measure(data_model: DataModel) -> Callable:
@@ -23,22 +19,23 @@ def measure(data_model: DataModel) -> Callable:
                 f"Measure '{func_name}' already exists in data_model.measures"
             )
 
-        source_code = inspect.getsource(func)
-        dedented_source = textwrap.dedent(source_code)
+        # Call with empty QueryContext to record the proxy chain at decoration time
+        mock_qc = QueryContext({"measures": []})
+        proxy = func(mock_qc)
 
-        # Validate the measure ends in some type of group_by, then agg
-        # and get the grouping context
-        grouping_context = extract_grouping_context(dedented_source, func_name)
+        if not isinstance(proxy, LazyFrameProxy):
+            raise ValueError(
+                f"Measure '{func_name}' must return a LazyFrameProxy via dm.table(). "
+                f"Got: {type(proxy).__name__}"
+            )
 
-        # Add the grouping context to the data model instance
-        data_model.measure_grouping_contexts[func_name] = grouping_context
+        proxy.validate_measure_chain()
 
-        # Get the names of output columns as lists
-        output_cols = extract_agg_output_columns(dedented_source, func_name)
+        data_model.measure_grouping_contexts[func_name] = proxy.grouping_context
 
+        output_cols = [expr.meta.output_name() for expr in proxy.agg_exprs]
         data_model.measure_output_cols[func_name] = output_cols
 
-        # add the measure to the list of measures in the function
         data_model.measures[func_name] = func
 
         return func

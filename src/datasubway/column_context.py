@@ -89,6 +89,16 @@ def _process_include_columns(include: list[str], include_tables: bool) -> list[s
     return result
 
 
+class _AllowExcludeResult(list):
+    """List subclass returned by allow()/exclude() carrying call metadata."""
+
+    def __init__(self, items, *, ae_type, pattern, include):
+        super().__init__(items)
+        self.ae_type = ae_type
+        self.pattern = pattern
+        self.include = include
+
+
 def allow(
     pattern: str | list[str],
     context: str | list[str] | dict,
@@ -96,6 +106,9 @@ def allow(
     *,
     include_tables: bool = True,
 ) -> list[str]:
+    original_pattern = pattern
+    original_include = include
+
     if isinstance(pattern, str):
         pattern = [pattern]
     if isinstance(include, str):
@@ -103,13 +116,16 @@ def allow(
 
     result_columns = _process_include_columns(include, include_tables)
 
+    def _sentinel(items):
+        return _AllowExcludeResult(items, ae_type="allow", pattern=original_pattern, include=original_include)
+
     if isinstance(context, dict):
         if not context:
-            return list(set(result_columns))
+            return _sentinel(list(set(result_columns)))
         expr = _filter_spec_by_pattern(context, parse_patterns(pattern), keep_matching=True)
         if expr is None:
-            return list(set(result_columns))
-        return list(set(result_columns)) + [expr]
+            return _sentinel(list(set(result_columns)))
+        return _sentinel(list(set(result_columns)) + [expr])
 
     if isinstance(context, str):
         context = [context]
@@ -132,7 +148,7 @@ def allow(
     result_columns.extend(allowed_context)
 
     # remove duplicates
-    return list(set(result_columns))
+    return _sentinel(list(set(result_columns)))
 
 
 def exclude(
@@ -142,6 +158,9 @@ def exclude(
     *,
     include_tables: bool = True,
 ) -> list[str]:
+    original_pattern = pattern
+    original_include = include
+
     if isinstance(pattern, str):
         pattern = [pattern]
     if isinstance(include, str):
@@ -149,13 +168,16 @@ def exclude(
 
     result_columns = _process_include_columns(include, include_tables)
 
+    def _sentinel(items):
+        return _AllowExcludeResult(items, ae_type="exclude", pattern=original_pattern, include=original_include)
+
     if isinstance(context, dict):
         if not context:
-            return list(set(result_columns))
+            return _sentinel(list(set(result_columns)))
         expr = _filter_spec_by_pattern(context, parse_patterns(pattern), keep_matching=False)
         if expr is None:
-            return list(set(result_columns))
-        return list(set(result_columns)) + [expr]
+            return _sentinel(list(set(result_columns)))
+        return _sentinel(list(set(result_columns)) + [expr])
 
     if isinstance(context, str):
         context = [context]
@@ -179,4 +201,4 @@ def exclude(
     result_columns.extend(allowed_context)
 
     # remove duplicates
-    return list(set(result_columns))
+    return _sentinel(list(set(result_columns)))
