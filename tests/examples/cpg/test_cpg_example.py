@@ -368,3 +368,67 @@ def test_rolling_3_day_average_measure():
     print(polars_result)
 
     assert_frame_equal(datasubway_result, polars_result, check_column_order=False)
+
+
+@measure(dm)
+def prior_day_revenue(qc: QueryContext):
+    return (
+        dm.table("fact_sales")
+        .filter(allow(pattern="*", context=qc.filters))
+        .with_columns(
+            (pl.col("fact_sales.date") + pl.duration(days=1)).alias("fact_sales.date")
+        )
+        .group_by(allow(pattern="*", include=["fact_sales.date"], context=qc.groups))
+        .agg(pl.col("fact_sales.revenue").sum().alias("prior_day_revenue"))
+    )
+
+
+def test_prior_day_revenue_measure():
+    query = {
+        "measures": ["prior_day_revenue"],
+        "filters": {
+            "AND": [
+                ("dim_product.category", "in", ["categoryA", "categoryC"]),
+                (
+                    "dim_synd_product.category",
+                    "!=",
+                    "categoryB",
+                ),  # this shouldn't affect the results
+            ]
+        },
+        "groups": ["fact_sales.date", "dim_product.category"],
+        "havings": {"OR": [("prior_day_revenue", ">=", 10)]},
+        "sorts": [("fact_sales.date", "asc"), ("dim_product.category", "desc")],
+        "limit": 10,
+        "offset": 1,
+    }
+
+    datasubway_explain = asyncio.run(dm.query(query, explain=True))
+    print(datasubway_explain)
+
+    datasubway_result = asyncio.run(dm.query(query))
+    print(datasubway_result)
+
+    polars_result = (
+        dm.tables["fact_sales"]
+        .join(
+            dm.tables["dim_product"],
+            left_on="fact_sales.product_id",
+            right_on="dim_product.product_id",
+            how="left",
+        )
+        .filter(pl.col("dim_product.category").is_in(["categoryA", "categoryC"]))
+        .with_columns(
+            (pl.col("fact_sales.date") + pl.duration(days=1)).alias("fact_sales.date")
+        )
+        .group_by("fact_sales.date", "dim_product.category")
+        .agg(pl.col("fact_sales.revenue").sum().alias("prior_day_revenue"))
+        .filter(pl.col("prior_day_revenue") >= 10)
+        .sort("fact_sales.date", "dim_product.category", descending=[False, True])
+        .slice(offset=1, length=10)
+        .collect()
+    )
+
+    print(polars_result)
+
+    assert_frame_equal(datasubway_result, polars_result, check_column_order=False)
