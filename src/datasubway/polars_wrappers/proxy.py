@@ -339,7 +339,13 @@ class LazyFrameProxy:
         )
         if pre_agg:
             source = LazyFrameWrapper(pre_agg.load(), from_pre_agg=True)
-            self._unjoined_tables = set()  # no joins needed; replay unaffected
+            # Tables covered by the pre-agg (group-by dims + aggregated fact tables)
+            pre_agg_tables = {
+                col.split(".", 1)[0]
+                for col in pre_agg.group_by + list(pre_agg.aggregations.keys())
+                if "." in col
+            }
+            self._unjoined_tables = self._collect_foreign_tables() - pre_agg_tables
         else:
             source, self._unjoined_tables = self._build_joined_source()
 

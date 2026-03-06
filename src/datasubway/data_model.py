@@ -233,7 +233,7 @@ class DataModel:
             # so full join the results
             else:
                 lazy_result = lazy_result.join(
-                    curr_resolved.lf, on=query_context.groups, how="full"
+                    curr_resolved.lf, on=query_context.groups, how="full", coalesce=True
                 )
 
         if query_context.havings != {}:

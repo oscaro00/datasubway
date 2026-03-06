@@ -58,6 +58,8 @@ class _MockPreAgg:
 
     def __init__(self, lf: pl.LazyFrame) -> None:
         self._lf = lf
+        self.group_by: list[str] = []
+        self.aggregations: dict[str, list[str]] = {}
 
     def load(self) -> pl.LazyFrame:
         return self._lf
