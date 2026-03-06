@@ -77,6 +77,18 @@ def parse_patterns(pattern_list: list[str]) -> list[tuple[str, str]]:
     return [parse_pattern(pattern_str) for pattern_str in pattern_list]
 
 
+def _process_include_columns(include: list[str], include_tables: bool) -> list[str]:
+    """Handle both 'table.col' schema columns and raw derived column names."""
+    result = []
+    for col in include:
+        if "." in col:
+            table, column = parse_table_column(col)
+            result.append(f"{table}.{column}" if include_tables else column)
+        else:
+            result.append(col)  # Raw derived column - pass through as-is
+    return result
+
+
 def allow(
     pattern: str | list[str],
     context: str | list[str] | dict,
@@ -89,12 +101,7 @@ def allow(
     if isinstance(include, str):
         include = [include]
 
-    if include_tables:
-        result_columns = [
-            f"{table}.{column}" for table, column in parse_table_columns(include)
-        ]
-    else:
-        result_columns = [f"{column}" for table, column in parse_table_columns(include)]
+    result_columns = _process_include_columns(include, include_tables)
 
     if isinstance(context, dict):
         if not context:
@@ -140,12 +147,7 @@ def exclude(
     if isinstance(include, str):
         include = [include]
 
-    if include_tables:
-        result_columns = [
-            f"{table}.{column}" for table, column in parse_table_columns(include)
-        ]
-    else:
-        result_columns = [f"{column}" for table, column in parse_table_columns(include)]
+    result_columns = _process_include_columns(include, include_tables)
 
     if isinstance(context, dict):
         if not context:

@@ -432,3 +432,206 @@ def test_prior_day_revenue_measure():
     print(polars_result)
 
     assert_frame_equal(datasubway_result, polars_result, check_column_order=False)
+
+
+@measure(dm)
+def wtd_revenue(qc: QueryContext):
+    return (
+        dm.table("fact_sales")
+        .filter(allow(pattern="*", context=qc.filters))
+        .with_columns(
+            [
+                (
+                    (pl.col("fact_sales.date") + pl.duration(days=1)).dt.truncate("1w")
+                    - pl.duration(days=1)
+                ).alias("week_start")
+            ]
+        )
+        .sort(allow(pattern="*", context=qc.groups))
+        .with_columns(
+            [
+                pl.col("fact_sales.revenue")
+                .cum_sum()
+                .over(
+                    exclude(
+                        pattern="fact_sales.date",
+                        include=["week_start"],
+                        context=qc.groups,
+                    )
+                )
+                .alias("wtd_revenue")
+            ]
+        )
+        .group_by(allow(pattern="*", context=qc.groups))
+        .agg(pl.col("wtd_revenue").max())
+    )
+
+
+def test_wtd_revenue_measure():
+    query = {
+        "measures": ["wtd_revenue"],
+        "filters": {
+            "AND": [
+                ("dim_product.category", "in", ["categoryA", "categoryC"]),
+                (
+                    "dim_synd_product.category",
+                    "!=",
+                    "categoryB",
+                ),  # this shouldn't affect the results
+            ]
+        },
+        "groups": ["dim_store.region", "dim_product.category"],
+        # "havings": {"OR": [("prior_day_revenue", ">=", 10)]},
+        "sorts": [("dim_store.region", "asc"), ("dim_product.category", "desc")],
+        "limit": 10,
+        "offset": 2,
+    }
+
+    datasubway_explain = asyncio.run(dm.query(query, explain=True))
+    print(datasubway_explain)
+
+    datasubway_result = asyncio.run(dm.query(query))
+    print(datasubway_result)
+
+    polars_result = (
+        dm.tables["fact_sales"]
+        .join(
+            dm.tables["dim_product"],
+            left_on="fact_sales.product_id",
+            right_on="dim_product.product_id",
+            how="left",
+        )
+        .join(
+            dm.tables["dim_store"],
+            left_on="fact_sales.store_id",
+            right_on="dim_store.store_id",
+            how="left",
+        )
+        .filter(pl.col("dim_product.category").is_in(["categoryA", "categoryC"]))
+        .with_columns(
+            [
+                (
+                    (pl.col("fact_sales.date") + pl.duration(days=1)).dt.truncate("1w")
+                    - pl.duration(days=1)
+                ).alias("week_start")
+            ]
+        )
+        .sort("dim_store.region", "dim_product.category")
+        .with_columns(
+            [
+                pl.col("fact_sales.revenue")
+                .cum_sum()
+                .over(["week_start", "dim_store.region", "dim_product.category"])
+                .alias("wtd_revenue")
+            ]
+        )
+        .with_columns(
+            (pl.col("fact_sales.date") + pl.duration(days=1)).alias("fact_sales.date")
+        )
+        .group_by("dim_store.region", "dim_product.category")
+        .agg(pl.col("wtd_revenue").max())
+        .sort("dim_store.region", "dim_product.category", descending=[False, True])
+        .slice(offset=2, length=10)
+        .collect()
+    )
+
+    print(polars_result)
+
+    assert_frame_equal(datasubway_result, polars_result, check_column_order=False)
+
+
+@measure(dm)
+def product_rank_by_revenue(qc: QueryContext):
+    product_rank = (
+        dm.table("fact_sales")
+        .filter(allow(pattern="*", context=qc.filters))
+        .group_by(
+            allow(pattern="*", include=["fact_sales.product_id"], context=qc.groups)
+        )
+        .agg(pl.col("fact_sales.revenue").sum().alias("total_revenue"))
+        .with_columns(
+            pl.col("total_revenue").rank("min", descending=True).alias("product_rank")
+        )
+        .select(pl.col("fact_sales.product_id"), pl.col("product_rank"))
+    )
+
+    return (
+        dm.table("fact_sales")
+        .filter(allow(pattern="*", context=qc.filters))
+        .join(product_rank, on="fact_sales.product_id", how="inner")
+        .group_by(
+            allow(pattern="*", include=["fact_sales.product_id"], context=qc.groups)
+        )
+        .agg(
+            pl.col("product_rank").min().alias("product_rank"),
+            pl.col("fact_sales.revenue").sum().alias("revenue"),
+        )
+    )
+
+
+def test_product_rank_by_revenue_measure():
+    query = {
+        "measures": ["product_rank_by_revenue"],
+        "filters": {
+            "AND": [
+                ("dim_product.category", "in", ["categoryA", "categoryC"]),
+                (
+                    "dim_synd_product.category",
+                    "!=",
+                    "categoryB",
+                ),  # this shouldn't affect the results
+            ]
+        },
+        "groups": ["fact_sales.product_id"],
+        # "havings": {"OR": [("prior_day_revenue", ">=", 10)]},
+        "sorts": [("fact_sales.product_id", "asc")],
+        "limit": 8,
+        "offset": 3,
+    }
+
+    datasubway_explain = asyncio.run(dm.query(query, explain=True))
+    print(datasubway_explain)
+
+    datasubway_result = asyncio.run(dm.query(query))
+    print(datasubway_result)
+
+    product_rank = (
+        dm.tables["fact_sales"]
+        .join(
+            dm.tables["dim_product"],
+            left_on="fact_sales.product_id",
+            right_on="dim_product.product_id",
+            how="inner",
+        )
+        .filter(pl.col("dim_product.category").is_in(["categoryA", "categoryC"]))
+        .group_by("fact_sales.product_id")
+        .agg(pl.col("fact_sales.revenue").sum().alias("total_revenue"))
+        .with_columns(
+            pl.col("total_revenue").rank("min", descending=True).alias("product_rank")
+        )
+        .select(pl.col("fact_sales.product_id"), pl.col("product_rank"))
+    )
+
+    polars_result = (
+        dm.tables["fact_sales"]
+        .join(
+            dm.tables["dim_product"],
+            left_on="fact_sales.product_id",
+            right_on="dim_product.product_id",
+            how="inner",
+        )
+        .filter(pl.col("dim_product.category").is_in(["categoryA", "categoryC"]))
+        .join(product_rank, on="fact_sales.product_id", how="inner")
+        .group_by("fact_sales.product_id")
+        .agg(
+            pl.col("product_rank").min().alias("product_rank"),
+            pl.col("fact_sales.revenue").sum().alias("revenue"),
+        )
+        .sort("fact_sales.product_id", descending=[False])
+        .slice(offset=3, length=8)
+        .collect()
+    )
+
+    print(polars_result)
+
+    assert_frame_equal(datasubway_result, polars_result, check_column_order=False)
