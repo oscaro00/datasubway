@@ -21,16 +21,13 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## Longer term vision:
 
-- I believe this combinations of structured yet flexible calculations is a great use case for small, local AI models to take natural language and execute reliable calculations. Passing measure descriptions along with measures will support domain specific calculations and terminology and a small model should be able to create a json-like query context. This will hopefully avoid the problem where models are great a writing simple queries, but are inconsistent on harder queries with domain specific knowledge especially across multiple users.
+- I believe this combinations of structured yet flexible calculations is a great use case for small, local AI models to take natural language and execute reliable calculations. Passing measure descriptions along with measures will support domain specific calculations and terminology and a small model should be able to create a json-like query context. This will hopefully avoid the problem where models are great at writing simple queries, but are inconsistent on harder queries with domain specific knowledge especially across multiple users.
 
 
 
 ## TO DO
 
 - Do more validation in QueryContext __init__
-- Tests
-  - tests for data_model
-  - complex data model example
 - Remove libcst dependency?
   - Extracting the last group_by and agg is probably easy with the proxy system
   - Making sure measures end in .group_by().agg() is harder without libcst (not really though...)
