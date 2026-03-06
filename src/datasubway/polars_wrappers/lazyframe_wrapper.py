@@ -109,6 +109,10 @@ class LazyFrameWrapper:
                 LazyGroupByWrapper,
             )
 
+            if group_by is not None and isinstance(index_column, str):
+                if isinstance(group_by, list):
+                    group_by = [c for c in group_by if c != index_column] or None
+
             return LazyGroupByWrapper(
                 self.lf.group_by_dynamic(
                     index_column,

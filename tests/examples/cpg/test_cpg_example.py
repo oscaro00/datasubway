@@ -302,3 +302,69 @@ def test_share_of_total_measure():
     print(polars_result)
 
     assert_frame_equal(datasubway_result, polars_result, check_column_order=False)
+
+
+@measure(dm)
+def rolling_3_day_average_revenue(qc: QueryContext):
+    return (
+        dm.table("fact_sales")
+        .filter(allow(pattern="*", context=qc.filters))
+        .sort("fact_sales.date")
+        .group_by_dynamic(
+            "fact_sales.date",
+            every="1d",
+            period="3d",
+            group_by=allow(pattern="*", context=qc.groups),
+        )
+        .agg(pl.col("fact_sales.revenue").mean().alias("average_3_day_rolling_revenue"))
+    )
+
+
+def test_rolling_3_day_average_measure():
+    query = {
+        "measures": ["rolling_3_day_average_revenue"],
+        "filters": {
+            "AND": [
+                ("dim_product.category", "in", ["categoryA", "categoryC"]),
+                (
+                    "dim_synd_product.category",
+                    "!=",
+                    "categoryB",
+                ),  # this shouldn't affect the results
+            ]
+        },
+        "groups": ["fact_sales.date", "dim_product.category"],
+        # "havings": {"OR": [("revenue", ">=", 1000), ("units", "<", 1000)]},
+        "sorts": [("fact_sales.date", "asc"), ("dim_product.category", "desc")],
+        "limit": 10,
+        "offset": 0,
+    }
+
+    datasubway_explain = asyncio.run(dm.query(query, explain=True))
+    print(datasubway_explain)
+
+    datasubway_result = asyncio.run(dm.query(query))
+    print(datasubway_result)
+
+    polars_result = (
+        dm.tables["fact_sales"]
+        .join(
+            dm.tables["dim_product"],
+            left_on="fact_sales.product_id",
+            right_on="dim_product.product_id",
+            how="left",
+        )
+        .filter(pl.col("dim_product.category").is_in(["categoryA", "categoryC"]))
+        .sort("fact_sales.date")
+        .group_by_dynamic(
+            "fact_sales.date", every="1d", period="3d", group_by="dim_product.category"
+        )
+        .agg(pl.col("fact_sales.revenue").mean().alias("average_3_day_rolling_revenue"))
+        .sort("fact_sales.date", "dim_product.category", descending=[False, True])
+        .slice(offset=0, length=10)
+        .collect()
+    )
+
+    print(polars_result)
+
+    assert_frame_equal(datasubway_result, polars_result, check_column_order=False)

@@ -147,8 +147,8 @@ class LazyFrameProxy:
         cols = extract_col_names((index_column,))
         if group_by is not None:
             if isinstance(group_by, (list, tuple)):
-                cols.extend(extract_col_names(tuple(group_by)))
-            elif isinstance(group_by, str):
+                cols.extend(c for c in extract_col_names(tuple(group_by)) if c not in cols)
+            elif isinstance(group_by, str) and group_by not in cols:
                 cols.append(group_by)
         self.group_by_cols = cols
         self.ops.append(
