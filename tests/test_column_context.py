@@ -2,6 +2,7 @@ import pytest
 
 from datasubway import allow, exclude
 from datasubway.column_context import (
+    _AllowExcludeResult,
     parse_pattern,
     parse_patterns,
     parse_table_column,
@@ -146,3 +147,53 @@ def test_exclude_with_include():
 def test_exclude_exclude_tables():
     result = exclude("orders.*", CONTEXT, include_tables=False)
     assert set(result) == {"name", "email"}
+
+
+# ---------------------------------------------------------------------------
+# _AllowExcludeResult sentinel
+# ---------------------------------------------------------------------------
+
+
+def test_allow_returns_allow_exclude_result():
+    assert isinstance(allow("*", CONTEXT), _AllowExcludeResult)
+
+
+def test_exclude_returns_allow_exclude_result():
+    assert isinstance(exclude("*", CONTEXT), _AllowExcludeResult)
+
+
+def test_allow_result_ae_type():
+    assert allow("*", CONTEXT).ae_type == "allow"
+
+
+def test_exclude_result_ae_type():
+    assert exclude("*", CONTEXT).ae_type == "exclude"
+
+
+def test_allow_result_stores_original_pattern_string():
+    assert allow("*", CONTEXT).pattern == "*"
+
+
+def test_allow_result_stores_original_pattern_list():
+    assert allow(["orders.*"], CONTEXT).pattern == ["orders.*"]
+
+
+def test_allow_result_stores_original_include():
+    assert allow("*", CONTEXT, include="orders.amount").include == "orders.amount"
+
+
+def test_allow_result_include_default_is_empty_list():
+    assert allow("*", CONTEXT).include == []
+
+
+def test_allow_exclude_result_behaves_as_list():
+    result = allow("orders.*", CONTEXT)
+    assert len(result) == 2
+    assert "orders.amount" in result
+    assert "orders.quantity" in result
+    assert set(result) == {"orders.amount", "orders.quantity"}  # iterable
+
+
+def test_allow_empty_context_returns_sentinel():
+    result = allow("*", [])
+    assert isinstance(result, _AllowExcludeResult)

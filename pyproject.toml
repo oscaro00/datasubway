@@ -15,7 +15,6 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "libcst>=1.8.6",
     "polars>=1.36.1",
 ]
 

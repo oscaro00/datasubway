@@ -28,10 +28,7 @@ The purpose of this library is to define a data model using python focusing on t
 ## TO DO
 
 - Do more validation in QueryContext __init__
-- Remove libcst dependency?
-  - Extracting the last group_by and agg is probably easy with the proxy system
-  - Making sure measures end in .group_by().agg() is harder without libcst (not really though...)
-  - Also will want to get docstrings from measures at some point, which could be difficult (use built in __doc__())
+- Get docstrings from measures ause built in __doc__()
 - Parameter to only look at pre aggregations within a certain time frame
 - Graph db for modeling and tracking table paths?
   - https://duckdb.org/community_extensions/extensions/duckpgq (concern is not updated super frequently)
@@ -46,3 +43,6 @@ The purpose of this library is to define a data model using python focusing on t
 - Roll based access control?
   - Might make more sense for this to be a user implemented feature because it involves auth
 - Add optional AI dependency to get chat bot functionality working
+
+
+Run `uv sync --extra dev` to download the development environment

@@ -3,6 +3,8 @@ from typing import cast
 import polars as pl
 import pytest
 
+from datasubway import allow, exclude
+from datasubway.column_context import _AllowExcludeResult
 from datasubway.joins_meta import Join
 from datasubway.pre_agg_meta import PreAggregation
 from datasubway.polars_wrappers.proxy import (
@@ -663,3 +665,124 @@ def test_e2e_unknown_foreign_col_filter_partially_dropped():
     vals = sorted(r["orders.val"] for r in rows)
 
     assert vals == [2, 3]
+
+
+# ---------------------------------------------------------------------------
+# LazyFrameProxy.grouping_context — capture from group_by / group_by_dynamic / rolling
+# ---------------------------------------------------------------------------
+
+COLS = ["tbl.a", "tbl.b", "tbl.c"]
+
+
+def test_group_by_with_sentinel_sets_grouping_context():
+    lf = pl.LazyFrame({"a": [1], "b": [2]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    proxy.group_by(allow("*", COLS))
+
+    assert proxy.grouping_context is not None
+
+
+def test_group_by_with_sentinel_stores_correct_type():
+    lf = pl.LazyFrame({"a": [1], "b": [2]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    proxy.group_by(allow("*", COLS))
+
+    assert proxy.grouping_context["type"] == "allow"
+
+
+def test_group_by_without_sentinel_leaves_grouping_context_none():
+    lf = pl.LazyFrame({"a": [1], "b": [2]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    proxy.group_by("tbl.a")
+
+    assert proxy.grouping_context is None
+
+
+def test_group_by_dynamic_with_sentinel_sets_grouping_context():
+    lf = pl.LazyFrame({"date": ["2024-01-01"], "region": ["N"], "val": [1]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    sentinel = allow("tbl.*", COLS)
+    proxy.group_by_dynamic("tbl.date", every="1d", group_by=sentinel)
+
+    assert proxy.grouping_context is not None
+
+
+def test_group_by_dynamic_merges_index_column_into_include():
+    lf = pl.LazyFrame({"date": ["2024-01-01"], "region": ["N"], "val": [1]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    sentinel = allow("tbl.*", COLS)
+    proxy.group_by_dynamic("tbl.date", every="1d", group_by=sentinel)
+
+    assert "tbl.date" in proxy.grouping_context["include"]
+
+
+def test_rolling_with_sentinel_sets_grouping_context():
+    lf = pl.LazyFrame({"date": ["2024-01-01"], "region": ["N"], "val": [1]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    sentinel = allow("tbl.*", COLS)
+    proxy.rolling("tbl.date", period="1d", group_by=sentinel)
+
+    assert proxy.grouping_context is not None
+    assert "tbl.date" in proxy.grouping_context["include"]
+
+
+# ---------------------------------------------------------------------------
+# LazyFrameProxy.validate_measure_chain()
+# ---------------------------------------------------------------------------
+
+
+def test_validate_measure_chain_passes_valid_chain():
+    lf = pl.LazyFrame({"a": [1], "b": [2]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    proxy.group_by(allow("*", COLS)).agg(pl.col("tbl.b").sum())
+
+    proxy.validate_measure_chain()  # should not raise
+
+
+def test_validate_measure_chain_raises_no_ops():
+    lf = pl.LazyFrame({"a": [1]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+
+    with pytest.raises(ValueError, match="no recorded ops"):
+        proxy.validate_measure_chain()
+
+
+def test_validate_measure_chain_raises_last_op_not_agg():
+    lf = pl.LazyFrame({"a": [1], "b": [2]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    proxy.group_by(allow("*", COLS))
+    proxy.filter(pl.col("tbl.a") > 0)
+
+    with pytest.raises(ValueError, match="must end with .agg()"):
+        proxy.validate_measure_chain()
+
+
+def test_validate_measure_chain_raises_no_group_by_before_agg():
+    lf = pl.LazyFrame({"a": [1], "b": [2]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    # Record an agg op directly via __getattr__ (no preceding group_by)
+    proxy.agg(pl.col("tbl.b").sum())
+
+    with pytest.raises(ValueError):
+        proxy.validate_measure_chain()
+
+
+def test_validate_measure_chain_raises_no_allow_exclude():
+    lf = pl.LazyFrame({"a": [1], "b": [2]})
+    dm = _MockDM({"tbl": lf})
+    proxy = LazyFrameProxy("tbl", dm)
+    # Plain string group_by — no sentinel, so grouping_context stays None
+    proxy.group_by("tbl.a").agg(pl.col("tbl.b").sum())
+
+    with pytest.raises(ValueError, match="allow\\(\\) or exclude\\(\\)"):
+        proxy.validate_measure_chain()

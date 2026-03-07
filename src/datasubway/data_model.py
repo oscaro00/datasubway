@@ -10,7 +10,7 @@ import polars as pl
 
 from datasubway.column_context import parse_table_column, parse_table_columns
 from datasubway.joins_meta import Join, parse_joins
-from datasubway.libcst.measure_output_context import GroupingContext
+from datasubway.measure_meta import GroupingContext
 from datasubway.polars_wrappers.filter_expr import (
     build_filter_expr,
     extract_table_columns_from_filter_dict,

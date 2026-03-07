@@ -5,7 +5,7 @@ from datasubway import allow, exclude
 from datasubway.data_model import DataModel
 from datasubway.measure_decorator import measure
 
-# Module-level LazyFrame referenced by measure function bodies
+# Module-level LazyFrame used by the dm fixture
 lf = pl.LazyFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
 
 
@@ -22,8 +22,8 @@ def dm():
 def test_measure_stored_in_measures(dm):
     @measure(dm)
     def my_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     assert "my_measure" in dm.measures
@@ -31,8 +31,8 @@ def test_measure_stored_in_measures(dm):
 
 def test_decorator_returns_original_function(dm):
     def my_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     original = my_measure
@@ -43,8 +43,8 @@ def test_decorator_returns_original_function(dm):
 def test_measure_grouping_context_populated(dm):
     @measure(dm)
     def my_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     assert "my_measure" in dm.measure_grouping_contexts
@@ -53,8 +53,8 @@ def test_measure_grouping_context_populated(dm):
 def test_measure_output_cols_populated(dm):
     @measure(dm)
     def my_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     assert "my_measure" in dm.measure_output_cols
@@ -68,8 +68,8 @@ def test_measure_output_cols_populated(dm):
 def test_grouping_context_allow_type(dm):
     @measure(dm)
     def allow_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     assert dm.measure_grouping_contexts["allow_measure"]["type"] == "allow"
@@ -78,8 +78,8 @@ def test_grouping_context_allow_type(dm):
 def test_grouping_context_exclude_type(dm):
     @measure(dm)
     def exclude_measure(qc):
-        return lf.group_by(exclude(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(exclude(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     assert dm.measure_grouping_contexts["exclude_measure"]["type"] == "exclude"
@@ -88,11 +88,11 @@ def test_grouping_context_exclude_type(dm):
 def test_grouping_context_pattern_extracted(dm):
     @measure(dm)
     def pattern_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
-    assert '"*"' in dm.measure_grouping_contexts["pattern_measure"]["pattern"]
+    assert "*" in dm.measure_grouping_contexts["pattern_measure"]["pattern"]
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +103,8 @@ def test_grouping_context_pattern_extracted(dm):
 def test_output_cols_with_alias(dm):
     @measure(dm)
     def alias_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     assert dm.measure_output_cols["alias_measure"] == ["sum_a"]
@@ -113,22 +113,22 @@ def test_output_cols_with_alias(dm):
 def test_output_cols_without_alias(dm):
     @measure(dm)
     def no_alias_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("b").first()
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.b").first()
         )
 
-    assert dm.measure_output_cols["no_alias_measure"] == ["b"]
+    assert dm.measure_output_cols["no_alias_measure"] == ["test.b"]
 
 
 def test_output_cols_multiple_columns(dm):
     @measure(dm)
     def multi_col_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a"),
-            pl.col("b").first(),
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a"),
+            pl.col("test.b").first(),
         )
 
-    assert dm.measure_output_cols["multi_col_measure"] == ["sum_a", "b"]
+    assert dm.measure_output_cols["multi_col_measure"] == ["sum_a", "test.b"]
 
 
 # ---------------------------------------------------------------------------
@@ -140,15 +140,15 @@ def test_duplicate_measure_name_raises(dm):
     """This is a bit messy, but it avoids linting errors for functions with duplicate names"""
 
     def dup_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     measure(dm)(dup_measure)
 
     def dup_measure_copy(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     dup_measure_copy.__name__ = "dup_measure"
@@ -159,7 +159,7 @@ def test_duplicate_measure_name_raises(dm):
 
 def test_invalid_measure_no_agg_raises(dm):
     def invalid_no_agg(qc):
-        return lf.select("a", "b")
+        return dm.table("test").select("test.a", "test.b")
 
     with pytest.raises(ValueError):
         measure(dm)(invalid_no_agg)
@@ -167,7 +167,7 @@ def test_invalid_measure_no_agg_raises(dm):
 
 def test_invalid_measure_no_allow_exclude_raises(dm):
     def invalid_no_allow(qc):
-        return lf.group_by("a").agg(pl.col("b").sum().alias("sum_b"))
+        return dm.table("test").group_by("test.a").agg(pl.col("test.b").sum().alias("sum_b"))
 
     with pytest.raises(ValueError):
         measure(dm)(invalid_no_allow)
@@ -181,14 +181,14 @@ def test_invalid_measure_no_allow_exclude_raises(dm):
 def test_multiple_measures_on_same_data_model(dm):
     @measure(dm)
     def first_measure(qc):
-        return lf.group_by(allow(pattern="*", context=qc["groups"])).agg(
-            pl.col("a").sum().alias("sum_a")
+        return dm.table("test").group_by(allow(pattern="*", context=qc.groups)).agg(
+            pl.col("test.a").sum().alias("sum_a")
         )
 
     @measure(dm)
     def second_measure(qc):
-        return lf.group_by(exclude(pattern="*", context=qc["groups"])).agg(
-            pl.col("b").first()
+        return dm.table("test").group_by(exclude(pattern="*", context=qc.groups)).agg(
+            pl.col("test.b").first()
         )
 
     for name in ("first_measure", "second_measure"):
