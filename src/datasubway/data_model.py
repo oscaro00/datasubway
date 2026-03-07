@@ -87,6 +87,7 @@ class DataModel:
         self.measures: dict[str, Any] = {}
         self.measure_grouping_contexts: dict[str, GroupingContext] = {}
         self.measure_output_cols: dict[str, list[str]] = {}
+        self.measure_docstrings: dict[str, str] = {}
 
         self.pre_agg_objects: list[PreAggregation] = parse_pre_aggregations(
             pre_aggregations if pre_aggregations is not None else {},

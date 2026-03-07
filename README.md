@@ -28,7 +28,6 @@ The purpose of this library is to define a data model using python focusing on t
 ## TO DO
 
 - Do more validation in QueryContext __init__
-- Get docstrings from measures ause built in __doc__()
 - Parameter to only look at pre aggregations within a certain time frame
 - Graph db for modeling and tracking table paths?
   - https://duckdb.org/community_extensions/extensions/duckpgq (concern is not updated super frequently)

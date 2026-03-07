@@ -31,12 +31,14 @@ def measure(data_model: DataModel) -> Callable:
 
         proxy.validate_measure_chain()
 
+        assert proxy.grouping_context is not None
         data_model.measure_grouping_contexts[func_name] = proxy.grouping_context
 
         output_cols = [expr.meta.output_name() for expr in proxy.agg_exprs]
         data_model.measure_output_cols[func_name] = output_cols
 
         data_model.measures[func_name] = func
+        data_model.measure_docstrings[func_name] = func.__doc__ or func_name.replace("_", " ")
 
         return func
 
