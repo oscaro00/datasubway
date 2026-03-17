@@ -1,0 +1,135 @@
+"""MeasureDataFrame: wrapper around DataFusion Python DataFrame that tracks operations for validation."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import datafusion
+from datafusion import col, lit
+from datafusion import functions as F
+
+from datasubway.column_context import _AllowExcludeResult
+
+
+class MeasureDataFrame:
+    """Wraps a DataFusion Python DataFrame and tracks the last operation for measure validation.
+
+    The @measure decorator probes each measure function at registration time
+    to validate that it ends with .aggregate() and to extract grouping context.
+    """
+
+    def __init__(self, inner: datafusion.DataFrame, table_name: str) -> None:
+        self._inner = inner
+        self._table_name = table_name
+        self._last_op = "table"
+        self._grouping_context: dict[str, Any] | None = None
+
+    def filter(self, *args: Any) -> MeasureDataFrame:
+        self._inner = self._inner.filter(*args)
+        self._last_op = "filter"
+        return self
+
+    def filter_dict(self, filter_tree: dict) -> MeasureDataFrame:
+        expr = _build_filter_expr(filter_tree)
+        return self.filter(expr)
+
+    def select(self, *args: Any) -> MeasureDataFrame:
+        self._inner = self._inner.select(*args)
+        self._last_op = "select"
+        return self
+
+    def aggregate(
+        self,
+        group_by: list | _AllowExcludeResult,
+        aggs: list,
+    ) -> MeasureDataFrame:
+        if isinstance(group_by, _AllowExcludeResult):
+            self._grouping_context = {
+                "type": group_by.ae_type,
+                "pattern": group_by.pattern,
+                "include": group_by.include,
+            }
+        # Convert string group-by items to col() expressions
+        group_exprs = [col(g) if isinstance(g, str) else g for g in group_by]
+        self._inner = self._inner.aggregate(group_exprs, aggs)
+        self._last_op = "aggregate"
+        return self
+
+    def join(
+        self,
+        right: MeasureDataFrame,
+        on: list[str] | None = None,
+        how: str = "inner",
+        **kwargs: Any,
+    ) -> MeasureDataFrame:
+        right_df = right._inner if isinstance(right, MeasureDataFrame) else right
+        self._inner = self._inner.join(right_df, on=on, how=how, **kwargs)
+        self._last_op = "join"
+        return self
+
+    def sort(self, *args: Any) -> MeasureDataFrame:
+        self._inner = self._inner.sort(*args)
+        self._last_op = "sort"
+        return self
+
+    def limit(self, count: int, offset: int = 0) -> MeasureDataFrame:
+        self._inner = self._inner.limit(count, offset)
+        self._last_op = "limit"
+        return self
+
+    def with_column(self, name: str, expr: Any) -> MeasureDataFrame:
+        self._inner = self._inner.with_column(name, expr)
+        self._last_op = "with_column"
+        return self
+
+    def collect(self) -> Any:
+        return self._inner.collect()
+
+    def to_arrow_table(self) -> Any:
+        return self._inner.to_arrow_table()
+
+    def columns(self) -> list[str]:
+        return [f.name for f in self._inner.schema()]
+
+    def schema(self) -> Any:
+        return self._inner.schema()
+
+    def logical_plan(self) -> Any:
+        return self._inner.logical_plan()
+
+
+def _build_filter_expr(filter_tree: dict) -> Any:
+    """Convert {"AND": [["col", "op", val], ...]} to DataFusion Expr."""
+    for key, conditions in filter_tree.items():
+        exprs = []
+        for cond in conditions:
+            if isinstance(cond, dict):
+                exprs.append(_build_filter_expr(cond))
+            else:
+                col_name, op, val = cond[0], cond[1], cond[2]
+                c = col(col_name)
+                if op == "in":
+                    exprs.append(F.in_list(c, [lit(v) for v in val], negated=False))
+                elif op == "not in":
+                    exprs.append(F.in_list(c, [lit(v) for v in val], negated=True))
+                else:
+                    v = lit(val)
+                    if op == "=":
+                        exprs.append(c == v)
+                    elif op == "!=":
+                        exprs.append(c != v)
+                    elif op == ">":
+                        exprs.append(c > v)
+                    elif op == ">=":
+                        exprs.append(c >= v)
+                    elif op == "<":
+                        exprs.append(c < v)
+                    elif op == "<=":
+                        exprs.append(c <= v)
+                    else:
+                        raise ValueError(f"Unknown filter operator: '{op}'")
+
+        combined = exprs[0]
+        for e in exprs[1:]:
+            combined = combined.__and__(e) if key == "AND" else combined.__or__(e)
+        return combined

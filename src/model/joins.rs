@@ -1,0 +1,330 @@
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// A single join specification between two tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Join {
+    pub left: String,
+    pub right: String,
+    pub left_on: Vec<String>,
+    pub right_on: Vec<String>,
+    pub how: String,
+    pub direction: String,
+}
+
+/// Adjacency-list based join graph.
+/// Computes join paths between tables, validates no 3+ cycles.
+#[derive(Debug, Clone)]
+pub struct JoinGraph {
+    /// adjacency[a][b] = Join specification for a→b edge
+    adjacency: HashMap<String, HashMap<String, Join>>,
+    /// All table names in the graph
+    tables: HashSet<String>,
+}
+
+impl JoinGraph {
+    pub fn new(joins: &[Join]) -> Result<Self, String> {
+        let mut adjacency: HashMap<String, HashMap<String, Join>> = HashMap::new();
+        let mut tables = HashSet::new();
+
+        for join in joins {
+            tables.insert(join.left.clone());
+            tables.insert(join.right.clone());
+
+            // Always add left→right edge
+            adjacency
+                .entry(join.left.clone())
+                .or_default()
+                .insert(join.right.clone(), join.clone());
+
+            if join.direction == "both" {
+                // Add reverse edge with swapped on-columns
+                let reverse = Join {
+                    left: join.right.clone(),
+                    right: join.left.clone(),
+                    left_on: join.right_on.clone(),
+                    right_on: join.left_on.clone(),
+                    how: join.how.clone(),
+                    direction: join.direction.clone(),
+                };
+                adjacency
+                    .entry(join.right.clone())
+                    .or_default()
+                    .insert(join.left.clone(), reverse);
+            }
+        }
+
+        let graph = JoinGraph { adjacency, tables };
+        graph.validate_no_long_cycles()?;
+        Ok(graph)
+    }
+
+    /// Find the join path from `start` to `end` using BFS.
+    /// Returns the ordered list of Joins to traverse, or None if unreachable.
+    pub fn find_path(&self, start: &str, end: &str) -> Option<Vec<Join>> {
+        if start == end {
+            return Some(vec![]);
+        }
+
+        let mut visited = HashSet::new();
+        // Queue stores (current_node, path_so_far)
+        let mut queue: VecDeque<(String, Vec<Join>)> = VecDeque::new();
+        visited.insert(start.to_string());
+        queue.push_back((start.to_string(), vec![]));
+
+        while let Some((current, path)) = queue.pop_front() {
+            if let Some(neighbors) = self.adjacency.get(&current) {
+                for (neighbor, join) in neighbors {
+                    if neighbor == end {
+                        let mut result = path.clone();
+                        result.push(join.clone());
+                        return Some(result);
+                    }
+                    if !visited.contains(neighbor) {
+                        visited.insert(neighbor.clone());
+                        let mut new_path = path.clone();
+                        new_path.push(join.clone());
+                        queue.push_back((neighbor.clone(), new_path));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Build full lookup: lookup[start][end] = vec of Joins to get from start to end.
+    pub fn build_lookup(&self) -> HashMap<String, HashMap<String, Vec<Join>>> {
+        let mut lookup = HashMap::new();
+        for start in &self.tables {
+            let mut inner = HashMap::new();
+            for end in &self.tables {
+                if start != end {
+                    if let Some(path) = self.find_path(start, end) {
+                        inner.insert(end.clone(), path);
+                    }
+                }
+            }
+            lookup.insert(start.clone(), inner);
+        }
+        lookup
+    }
+
+    /// Validate that no cycles of length >= 3 exist.
+    /// 2-node cycles from bidirectional edges are allowed.
+    fn validate_no_long_cycles(&self) -> Result<(), String> {
+        for start in &self.tables {
+            let mut visited = HashMap::new();
+            visited.insert(start.clone(), 0usize);
+            self.dfs_cycle_check(start, &mut visited, 1)?;
+        }
+        Ok(())
+    }
+
+    fn dfs_cycle_check(
+        &self,
+        current: &str,
+        visited: &mut HashMap<String, usize>,
+        depth: usize,
+    ) -> Result<(), String> {
+        if let Some(neighbors) = self.adjacency.get(current) {
+            for neighbor in neighbors.keys() {
+                if let Some(&visit_depth) = visited.get(neighbor) {
+                    // Cycle detected — only allowed if length == 2 (bidirectional edge)
+                    let cycle_len = depth - visit_depth;
+                    if cycle_len >= 3 {
+                        return Err(format!(
+                            "Cycle of length {} detected involving table '{}'",
+                            cycle_len, neighbor
+                        ));
+                    }
+                } else {
+                    visited.insert(neighbor.clone(), depth);
+                    self.dfs_cycle_check(neighbor, visited, depth + 1)?;
+                    visited.remove(neighbor);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn tables(&self) -> &HashSet<String> {
+        &self.tables
+    }
+}
+
+// ── PyO3 wrapper ──
+
+#[pyclass(name = "JoinGraph")]
+#[derive(Debug, Clone)]
+pub struct PyJoinGraph {
+    pub inner: JoinGraph,
+}
+
+#[pymethods]
+impl PyJoinGraph {
+    /// Create a JoinGraph from a list of join specification dicts.
+    #[new]
+    fn new(joins: Vec<HashMap<String, Py<PyAny>>>, py: Python<'_>) -> PyResult<Self> {
+        let mut parsed_joins = Vec::new();
+        for j in joins {
+            let join = parse_join_dict(&j, py)?;
+            parsed_joins.push(join);
+        }
+        let graph = JoinGraph::new(&parsed_joins).map_err(|e| PyValueError::new_err(e))?;
+        Ok(PyJoinGraph { inner: graph })
+    }
+
+    /// Find the join path between two tables. Returns list of dicts or None.
+    fn find_path(&self, start: &str, end: &str) -> Option<Vec<HashMap<String, String>>> {
+        self.inner.find_path(start, end).map(|path| {
+            path.into_iter()
+                .map(|j| {
+                    let mut m = HashMap::new();
+                    m.insert("left".into(), j.left);
+                    m.insert("right".into(), j.right);
+                    m.insert("left_on".into(), j.left_on.join(","));
+                    m.insert("right_on".into(), j.right_on.join(","));
+                    m.insert("how".into(), j.how);
+                    m
+                })
+                .collect()
+        })
+    }
+
+    /// Get all table names in the join graph.
+    fn tables(&self) -> Vec<String> {
+        self.inner.tables().iter().cloned().collect()
+    }
+}
+
+fn parse_join_dict(d: &HashMap<String, Py<PyAny>>, py: Python<'_>) -> PyResult<Join> {
+    let get_str = |key: &str| -> PyResult<String> {
+        d.get(key)
+            .ok_or_else(|| PyValueError::new_err(format!("Missing key: {}", key)))?
+            .extract::<String>(py)
+    };
+
+    let get_str_or_list = |key: &str| -> PyResult<Vec<String>> {
+        let obj = d
+            .get(key)
+            .ok_or_else(|| PyValueError::new_err(format!("Missing key: {}", key)))?;
+        if let Ok(s) = obj.extract::<String>(py) {
+            Ok(vec![s])
+        } else {
+            obj.extract::<Vec<String>>(py)
+        }
+    };
+
+    Ok(Join {
+        left: get_str("left")?,
+        right: get_str("right")?,
+        left_on: get_str_or_list("left_on")?,
+        right_on: get_str_or_list("right_on")?,
+        how: get_str("how")?,
+        direction: get_str("direction")?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_joins() -> Vec<Join> {
+        vec![
+            Join {
+                left: "orders".into(),
+                right: "customers".into(),
+                left_on: vec!["customer_id".into()],
+                right_on: vec!["id".into()],
+                how: "left".into(),
+                direction: "right2left".into(),
+            },
+            Join {
+                left: "orders".into(),
+                right: "products".into(),
+                left_on: vec!["product_id".into()],
+                right_on: vec!["id".into()],
+                how: "left".into(),
+                direction: "right2left".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_build_graph() {
+        let graph = JoinGraph::new(&sample_joins()).unwrap();
+        assert_eq!(graph.tables().len(), 3);
+    }
+
+    #[test]
+    fn test_find_direct_path() {
+        let graph = JoinGraph::new(&sample_joins()).unwrap();
+        let path = graph.find_path("orders", "customers").unwrap();
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].right, "customers");
+    }
+
+    #[test]
+    fn test_no_reverse_path_unidirectional() {
+        let graph = JoinGraph::new(&sample_joins()).unwrap();
+        // right2left only: customers cannot reach orders
+        assert!(graph.find_path("customers", "orders").is_none());
+    }
+
+    #[test]
+    fn test_bidirectional() {
+        let joins = vec![Join {
+            left: "a".into(),
+            right: "b".into(),
+            left_on: vec!["id".into()],
+            right_on: vec!["a_id".into()],
+            how: "inner".into(),
+            direction: "both".into(),
+        }];
+        let graph = JoinGraph::new(&joins).unwrap();
+        assert!(graph.find_path("a", "b").is_some());
+        assert!(graph.find_path("b", "a").is_some());
+    }
+
+    #[test]
+    fn test_cycle_detection() {
+        let joins = vec![
+            Join {
+                left: "a".into(),
+                right: "b".into(),
+                left_on: vec!["id".into()],
+                right_on: vec!["id".into()],
+                how: "inner".into(),
+                direction: "both".into(),
+            },
+            Join {
+                left: "b".into(),
+                right: "c".into(),
+                left_on: vec!["id".into()],
+                right_on: vec!["id".into()],
+                how: "inner".into(),
+                direction: "both".into(),
+            },
+            Join {
+                left: "c".into(),
+                right: "a".into(),
+                left_on: vec!["id".into()],
+                right_on: vec!["id".into()],
+                how: "inner".into(),
+                direction: "both".into(),
+            },
+        ];
+        let result = JoinGraph::new(&joins);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_lookup() {
+        let graph = JoinGraph::new(&sample_joins()).unwrap();
+        let lookup = graph.build_lookup();
+        assert!(lookup["orders"].contains_key("customers"));
+        assert!(lookup["orders"].contains_key("products"));
+    }
+}

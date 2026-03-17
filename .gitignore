@@ -9,4 +9,17 @@ wheels/
 # Virtual environments
 .venv
 
+# Rust/Cargo
+target/
+Cargo.lock
+
+# Compiled extensions
+*.so
+*.dylib
+*.pyd
+
+# OS
 *.DS_Store
+
+# Pre-aggregation output
+_pre_aggregations/
