@@ -311,9 +311,11 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mem_table =
-                datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![batch.clone()]])
-                    .unwrap();
+            let mem_table = datafusion::datasource::MemTable::try_new(
+                schema.clone(),
+                vec![vec![batch.clone()]],
+            )
+            .unwrap();
             ctx.register_table("orders", Arc::new(mem_table)).unwrap();
 
             // Register a pre-agg table with component columns
@@ -329,11 +331,9 @@ mod tests {
                 ],
             )
             .unwrap();
-            let preagg_table = datafusion::datasource::MemTable::try_new(
-                preagg_schema,
-                vec![vec![preagg_batch]],
-            )
-            .unwrap();
+            let preagg_table =
+                datafusion::datasource::MemTable::try_new(preagg_schema, vec![vec![preagg_batch]])
+                    .unwrap();
             ctx.register_table("regional_revenue", Arc::new(preagg_table))
                 .unwrap();
         });
@@ -360,10 +360,7 @@ mod tests {
         let plan = rt.block_on(async {
             let df = ctx.table("orders").await.unwrap();
             let agg = df
-                .aggregate(
-                    vec![col("region")],
-                    vec![sum(col("amount")).alias("total")],
-                )
+                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
                 .unwrap();
             agg.logical_plan().clone()
         });
@@ -392,10 +389,7 @@ mod tests {
         let plan = rt.block_on(async {
             let df = ctx.table("orders").await.unwrap();
             let agg = df
-                .aggregate(
-                    vec![col("region")],
-                    vec![sum(col("amount")).alias("total")],
-                )
+                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
                 .unwrap();
             agg.logical_plan().clone()
         });
@@ -415,12 +409,7 @@ mod tests {
         );
 
         let pre_aggs = [pre_agg];
-        let best = find_best_pre_agg(
-            &pre_aggs,
-            &group_by,
-            &agg_components,
-            &filter_cols,
-        );
+        let best = find_best_pre_agg(&pre_aggs, &group_by, &agg_components, &filter_cols);
         assert!(best.is_some(), "Should find a matching pre-agg");
         assert_eq!(best.unwrap().name, "regional_revenue");
     }
@@ -434,10 +423,7 @@ mod tests {
             let df = ctx.table("orders").await.unwrap();
             let filtered = df.filter(col("region").eq(lit("US"))).unwrap();
             let agg = filtered
-                .aggregate(
-                    vec![col("region")],
-                    vec![sum(col("amount")).alias("total")],
-                )
+                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
                 .unwrap();
             agg.logical_plan().clone()
         });
@@ -463,10 +449,7 @@ mod tests {
         let plan = rt.block_on(async {
             let df = ctx.table("orders").await.unwrap();
             let agg = df
-                .aggregate(
-                    vec![col("region")],
-                    vec![sum(col("amount")).alias("total")],
-                )
+                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
                 .unwrap();
             agg.logical_plan().clone()
         });
@@ -498,10 +481,7 @@ mod tests {
         let plan = rt.block_on(async {
             let df = ctx.table("orders").await.unwrap();
             let agg = df
-                .aggregate(
-                    vec![col("region")],
-                    vec![sum(col("amount")).alias("total")],
-                )
+                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
                 .unwrap();
             agg.logical_plan().clone()
         });
@@ -523,10 +503,7 @@ mod tests {
             // Filter on "amount" which is NOT in the pre-agg's group_by
             let filtered = df.filter(col("amount").gt(lit(100))).unwrap();
             let agg = filtered
-                .aggregate(
-                    vec![col("region")],
-                    vec![sum(col("amount")).alias("total")],
-                )
+                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
                 .unwrap();
             agg.logical_plan().clone()
         });

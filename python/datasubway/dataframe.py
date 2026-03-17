@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, Sequence
 
 import datafusion
 from datafusion import col, lit
@@ -58,12 +58,25 @@ class MeasureDataFrame:
     def join(
         self,
         right: MeasureDataFrame,
-        on: list[str] | None = None,
-        how: str = "inner",
-        **kwargs: Any,
+        on: str | Sequence[str] | None = None,
+        how: Literal["inner", "left", "right", "full", "semi", "anti"] = "inner",
+        *,
+        left_on: str | Sequence[str] | None = None,
+        right_on: str | Sequence[str] | None = None,
+        coalesce_duplicate_keys: bool = True,
     ) -> MeasureDataFrame:
         right_df = right._inner if isinstance(right, MeasureDataFrame) else right
-        self._inner = self._inner.join(right_df, on=on, how=how, **kwargs)
+        kwargs: dict[str, Any] = {
+            "how": how,
+            "coalesce_duplicate_keys": coalesce_duplicate_keys,
+        }
+        if on is not None:
+            kwargs["on"] = on
+        if left_on is not None:
+            kwargs["left_on"] = left_on
+        if right_on is not None:
+            kwargs["right_on"] = right_on
+        self._inner = self._inner.join(right_df, **kwargs)
         self._last_op = "join"
         return self
 
