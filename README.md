@@ -33,7 +33,6 @@ The purpose of this library is to define a data model using python focusing on t
   - https://duckdb.org/community_extensions/extensions/duckpgq (concern is not updated super frequently)
 
 
-- Add a license file
 - Logging
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
