@@ -209,3 +209,72 @@ class TestPreAggQuery:
     def test_query_no_groups(self):
         result = run(self.dm.query({"measures": ["revenue"]}))
         assert result.column("revenue").to_pylist() == [1050]
+
+
+CUSTOMERS_BATCH = pa.RecordBatch.from_pydict(
+    {
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"],
+    }
+)
+
+CUSTOMER_ORDERS_BATCH = pa.RecordBatch.from_pydict(
+    {
+        "customer_id": [1, 1, 2, 3, 2],
+        "amount": [100, 200, 150, 250, 300],
+    }
+)
+
+
+class TestMultiTablePreAgg:
+    """Test that pre-aggregations can span multiple tables via auto-join."""
+
+    def setup_method(self):
+        import tempfile
+
+        self.tmp_dir = Path(tempfile.mkdtemp())
+        self.dm = DataModel(
+            tables={
+                "orders": CUSTOMER_ORDERS_BATCH,
+                "customers": CUSTOMERS_BATCH,
+            },
+            joins=[
+                {
+                    "left": "orders",
+                    "right": "customers",
+                    "left_on": "customer_id",
+                    "right_on": "id",
+                    "how": "inner",
+                    "direction": "right2left",
+                }
+            ],
+            pre_aggregations={
+                "revenue_by_customer": {
+                    "group_by": ["customers.name"],
+                    "aggregations": {
+                        "orders.amount": ["sum"],
+                    },
+                },
+            },
+            pre_agg_directory=self.tmp_dir,
+        )
+
+    def test_multi_table_pre_agg_builds(self):
+        results = self.dm.write_pre_aggs(["revenue_by_customer"])
+        assert len(results) == 1
+        assert results[0].row_count == 3  # Alice, Bob, Charlie
+
+    def test_multi_table_pre_agg_has_correct_data(self):
+        self.dm.write_pre_aggs(["revenue_by_customer"])
+        pa_obj = self.dm.pre_agg_objects[0]
+        table = pq.read_table(pa_obj.file_path)
+        rows = table.to_pydict()
+        # Find the amount-sum column (may be qualified or not)
+        sum_col = None
+        for c in table.column_names:
+            if "sum" in c:
+                sum_col = c
+                break
+        assert sum_col is not None
+        data = sorted(zip(rows["name"], rows[sum_col]))
+        assert data == [("Alice", 300), ("Bob", 450), ("Charlie", 250)]

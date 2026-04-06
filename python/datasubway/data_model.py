@@ -139,7 +139,7 @@ class DataModel:
 
     def table(self, name: str) -> MeasureDataFrame:
         """Get a MeasureDataFrame for a registered table."""
-        return MeasureDataFrame(self.py_ctx.table(name), name)
+        return MeasureDataFrame(self.py_ctx.table(name), name, data_model=self)
 
     def all_columns(self) -> list[str]:
         """Return all qualified column names across all tables."""
@@ -305,8 +305,7 @@ class DataModel:
     def write_pre_aggs(self, names: list[str]) -> list[PreAggregation]:
         """Compute and write named pre-aggregations to parquet.
 
-        Builds the aggregate from raw tables using SQL, writes parquet,
-        and updates metadata.
+        Uses the DataFrame API with auto-join to support multi-table pre-aggregations.
         """
         self.pre_agg_directory.mkdir(parents=True, exist_ok=True)
         metadata = self._load_pre_agg_metadata()
@@ -321,14 +320,12 @@ class DataModel:
             if pa_obj is None:
                 raise KeyError(f"Unknown pre-aggregation: '{name}'")
 
-            # Build SQL to compute the pre-aggregation
-            sql = self._build_pre_agg_sql(pa_obj)
-            batches = self.engine.sql(sql)
+            # Build DataFrame with auto-join support
+            mdf = self._build_pre_agg_dataframe(pa_obj)
+            result_table = mdf.to_arrow_table()
 
-            if not batches:
+            if result_table.num_rows == 0:
                 raise RuntimeError(f"Pre-agg '{name}' produced no results")
-
-            result_table = pa.Table.from_batches(batches)
 
             # Write to parquet
             from datetime import datetime, timezone
@@ -356,37 +353,58 @@ class DataModel:
         self._save_pre_agg_metadata(metadata)
         return results
 
-    def _build_pre_agg_sql(self, pa_obj: PreAggregation) -> str:
-        """Build SQL to compute a pre-aggregation from raw tables."""
-        group_cols = ", ".join(pa_obj.group_by)
+    def _build_pre_agg_dataframe(self, pa_obj: PreAggregation) -> MeasureDataFrame:
+        """Build a MeasureDataFrame that computes the pre-aggregation.
 
-        # Build aggregation expressions
+        Uses auto-join to handle multi-table group-by and aggregation columns.
+        """
+        from datafusion import col
+        from datafusion import functions as F
+
+        # Collect all referenced tables from group_by and aggregation columns
+        all_tables: list[str] = []
+        for g in pa_obj.group_by:
+            if "." in g:
+                all_tables.append(g.split(".")[0])
+        for col_name in pa_obj.aggregations:
+            if "." in col_name:
+                all_tables.append(col_name.split(".")[0])
+
+        # Pick the base table that can reach the most other tables via join graph
+        # Default to first aggregation table (fact table) since it typically has
+        # outgoing join paths to dimension tables
+        unique_tables = list(dict.fromkeys(all_tables))
+        base_table = unique_tables[0] if unique_tables else pa_obj.group_by[0]
+        if self.join_graph and len(unique_tables) > 1:
+            # Find the table that can reach all others
+            for candidate in unique_tables:
+                if all(
+                    candidate == t
+                    or self.join_graph.find_path(candidate, t) is not None
+                    for t in unique_tables
+                ):
+                    base_table = candidate
+                    break
+
+        group_exprs = [col(g) for g in pa_obj.group_by]
+
         agg_exprs = []
-        for col, components in pa_obj.aggregations.items():
+        for col_name, components in pa_obj.aggregations.items():
             for comp in components:
+                c = col(col_name)
+                alias = f"{col_name}-{comp}"
                 if comp == "sum":
-                    agg_exprs.append(f'SUM({col}) as "{col}-sum"')
+                    agg_exprs.append(F.sum(c).alias(alias))
                 elif comp == "count":
-                    agg_exprs.append(f'COUNT({col}) as "{col}-count"')
+                    agg_exprs.append(F.count(c).alias(alias))
                 elif comp == "min":
-                    agg_exprs.append(f'MIN({col}) as "{col}-min"')
+                    agg_exprs.append(F.min(c).alias(alias))
                 elif comp == "max":
-                    agg_exprs.append(f'MAX({col}) as "{col}-max"')
+                    agg_exprs.append(F.max(c).alias(alias))
                 elif comp == "sumsq":
-                    agg_exprs.append(f'SUM({col} * {col}) as "{col}-sumsq"')
+                    agg_exprs.append(F.sum(c * c).alias(alias))
 
-        select_parts = [group_cols] + agg_exprs
-        select_clause = ", ".join(select_parts)
-
-        # Determine source table(s)
-        # Use the first group-by column's table as the base
-        base_table = (
-            pa_obj.group_by[0].split(".")[0]
-            if "." in pa_obj.group_by[0]
-            else pa_obj.group_by[0]
-        )
-
-        return f"SELECT {select_clause} FROM {base_table} GROUP BY {group_cols}"
+        return self.table(base_table).aggregate(group_by=group_exprs, aggs=agg_exprs)
 
     def _apply_sorts(self, table: pa.Table, sorts: list[tuple[str, str]]) -> pa.Table:
         """Apply sorting to the result table."""

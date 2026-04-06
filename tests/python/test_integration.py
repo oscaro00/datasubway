@@ -18,6 +18,28 @@ ORDERS_BATCH = pa.RecordBatch.from_pydict(
     }
 )
 
+PLAYERS_BATCH = pa.RecordBatch.from_pydict(
+    {
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"],
+        "team_id": [10, 10, 20],
+    }
+)
+
+PLAYER_STATS_BATCH = pa.RecordBatch.from_pydict(
+    {
+        "player_id": [1, 2, 3, 1, 2],
+        "avg_speed": [10.0, 12.0, 8.0, 11.0, 13.0],
+    }
+)
+
+TEAMS_BATCH = pa.RecordBatch.from_pydict(
+    {
+        "id": [10, 20],
+        "team_name": ["Eagles", "Hawks"],
+    }
+)
+
 
 def run(coro):
     """Run an async function synchronously."""
@@ -259,3 +281,119 @@ class TestLimitOffset:
             )
         )
         assert result.num_rows == 1
+
+
+# ── Auto-join tests ──
+
+
+def _make_auto_join_dm():
+    """Create a DataModel with players, player_stats, teams and joins."""
+    return DataModel(
+        tables={
+            "player_stats": PLAYER_STATS_BATCH,
+            "players": PLAYERS_BATCH,
+            "teams": TEAMS_BATCH,
+        },
+        joins=[
+            {
+                "left": "player_stats",
+                "right": "players",
+                "left_on": "player_id",
+                "right_on": "id",
+                "how": "inner",
+                "direction": "right2left",
+            },
+            {
+                "left": "players",
+                "right": "teams",
+                "left_on": "team_id",
+                "right_on": "id",
+                "how": "inner",
+                "direction": "right2left",
+            },
+        ],
+    )
+
+
+class TestAutoJoinGroupBy:
+    def setup_method(self):
+        self.dm = _make_auto_join_dm()
+
+        @measure(self.dm)
+        def avg_speed(qc):
+            return self.dm.table("player_stats").aggregate(
+                allow("*", qc.groups),
+                [F.avg(col("avg_speed")).alias("avg_speed")],
+            )
+
+    def test_group_by_foreign_table(self):
+        result = run(
+            self.dm.query(
+                {"measures": ["avg_speed"], "groups": ["players.name"]}
+            )
+        )
+        assert result.num_rows == 3
+        rows = result.to_pydict()
+        data = sorted(zip(rows["name"], rows["avg_speed"]))
+        assert data[0][0] == "Alice"
+        assert data[1][0] == "Bob"
+        assert data[2][0] == "Charlie"
+
+    def test_no_groups_still_works(self):
+        result = run(self.dm.query({"measures": ["avg_speed"]}))
+        assert result.num_rows == 1
+
+
+class TestAutoJoinFilter:
+    def setup_method(self):
+        self.dm = _make_auto_join_dm()
+
+        @measure(self.dm)
+        def avg_speed(qc):
+            return (
+                self.dm.table("player_stats")
+                .filter(qc.filters)
+                .aggregate(
+                    allow("*", qc.groups),
+                    [F.avg(col("avg_speed")).alias("avg_speed")],
+                )
+            )
+
+    def test_filter_on_foreign_table(self):
+        result = run(
+            self.dm.query(
+                {
+                    "measures": ["avg_speed"],
+                    "filters": {"AND": [["players.name", "=", "Alice"]]},
+                }
+            )
+        )
+        assert result.num_rows == 1
+        assert result.column("avg_speed").to_pylist()[0] == 10.5  # (10+11)/2
+
+
+class TestAutoJoinMultiHop:
+    def setup_method(self):
+        self.dm = _make_auto_join_dm()
+
+        @measure(self.dm)
+        def avg_speed(qc):
+            return self.dm.table("player_stats").aggregate(
+                allow("*", qc.groups),
+                [F.avg(col("avg_speed")).alias("avg_speed")],
+            )
+
+    def test_two_hop_join(self):
+        """player_stats -> players -> teams"""
+        result = run(
+            self.dm.query(
+                {"measures": ["avg_speed"], "groups": ["teams.team_name"]}
+            )
+        )
+        assert result.num_rows == 2
+        rows = result.to_pydict()
+        data = sorted(zip(rows["team_name"], rows["avg_speed"]))
+        # Eagles: Alice(10,11) + Bob(12,13) = avg 11.5
+        # Hawks: Charlie(8) = avg 8.0
+        assert data[0] == ("Eagles", 11.5)
+        assert data[1] == ("Hawks", 8.0)
