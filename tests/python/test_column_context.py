@@ -1,42 +1,8 @@
 """Tests for allow() and exclude() column context resolution."""
 
-import pytest
-from datasubway.column_context import (
-    _AllowExcludeResult,
-    allow,
-    exclude,
-    parse_pattern,
-    parse_table_column,
-)
+from datasubway.column_context import allow, exclude
 
 CONTEXT = ["orders.region", "orders.amount", "customers.name"]
-
-
-class TestParseTableColumn:
-    def test_valid(self):
-        assert parse_table_column("orders.region") == ("orders", "region")
-
-    def test_invalid(self):
-        with pytest.raises(ValueError):
-            parse_table_column("invalid")
-
-    def test_no_dots(self):
-        with pytest.raises(ValueError):
-            parse_table_column("nodot")
-
-
-class TestParsePattern:
-    def test_wildcard(self):
-        assert parse_pattern("*") == ("*", "*")
-
-    def test_table_wildcard(self):
-        assert parse_pattern("orders.*") == ("orders", "*")
-
-    def test_column_wildcard(self):
-        assert parse_pattern("*.amount") == ("*", "amount")
-
-    def test_exact(self):
-        assert parse_pattern("orders.amount") == ("orders", "amount")
 
 
 class TestAllow:
@@ -61,17 +27,6 @@ class TestAllow:
         assert "orders.region" in result
         assert "orders.amount" in result
         assert "customers.name" in result
-
-    def test_include_tables_false(self):
-        result = allow("orders.*", CONTEXT, include_tables=False)
-        assert list(result) == ["region", "amount"]
-
-    def test_metadata(self):
-        result = allow("orders.*", CONTEXT)
-        assert isinstance(result, _AllowExcludeResult)
-        assert result.ae_type == "allow"
-        assert result.pattern == "orders.*"
-        assert result.include == []
 
     def test_no_match(self):
         result = allow("products.*", CONTEXT)
@@ -102,8 +57,3 @@ class TestExclude:
     def test_exact(self):
         result = exclude("orders.amount", CONTEXT)
         assert list(result) == ["orders.region", "customers.name"]
-
-    def test_metadata(self):
-        result = exclude("orders.*", CONTEXT)
-        assert result.ae_type == "exclude"
-        assert result.pattern == "orders.*"

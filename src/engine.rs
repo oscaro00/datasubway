@@ -8,7 +8,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 use tokio::runtime::Runtime;
 
+use crate::model::joins::PyJoinGraph;
 use crate::model::pre_agg::{PreAggregation, PyPreAggregation};
+use crate::optimizer::auto_join_rule::AutoJoinRule;
 use crate::optimizer::pre_agg_rule::PreAggSubstitution;
 
 /// Core engine wrapping a DataFusion SessionContext.
@@ -114,6 +116,18 @@ impl PyEngine {
     /// Register the PreAggSubstitution optimizer rule with the SessionContext.
     fn add_pre_agg_optimizer_rule(&mut self) {
         let rule = PreAggSubstitution::new(self.pre_aggs.clone());
+        self.ctx.add_optimizer_rule(Arc::new(rule));
+    }
+
+    /// Register the AutoJoin optimizer rule with the SessionContext.
+    /// This should be called AFTER add_pre_agg_optimizer_rule so that
+    /// pre-agg substitution runs first (and may eliminate the need for joins).
+    fn add_auto_join_optimizer_rule(
+        &mut self,
+        join_graph: &PyJoinGraph,
+        table_schemas: std::collections::HashMap<String, Vec<String>>,
+    ) {
+        let rule = AutoJoinRule::new(join_graph.inner.clone(), table_schemas);
         self.ctx.add_optimizer_rule(Arc::new(rule));
     }
 

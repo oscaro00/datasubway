@@ -156,27 +156,3 @@ class TestMeasureValidation:
                 )
 
 
-class TestGroupingContext:
-    def setup_method(self):
-        self.dm = DataModel(tables={"orders": ORDERS_BATCH})
-
-    def test_allow_grouping_context_extracted(self):
-        @measure(self.dm)
-        def revenue(qc):
-            return self.dm.table("orders").aggregate(
-                allow("orders.*", qc.groups) if qc.groups else allow("*", qc.groups),
-                [F.sum(col("amount")).alias("revenue")],
-            )
-
-        ctx = self.dm.measure_grouping_contexts["revenue"]
-        assert ctx["type"] == "allow"
-        assert ctx["pattern"] == "*"
-
-    def test_no_allow_empty_context(self):
-        @measure(self.dm)
-        def revenue(qc):
-            return self.dm.table("orders").aggregate(
-                [], [F.sum(col("amount")).alias("revenue")]
-            )
-
-        assert self.dm.measure_grouping_contexts["revenue"] == {}

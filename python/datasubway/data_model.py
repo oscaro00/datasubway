@@ -80,7 +80,6 @@ class DataModel:
         self.measures: dict[str, Any] = {}
         self.measure_output_cols: dict[str, list[str]] = {}
         self.measure_docstrings: dict[str, str] = {}
-        self.measure_grouping_contexts: dict[str, dict] = {}
 
     def _store_schema(self, name: str, source: str | pa.Table | pa.RecordBatch) -> None:
         """Store qualified column names for a table."""
@@ -138,8 +137,34 @@ class DataModel:
         meta_path.write_text(json.dumps(metadata, default=str))
 
     def table(self, name: str) -> MeasureDataFrame:
-        """Get a MeasureDataFrame for a registered table."""
-        return MeasureDataFrame(self.py_ctx.table(name), name, data_model=self)
+        """Get a MeasureDataFrame for a registered table.
+
+        Eagerly pre-joins all reachable tables via the JoinGraph so that
+        cross-table column references work without lazy auto-join logic.
+        The join decision (which tables, what order) comes from Rust's JoinGraph.
+        """
+        inner = self.py_ctx.table(name)
+        if self.join_graph is not None:
+            joined_tables = {name}
+            for target in self.join_graph.tables():
+                if target in joined_tables:
+                    continue
+                path = self.join_graph.find_path(name, target)
+                if path is None:
+                    continue
+                for step in path:
+                    step_target = step["right"]
+                    if step_target in joined_tables:
+                        continue
+                    right_df = self.py_ctx.table(step_target)
+                    inner = inner.join(
+                        right_df,
+                        left_on=step["left_on"].split(","),
+                        right_on=step["right_on"].split(","),
+                        how=step["how"],
+                    )
+                    joined_tables.add(step_target)
+        return MeasureDataFrame(inner, name, data_model=self)
 
     def all_columns(self) -> list[str]:
         """Return all qualified column names across all tables."""
@@ -356,12 +381,13 @@ class DataModel:
     def _build_pre_agg_dataframe(self, pa_obj: PreAggregation) -> MeasureDataFrame:
         """Build a MeasureDataFrame that computes the pre-aggregation.
 
-        Uses auto-join to handle multi-table group-by and aggregation columns.
+        Uses dm.table() which eagerly pre-joins all reachable tables,
+        so cross-table group-by and aggregation columns work automatically.
         """
         from datafusion import col
         from datafusion import functions as F
 
-        # Collect all referenced tables from group_by and aggregation columns
+        # Pick a base table that can reach all referenced tables via join graph
         all_tables: list[str] = []
         for g in pa_obj.group_by:
             if "." in g:
@@ -369,14 +395,9 @@ class DataModel:
         for col_name in pa_obj.aggregations:
             if "." in col_name:
                 all_tables.append(col_name.split(".")[0])
-
-        # Pick the base table that can reach the most other tables via join graph
-        # Default to first aggregation table (fact table) since it typically has
-        # outgoing join paths to dimension tables
         unique_tables = list(dict.fromkeys(all_tables))
         base_table = unique_tables[0] if unique_tables else pa_obj.group_by[0]
         if self.join_graph and len(unique_tables) > 1:
-            # Find the table that can reach all others
             for candidate in unique_tables:
                 if all(
                     candidate == t
@@ -408,6 +429,13 @@ class DataModel:
 
     def _apply_sorts(self, table: pa.Table, sorts: list[tuple[str, str]]) -> pa.Table:
         """Apply sorting to the result table."""
+        # Cast string_view columns to string to avoid ArrowNotImplementedError
+        # with take() which doesn't support (string_view, uint64) inputs
+        for i, field in enumerate(table.schema):
+            if pa.types.is_large_string(field.type) or field.type == pa.string_view():
+                table = table.set_column(
+                    i, field.name, table.column(i).cast(pa.string())
+                )
         sort_keys = [
             (col, "ascending" if d == "asc" else "descending") for col, d in sorts
         ]

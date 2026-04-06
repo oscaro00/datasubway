@@ -27,10 +27,13 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## TO DO
 
+- Move all logic to rust (just python api bindings [except @measure probably])
+  - Remove old python logic
+- Make auto joining a logical plan optimizer
+
+
 - Do more validation in QueryContext __init__
 - Parameter to only look at pre aggregations within a certain time frame
-- Graph db for modeling and tracking table paths?
-  - https://duckdb.org/community_extensions/extensions/duckpgq (concern is not updated super frequently)
 
 
 - Logging

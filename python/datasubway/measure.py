@@ -52,11 +52,6 @@ def measure(data_model: Any) -> Callable:
             if probe_result._last_op != "aggregate":
                 raise ValueError(f"Measure '{name}' must end with .aggregate()")
             output_cols = probe_result.columns()
-            data_model.measure_grouping_contexts[name] = (
-                probe_result._grouping_context or {}
-            )
-        else:
-            data_model.measure_grouping_contexts[name] = {}
 
         # Register the measure
         data_model.measures[name] = fn
