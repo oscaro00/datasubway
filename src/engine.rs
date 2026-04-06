@@ -131,6 +131,33 @@ impl PyEngine {
         self.ctx.add_optimizer_rule(Arc::new(rule));
     }
 
+    /// Check whether the root node of a Substrait plan is an Aggregate.
+    /// Used by the @measure decorator to validate measures end with .aggregate().
+    fn is_aggregate_plan(&self, substrait_bytes: &[u8]) -> PyResult<bool> {
+        self.rt.block_on(async {
+            let plan_proto: datafusion_substrait::substrait::proto::Plan =
+                prost::Message::decode(substrait_bytes).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Substrait decode failed: {e}"))
+                })?;
+
+            let state = self.ctx.state();
+            let logical_plan =
+                datafusion_substrait::logical_plan::consumer::from_substrait_plan(
+                    &state,
+                    &plan_proto,
+                )
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Substrait consume failed: {e}"))
+                })?;
+
+            Ok(matches!(
+                logical_plan,
+                datafusion::logical_expr::LogicalPlan::Aggregate(_)
+            ))
+        })
+    }
+
     /// Accept Substrait plan bytes, deserialize into a LogicalPlan in our
     /// SessionContext (which has PreAggSubstitution registered), optimize,
     /// execute, and return Arrow RecordBatches.

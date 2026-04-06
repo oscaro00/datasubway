@@ -1,12 +1,12 @@
 """Tests for the @measure decorator with DataFusion expression-based API validation."""
 
+import datafusion
 import pyarrow as pa
 import pytest
 from datafusion import col
 from datafusion import functions as F
 from datasubway.column_context import allow
 from datasubway.data_model import DataModel
-from datasubway.dataframe import MeasureDataFrame
 from datasubway.measure import measure
 
 ORDERS_BATCH = pa.RecordBatch.from_pydict(
@@ -99,7 +99,7 @@ class TestMeasureDecorator:
 
         qc = QueryContext({"measures": ["revenue"]})
         result = revenue(qc)
-        assert isinstance(result, MeasureDataFrame)
+        assert isinstance(result, datafusion.DataFrame)
         batches = result.collect()
         t = pa.Table.from_batches(batches)
         assert t.column("revenue").to_pylist() == [700]
@@ -132,8 +132,8 @@ class TestMeasureValidation:
             def bad_measure(qc):
                 return self.dm.table("orders")
 
-    def test_must_return_measure_dataframe(self):
-        with pytest.raises(TypeError, match="must return a MeasureDataFrame"):
+    def test_must_return_dataframe(self):
+        with pytest.raises(TypeError, match="must return a datafusion.DataFrame"):
 
             @measure(self.dm)
             def bad_type(qc):
@@ -151,8 +151,8 @@ class TestMeasureValidation:
 
             @measure(self.dm)
             def bad_filter(qc):
-                return self.dm.table("orders").filter_dict(
-                    {"AND": [["region", "=", "US"]]}
+                return self.dm.table("orders").filter(
+                    allow("*", {"AND": [["region", "=", "US"]]})
                 )
 
 

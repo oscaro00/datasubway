@@ -102,7 +102,7 @@ class TestSingleMeasureWithFilter:
         def revenue(qc):
             return (
                 self.dm.table("orders")
-                .filter(qc.filters)
+                .filter(allow("*", qc.filters))
                 .aggregate(allow("*", qc.groups), [F.sum(col("amount")).alias("revenue")])
             )
 
@@ -352,7 +352,7 @@ class TestAutoJoinFilter:
         def avg_speed(qc):
             return (
                 self.dm.table("player_stats")
-                .filter(qc.filters)
+                .filter(allow("*", qc.filters))
                 .aggregate(
                     allow("*", qc.groups),
                     [F.avg(col("avg_speed")).alias("avg_speed")],

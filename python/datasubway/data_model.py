@@ -11,7 +11,6 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from datasubway._engine import Engine, JoinGraph, PreAggregation, QueryContext
-from datasubway.dataframe import MeasureDataFrame
 
 
 class DataModel:
@@ -135,8 +134,8 @@ class DataModel:
         meta_path = self.pre_agg_directory / "_metadata.json"
         meta_path.write_text(json.dumps(metadata, default=str))
 
-    def table(self, name: str) -> MeasureDataFrame:
-        """Get a MeasureDataFrame for a registered table.
+    def table(self, name: str) -> df.DataFrame:
+        """Get a DataFusion DataFrame for a registered table.
 
         Eagerly pre-joins all reachable tables via the JoinGraph so that
         cross-table column references work without lazy auto-join logic.
@@ -163,7 +162,7 @@ class DataModel:
                         how=step["how"],
                     )
                     joined_tables.add(step_target)
-        return MeasureDataFrame(inner, name, data_model=self)
+        return inner
 
     def all_columns(self) -> list[str]:
         """Return all qualified column names across all tables."""
@@ -232,7 +231,7 @@ class DataModel:
         for measure_name in qc.measures:
             measure_fn = self.measures[measure_name]
             result = measure_fn(qc)
-            if isinstance(result, MeasureDataFrame):
+            if isinstance(result, df.DataFrame):
                 # Serialize plan to Substrait bytes
                 substrait_plan = Producer.to_substrait_plan(
                     result.logical_plan(), self.py_ctx
@@ -377,8 +376,8 @@ class DataModel:
         self._save_pre_agg_metadata(metadata)
         return results
 
-    def _build_pre_agg_dataframe(self, pa_obj: PreAggregation) -> MeasureDataFrame:
-        """Build a MeasureDataFrame that computes the pre-aggregation.
+    def _build_pre_agg_dataframe(self, pa_obj: PreAggregation) -> df.DataFrame:
+        """Build a DataFrame that computes the pre-aggregation.
 
         Uses dm.table() which eagerly pre-joins all reachable tables,
         so cross-table group-by and aggregation columns work automatically.

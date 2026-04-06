@@ -32,13 +32,19 @@ class TestAllow:
         result = allow("products.*", CONTEXT)
         assert list(result) == []
 
-    def test_filter_dict_context(self):
+    def test_filter_dict_context_returns_expr(self):
+        """When context is a filter dict, allow() returns a DataFusion Expr."""
+        import datafusion
+
         filter_ctx = {
-            "AND": [("orders.region", "=", "US"), ("orders.amount", ">", 100)]
+            "AND": [
+                ["orders.region", "=", "US"],
+                ["orders.amount", ">", 100],
+            ]
         }
         result = allow("orders.*", filter_ctx)
-        assert "orders.region" in result
-        assert "orders.amount" in result
+        # Should return a DataFusion Expr, not a list
+        assert isinstance(result, datafusion.Expr)
 
     def test_multiple_patterns(self):
         result = allow(["orders.region", "customers.name"], CONTEXT)

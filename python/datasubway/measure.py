@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from datasubway.dataframe import MeasureDataFrame
+import datafusion
+from datafusion.substrait import Producer
+
 from datasubway._engine import QueryContext
 
 
@@ -15,13 +17,13 @@ def measure(data_model: Any) -> Callable:
         @measure(dm)
         def revenue(qc):
             return (dm.table("orders")
-                .filter(qc.filters)
+                .filter(allow("*", qc.filters))
                 .aggregate(
                     group_by=allow("*", qc.groups),
                     aggs=[F.sum(col("amount")).alias("revenue")]
                 ))
 
-    The decorated function must accept a QueryContext and return a MeasureDataFrame
+    The decorated function must accept a QueryContext and return a datafusion.DataFrame
     whose last operation is .aggregate().
     """
 
@@ -45,13 +47,17 @@ def measure(data_model: Any) -> Callable:
             pass
 
         if probe_result is not None:
-            if not isinstance(probe_result, MeasureDataFrame):
+            if not isinstance(probe_result, datafusion.DataFrame):
                 raise TypeError(
-                    f"Measure '{name}' must return a MeasureDataFrame (use dm.table())"
+                    f"Measure '{name}' must return a datafusion.DataFrame (use dm.table())"
                 )
-            if probe_result._last_op != "aggregate":
+            # Validate plan ends with aggregate via Rust plan inspection
+            substrait_plan = Producer.to_substrait_plan(
+                probe_result.logical_plan(), data_model.py_ctx
+            )
+            if not data_model.engine.is_aggregate_plan(substrait_plan.encode()):
                 raise ValueError(f"Measure '{name}' must end with .aggregate()")
-            output_cols = probe_result.columns()
+            output_cols = [f.name for f in probe_result.schema()]
 
         # Register the measure
         data_model.measures[name] = fn

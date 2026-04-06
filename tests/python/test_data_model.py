@@ -1,9 +1,9 @@
 """Tests for the DataModel class."""
 
+import datafusion
 import pyarrow as pa
 import pytest
 from datasubway.data_model import DataModel
-from datasubway.dataframe import MeasureDataFrame
 from datasubway._engine import QueryContext
 
 ORDERS_BATCH = pa.RecordBatch.from_pydict(
@@ -67,17 +67,15 @@ class TestDataModelInit:
 
 
 class TestDataModelTable:
-    def test_table_returns_measure_dataframe(self):
+    def test_table_returns_dataframe(self):
         dm = DataModel(tables={"orders": ORDERS_BATCH})
-        mdf = dm.table("orders")
-        assert isinstance(mdf, MeasureDataFrame)
-        assert mdf._table_name == "orders"
-        assert mdf._last_op == "table"
+        result = dm.table("orders")
+        assert isinstance(result, datafusion.DataFrame)
 
     def test_table_columns(self):
         dm = DataModel(tables={"orders": ORDERS_BATCH})
-        mdf = dm.table("orders")
-        cols = mdf.columns()
+        result = dm.table("orders")
+        cols = [f.name for f in result.schema()]
         assert "region" in cols
         assert "amount" in cols
 
