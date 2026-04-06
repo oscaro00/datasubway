@@ -15,9 +15,10 @@ def measure(data_model: Any) -> Callable:
         @measure(dm)
         def revenue(qc):
             return (dm.table("orders")
+                .filter(qc.filters)
                 .aggregate(
                     group_by=allow("*", qc.groups),
-                    aggs=[{"col": "amount", "func": "sum", "alias": "revenue"}]
+                    aggs=[F.sum(col("amount")).alias("revenue")]
                 ))
 
     The decorated function must accept a QueryContext and return a MeasureDataFrame

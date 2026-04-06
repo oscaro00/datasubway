@@ -47,9 +47,8 @@ class TestSingleMeasureWithGroups:
 
         @measure(self.dm)
         def revenue(qc):
-            groups = allow("*", qc.groups) if qc.groups else []
             return self.dm.table("orders").aggregate(
-                groups, [F.sum(col("amount")).alias("revenue")]
+                allow("*", qc.groups), [F.sum(col("amount")).alias("revenue")]
             )
 
     def test_group_by_region(self):
@@ -79,11 +78,11 @@ class TestSingleMeasureWithFilter:
 
         @measure(self.dm)
         def revenue(qc):
-            df = self.dm.table("orders")
-            if qc.filters:
-                df = df.filter_dict(qc.filters)
-            groups = allow("*", qc.groups) if qc.groups else []
-            return df.aggregate(groups, [F.sum(col("amount")).alias("revenue")])
+            return (
+                self.dm.table("orders")
+                .filter(qc.filters)
+                .aggregate(allow("*", qc.groups), [F.sum(col("amount")).alias("revenue")])
+            )
 
     def test_filter_region(self):
         result = run(
@@ -118,16 +117,14 @@ class TestMultipleMeasures:
 
         @measure(self.dm)
         def revenue(qc):
-            groups = allow("*", qc.groups) if qc.groups else []
             return self.dm.table("orders").aggregate(
-                groups, [F.sum(col("amount")).alias("revenue")]
+                allow("*", qc.groups), [F.sum(col("amount")).alias("revenue")]
             )
 
         @measure(self.dm)
         def total_quantity(qc):
-            groups = allow("*", qc.groups) if qc.groups else []
             return self.dm.table("orders").aggregate(
-                groups, [F.sum(col("quantity")).alias("total_quantity")]
+                allow("*", qc.groups), [F.sum(col("quantity")).alias("total_quantity")]
             )
 
     def test_multi_measure_no_groups(self):
@@ -157,9 +154,8 @@ class TestHavings:
 
         @measure(self.dm)
         def revenue(qc):
-            groups = allow("*", qc.groups) if qc.groups else []
             return self.dm.table("orders").aggregate(
-                groups, [F.sum(col("amount")).alias("revenue")]
+                allow("*", qc.groups), [F.sum(col("amount")).alias("revenue")]
             )
 
     def test_having_filter(self):
@@ -183,9 +179,8 @@ class TestSorts:
 
         @measure(self.dm)
         def revenue(qc):
-            groups = allow("*", qc.groups) if qc.groups else []
             return self.dm.table("orders").aggregate(
-                groups, [F.sum(col("amount")).alias("revenue")]
+                allow("*", qc.groups), [F.sum(col("amount")).alias("revenue")]
             )
 
     def test_sort_asc(self):
@@ -219,9 +214,8 @@ class TestLimitOffset:
 
         @measure(self.dm)
         def revenue(qc):
-            groups = allow("*", qc.groups) if qc.groups else []
             return self.dm.table("orders").aggregate(
-                groups, [F.sum(col("amount")).alias("revenue")]
+                allow("*", qc.groups), [F.sum(col("amount")).alias("revenue")]
             )
 
     def test_limit(self):

@@ -25,13 +25,23 @@ class MeasureDataFrame:
         self._grouping_context: dict[str, Any] | None = None
 
     def filter(self, *args: Any) -> MeasureDataFrame:
+        if len(args) == 1:
+            arg = args[0]
+            # No-op for empty input (empty list, empty dict, None)
+            if arg is None or (isinstance(arg, (list, dict)) and not arg):
+                return self
+            # Handle dict-based filter trees directly
+            if isinstance(arg, dict):
+                expr = _build_filter_expr(arg)
+                self._inner = self._inner.filter(expr)
+                self._last_op = "filter"
+                return self
         self._inner = self._inner.filter(*args)
         self._last_op = "filter"
         return self
 
     def filter_dict(self, filter_tree: dict) -> MeasureDataFrame:
-        expr = _build_filter_expr(filter_tree)
-        return self.filter(expr)
+        return self.filter(filter_tree)
 
     def select(self, *args: Any) -> MeasureDataFrame:
         self._inner = self._inner.select(*args)

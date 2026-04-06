@@ -192,9 +192,8 @@ class TestPreAggQuery:
 
         @measure(self.dm)
         def revenue(qc):
-            groups = allow("*", qc.groups) if qc.groups else []
             return self.dm.table("orders").aggregate(
-                groups, [F.sum(col("amount")).alias("revenue")]
+                allow("*", qc.groups), [F.sum(col("amount")).alias("revenue")]
             )
 
     def test_query_still_works_with_pre_aggs_defined(self):
