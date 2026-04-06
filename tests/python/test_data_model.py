@@ -4,7 +4,7 @@ import pyarrow as pa
 import pytest
 from datasubway.data_model import DataModel
 from datasubway.dataframe import MeasureDataFrame
-from datasubway.query_context import QueryContext
+from datasubway._engine import QueryContext
 
 ORDERS_BATCH = pa.RecordBatch.from_pydict(
     {

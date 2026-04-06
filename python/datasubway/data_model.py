@@ -10,9 +10,8 @@ import datafusion as df
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from datasubway._engine import Engine, JoinGraph, PreAggregation
+from datasubway._engine import Engine, JoinGraph, PreAggregation, QueryContext
 from datasubway.dataframe import MeasureDataFrame
-from datasubway.query_context import QueryContext
 
 
 class DataModel:

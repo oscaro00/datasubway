@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from datasubway.dataframe import MeasureDataFrame
-from datasubway.query_context import QueryContext
+from datasubway._engine import QueryContext
 
 
 def measure(data_model: Any) -> Callable:

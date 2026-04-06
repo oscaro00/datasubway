@@ -8,12 +8,14 @@ use crate::engine::PyEngine;
 use crate::model::column_context::{py_allow, py_exclude};
 use crate::model::joins::PyJoinGraph;
 use crate::model::pre_agg::PyPreAggregation;
+use crate::model::query_context::PyQueryContext;
 
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
     m.add_class::<PyJoinGraph>()?;
     m.add_class::<PyPreAggregation>()?;
+    m.add_class::<PyQueryContext>()?;
     m.add_function(wrap_pyfunction!(py_allow, m)?)?;
     m.add_function(wrap_pyfunction!(py_exclude, m)?)?;
     Ok(())

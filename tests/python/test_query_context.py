@@ -1,7 +1,7 @@
 """Tests for QueryContext validation."""
 
 import pytest
-from datasubway.query_context import QueryContext
+from datasubway._engine import QueryContext
 
 
 class TestQueryContext:

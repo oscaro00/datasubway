@@ -95,7 +95,7 @@ class TestMeasureDecorator:
                 [], [F.sum(col("amount")).alias("revenue")]
             )
 
-        from datasubway.query_context import QueryContext
+        from datasubway._engine import QueryContext
 
         qc = QueryContext({"measures": ["revenue"]})
         result = revenue(qc)
