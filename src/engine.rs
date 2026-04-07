@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -9,9 +10,11 @@ use pyo3::types::PyList;
 use tokio::runtime::Runtime;
 
 use crate::model::joins::PyJoinGraph;
-use crate::model::pre_agg::{PreAggregation, PyPreAggregation};
+use crate::model::pre_agg::{self, PreAggregation, PyPreAggregation};
+use crate::model::query_context::PyQueryContext;
 use crate::optimizer::auto_join_rule::AutoJoinRule;
 use crate::optimizer::pre_agg_rule::PreAggSubstitution;
+use crate::post_process;
 
 /// Core engine wrapping a DataFusion SessionContext.
 /// Handles table registration, optimization, and execution.
@@ -20,6 +23,7 @@ pub struct PyEngine {
     ctx: SessionContext,
     rt: Arc<Runtime>,
     pre_aggs: Vec<PreAggregation>,
+    table_schemas: HashMap<String, Vec<String>>,
 }
 
 #[pymethods]
@@ -34,30 +38,71 @@ impl PyEngine {
             ctx,
             rt: Arc::new(rt),
             pre_aggs: Vec::new(),
+            table_schemas: HashMap::new(),
         })
     }
 
     /// Register a parquet file as a named table.
-    fn register_parquet(&self, name: &str, path: &str) -> PyResult<()> {
+    fn register_parquet(&mut self, name: &str, path: &str) -> PyResult<()> {
         self.rt
             .block_on(async {
                 self.ctx
                     .register_parquet(name, path, Default::default())
                     .await
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to register parquet: {}", e)))
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to register parquet: {}", e)))?;
+
+        // Store schema
+        let schema_names = self
+            .rt
+            .block_on(async {
+                let df = self.ctx.table(name).await?;
+                Ok::<Vec<String>, datafusion::common::DataFusionError>(
+                    df.schema()
+                        .fields()
+                        .iter()
+                        .map(|f| format!("{}.{}", name, f.name()))
+                        .collect(),
+                )
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to read schema: {}", e)))?;
+        self.table_schemas.insert(name.to_string(), schema_names);
+        Ok(())
     }
 
     /// Register a CSV file as a named table.
-    fn register_csv(&self, name: &str, path: &str) -> PyResult<()> {
+    fn register_csv(&mut self, name: &str, path: &str) -> PyResult<()> {
         self.rt
             .block_on(async { self.ctx.register_csv(name, path, Default::default()).await })
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to register CSV: {}", e)))
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to register CSV: {}", e)))?;
+
+        // Store schema
+        let schema_names = self
+            .rt
+            .block_on(async {
+                let df = self.ctx.table(name).await?;
+                Ok::<Vec<String>, datafusion::common::DataFusionError>(
+                    df.schema()
+                        .fields()
+                        .iter()
+                        .map(|f| format!("{}.{}", name, f.name()))
+                        .collect(),
+                )
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to read schema: {}", e)))?;
+        self.table_schemas.insert(name.to_string(), schema_names);
+        Ok(())
     }
 
     /// Register an Arrow RecordBatch as a named table.
-    fn register_record_batch(&self, name: &str, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn register_record_batch(&mut self, name: &str, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let batch: RecordBatch = arrow::pyarrow::FromPyArrow::from_pyarrow_bound(batch)?;
+        let schema_names: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("{}.{}", name, f.name()))
+            .collect();
         let schema = batch.schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create MemTable: {}", e)))?;
@@ -66,6 +111,7 @@ impl PyEngine {
                 .register_table(name, Arc::new(mem_table))
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to register table: {}", e)))
         })?;
+        self.table_schemas.insert(name.to_string(), schema_names);
         Ok(())
     }
 
@@ -88,6 +134,35 @@ impl PyEngine {
                 })
                 .collect()
         })
+    }
+
+    /// Return all qualified column names across all registered tables.
+    fn all_columns(&self) -> Vec<String> {
+        self.table_schemas
+            .values()
+            .flat_map(|cols| cols.iter().cloned())
+            .collect()
+    }
+
+    /// Return the qualified column names for a specific table.
+    fn table_schema(&self, name: &str) -> Vec<String> {
+        self.table_schemas
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Find the best pre-aggregation covering the given requirements.
+    fn find_best_pre_agg(
+        &self,
+        group_by: Vec<String>,
+        agg_components: std::collections::HashMap<String, std::collections::HashSet<String>>,
+        filter_columns: Vec<String>,
+    ) -> Option<PyPreAggregation> {
+        pre_agg::find_best_pre_agg(&self.pre_aggs, &group_by, &agg_components, &filter_columns)
+            .map(|pa| PyPreAggregation {
+                inner: pa.clone(),
+            })
     }
 
     /// Execute a SQL query and return results as a list of PyArrow RecordBatches.
@@ -156,6 +231,43 @@ impl PyEngine {
                 datafusion::logical_expr::LogicalPlan::Aggregate(_)
             ))
         })
+    }
+
+    /// Post-process measure results: join, apply havings, sorts, limit/offset.
+    ///
+    /// Takes a list of (measure_name, list_of_record_batches) pairs and a QueryContext.
+    /// Returns the final result as a list of RecordBatches.
+    fn post_process_measures<'py>(
+        &self,
+        measure_batches: Vec<(String, Vec<Bound<'py, PyAny>>)>,
+        qc: &PyQueryContext,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Convert PyArrow RecordBatches to Rust RecordBatches
+        let rust_batches: Vec<(&str, Vec<RecordBatch>)> = measure_batches
+            .iter()
+            .map(|(name, py_batches)| {
+                let batches: Vec<RecordBatch> = py_batches
+                    .iter()
+                    .map(|b| arrow::pyarrow::FromPyArrow::from_pyarrow_bound(b))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((name.as_str(), batches))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let result_batches = post_process::post_process_measure_results(
+            &self.rt,
+            rust_batches,
+            &qc.inner,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Post-process failed: {e}")))?;
+
+        // Convert back to PyArrow
+        let py_batches: Vec<Bound<'py, PyAny>> = result_batches
+            .into_iter()
+            .map(|b| b.to_pyarrow(py))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PyList::new(py, &py_batches)?.into_any())
     }
 
     /// Accept Substrait plan bytes, deserialize into a LogicalPlan in our

@@ -35,8 +35,9 @@ class TestDataModelInit:
 
     def test_schema_stored(self):
         dm = DataModel(tables={"orders": ORDERS_BATCH})
-        assert "orders.region" in dm.table_schemas["orders"]
-        assert "orders.amount" in dm.table_schemas["orders"]
+        schema = dm.engine.table_schema("orders")
+        assert "orders.region" in schema
+        assert "orders.amount" in schema
 
     def test_multiple_tables(self):
         dm = DataModel(tables={"orders": ORDERS_BATCH, "customers": CUSTOMERS_BATCH})
@@ -100,6 +101,8 @@ class TestDataModelAllColumns:
 
 
 class TestValidateQueryContext:
+    """Tests for QueryContext.validate() — now implemented in Rust."""
+
     def setup_method(self):
         self.dm = DataModel(
             tables={"orders": ORDERS_BATCH, "customers": CUSTOMERS_BATCH}
@@ -107,6 +110,13 @@ class TestValidateQueryContext:
         # Register a dummy measure
         self.dm.measures["revenue"] = lambda qc: None
         self.dm.measure_output_cols["revenue"] = ["revenue"]
+
+    def _validate(self, qc):
+        return qc.validate(
+            list(self.dm.measures.keys()),
+            self.dm.measure_output_cols,
+            self.dm.all_columns(),
+        )
 
     def test_valid(self):
         qc = QueryContext(
@@ -116,17 +126,17 @@ class TestValidateQueryContext:
                 "filters": {"AND": [("orders.amount", ">", 100)]},
             }
         )
-        assert self.dm.validate_query_context(qc) is True
+        assert self._validate(qc) is True
 
     def test_unknown_measure(self):
         qc = QueryContext({"measures": ["nonexistent"]})
         with pytest.raises(ValueError, match="Unknown measure"):
-            self.dm.validate_query_context(qc)
+            self._validate(qc)
 
     def test_unknown_group_column(self):
         qc = QueryContext({"measures": ["revenue"], "groups": ["orders.nonexistent"]})
         with pytest.raises(ValueError, match="Unknown group column"):
-            self.dm.validate_query_context(qc)
+            self._validate(qc)
 
     def test_unknown_filter_column(self):
         qc = QueryContext(
@@ -136,7 +146,7 @@ class TestValidateQueryContext:
             }
         )
         with pytest.raises(ValueError, match="Unknown filter column"):
-            self.dm.validate_query_context(qc)
+            self._validate(qc)
 
     def test_invalid_sort_direction(self):
         qc = QueryContext(
@@ -147,7 +157,7 @@ class TestValidateQueryContext:
             }
         )
         with pytest.raises(ValueError, match="Invalid sort direction"):
-            self.dm.validate_query_context(qc)
+            self._validate(qc)
 
     def test_valid_having(self):
         qc = QueryContext(
@@ -157,7 +167,7 @@ class TestValidateQueryContext:
                 "havings": {"AND": [("revenue", ">", 100)]},
             }
         )
-        assert self.dm.validate_query_context(qc) is True
+        assert self._validate(qc) is True
 
     def test_invalid_having_column(self):
         qc = QueryContext(
@@ -168,4 +178,4 @@ class TestValidateQueryContext:
             }
         )
         with pytest.raises(ValueError, match="Invalid having column"):
-            self.dm.validate_query_context(qc)
+            self._validate(qc)

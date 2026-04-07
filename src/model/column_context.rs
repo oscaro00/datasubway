@@ -1,8 +1,4 @@
 use datafusion_expr::Expr;
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
-use pythonize::depythonize;
 
 /// Parsed pattern: (table_part, column_part) where "*" means match any.
 #[derive(Debug, Clone)]
@@ -117,7 +113,7 @@ pub fn exclude(pattern: &str, context: &[String]) -> Result<Vec<Expr>, String> {
     exclude_exprs(&[pattern.to_string()], context)
 }
 
-// ── Filter expression building ──
+// ── Filter expression building (used by Python PyO3 functions) ──
 
 /// Extract column names from a filter tree (dict).
 fn extract_filter_columns(value: &serde_json::Value) -> Vec<String> {
@@ -146,270 +142,283 @@ fn extract_filter_columns(value: &serde_json::Value) -> Vec<String> {
     columns
 }
 
-/// Build a Python DataFusion Expr from a filter dict tree, scoped to allowed columns.
-/// Calls Python's datafusion.col(), datafusion.lit(), and datafusion.functions.in_list()
-/// from Rust via PyO3 to construct the expression.
-fn build_filter_py_expr<'py>(
-    py: Python<'py>,
-    filter_json: &serde_json::Value,
-    allowed_columns: &[String],
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let df_mod = py.import("datafusion")?;
-    let df_col = df_mod.getattr("col")?;
-    let df_lit = df_mod.getattr("lit")?;
-    let df_functions = py.import("datafusion.functions")?;
-    let df_in_list = df_functions.getattr("in_list")?;
-
-    build_filter_node(py, filter_json, allowed_columns, &df_col, &df_lit, &df_in_list)
-}
-
-fn build_filter_node<'py>(
-    py: Python<'py>,
-    value: &serde_json::Value,
-    allowed_columns: &[String],
-    df_col: &Bound<'py, PyAny>,
-    df_lit: &Bound<'py, PyAny>,
-    df_in_list: &Bound<'py, PyAny>,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, conditions) in map {
-                let is_and = key == "AND";
-                if let serde_json::Value::Array(arr) = conditions {
-                    let mut exprs: Vec<Bound<'py, PyAny>> = Vec::new();
-                    for item in arr {
-                        match item {
-                            serde_json::Value::Array(tuple) if tuple.len() >= 3 => {
-                                // Leaf condition: ["col", "op", value]
-                                let col_name = tuple[0].as_str().ok_or_else(|| {
-                                    PyValueError::new_err("filter column must be a string")
-                                })?;
-                                if !allowed_columns.contains(&col_name.to_string()) {
-                                    continue;
-                                }
-                                let expr = build_leaf_expr(
-                                    py, col_name, &tuple[1], &tuple[2], df_col, df_lit, df_in_list,
-                                )?;
-                                exprs.push(expr);
-                            }
-                            serde_json::Value::Object(_) => {
-                                // Nested dict → recurse
-                                if let Some(nested) = build_filter_node(
-                                    py,
-                                    item,
-                                    allowed_columns,
-                                    df_col,
-                                    df_lit,
-                                    df_in_list,
-                                )? {
-                                    exprs.push(nested);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if exprs.is_empty() {
-                        return Ok(None);
-                    }
-                    let mut combined = exprs.remove(0);
-                    for e in exprs {
-                        combined = if is_and {
-                            combined.call_method1("__and__", (e,))?
-                        } else {
-                            combined.call_method1("__or__", (e,))?
-                        };
-                    }
-                    return Ok(Some(combined));
-                }
-            }
-            Ok(None)
-        }
-        _ => Ok(None),
-    }
-}
-
-fn build_leaf_expr<'py>(
-    py: Python<'py>,
-    col_name: &str,
-    op_val: &serde_json::Value,
-    value: &serde_json::Value,
-    df_col: &Bound<'py, PyAny>,
-    df_lit: &Bound<'py, PyAny>,
-    df_in_list: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let op = op_val
-        .as_str()
-        .ok_or_else(|| PyValueError::new_err("filter operator must be a string"))?;
-    let c = df_col.call1((col_name,))?;
-
-    match op {
-        "in" | "not in" => {
-            let arr = value.as_array().ok_or_else(|| {
-                PyValueError::new_err(format!("'{op}' operator requires a list value"))
-            })?;
-            let py_list: Vec<Bound<'py, PyAny>> = arr
-                .iter()
-                .map(|v| json_value_to_py(py, v, df_lit))
-                .collect::<PyResult<Vec<_>>>()?;
-            let negated = op == "not in";
-            df_in_list.call1((c, py_list, negated))
-        }
-        _ => {
-            let v = json_value_to_py(py, value, df_lit)?;
-            match op {
-                "=" => c.call_method1("__eq__", (v,)),
-                "!=" => c.call_method1("__ne__", (v,)),
-                ">" => c.call_method1("__gt__", (v,)),
-                ">=" => c.call_method1("__ge__", (v,)),
-                "<" => c.call_method1("__lt__", (v,)),
-                "<=" => c.call_method1("__le__", (v,)),
-                _ => Err(PyValueError::new_err(format!(
-                    "Unknown filter operator: '{op}'"
-                ))),
-            }
-        }
-    }
-}
-
-/// Convert a serde_json::Value to a Python DataFusion lit() expression.
-fn json_value_to_py<'py>(
-    py: Python<'py>,
-    value: &serde_json::Value,
-    df_lit: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
-    match value {
-        serde_json::Value::String(s) => df_lit.call1((s.as_str(),)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                df_lit.call1((i,))
-            } else if let Some(f) = n.as_f64() {
-                df_lit.call1((f,))
-            } else {
-                Err(PyValueError::new_err(format!(
-                    "Unsupported number in filter: {n}"
-                )))
-            }
-        }
-        serde_json::Value::Bool(b) => df_lit.call1((*b,)),
-        serde_json::Value::Null => df_lit.call1((py.None(),)),
-        _ => Err(PyValueError::new_err(format!(
-            "Unsupported filter value type: {value}"
-        ))),
-    }
-}
-
 // ── PyO3 functions ──
 
-/// Python-exposed allow function. Polymorphic based on context type:
-/// - list[str] context → returns list of matching column strings
-/// - dict context (filter tree) → returns a DataFusion Expr
-#[pyfunction]
-#[pyo3(name = "allow", signature = (pattern, context, include=None))]
-pub fn py_allow<'py>(
-    py: Python<'py>,
-    pattern: PatternArg,
-    context: &Bound<'py, PyAny>,
-    include: Option<PatternArg>,
-) -> PyResult<Bound<'py, PyAny>> {
-    if let Ok(dict) = context.downcast::<PyDict>() {
-        // Dict context → build filter Expr
-        let filter_json: serde_json::Value =
-            depythonize(dict).map_err(|e| PyValueError::new_err(format!("Invalid filter dict: {e}")))?;
-        let all_columns = extract_filter_columns(&filter_json);
-        let patterns = pattern.into_vec();
-        let matched =
-            allow_columns(&patterns, &all_columns).map_err(|e| PyValueError::new_err(e))?;
-        match build_filter_py_expr(py, &filter_json, &matched)? {
-            Some(expr) => Ok(expr),
-            None => {
-                // No matching conditions — return a literal true so .filter() is a no-op
-                let df_mod = py.import("datafusion")?;
-                let df_lit = df_mod.getattr("lit")?;
-                df_lit.call1((true,))
+#[cfg(feature = "python")]
+pub use py_wrapper::*;
+
+#[cfg(feature = "python")]
+mod py_wrapper {
+    use super::*;
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+    use pythonize::depythonize;
+
+    /// Build a Python DataFusion Expr from a filter dict tree, scoped to allowed columns.
+    fn build_filter_py_expr<'py>(
+        py: Python<'py>,
+        filter_json: &serde_json::Value,
+        allowed_columns: &[String],
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let df_mod = py.import("datafusion")?;
+        let df_col = df_mod.getattr("col")?;
+        let df_lit = df_mod.getattr("lit")?;
+        let df_functions = py.import("datafusion.functions")?;
+        let df_in_list = df_functions.getattr("in_list")?;
+
+        build_filter_node(
+            py,
+            filter_json,
+            allowed_columns,
+            &df_col,
+            &df_lit,
+            &df_in_list,
+        )
+    }
+
+    fn build_filter_node<'py>(
+        py: Python<'py>,
+        value: &serde_json::Value,
+        allowed_columns: &[String],
+        df_col: &Bound<'py, PyAny>,
+        df_lit: &Bound<'py, PyAny>,
+        df_in_list: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, conditions) in map {
+                    let is_and = key == "AND";
+                    if let serde_json::Value::Array(arr) = conditions {
+                        let mut exprs: Vec<Bound<'py, PyAny>> = Vec::new();
+                        for item in arr {
+                            match item {
+                                serde_json::Value::Array(tuple) if tuple.len() >= 3 => {
+                                    let col_name = tuple[0].as_str().ok_or_else(|| {
+                                        PyValueError::new_err("filter column must be a string")
+                                    })?;
+                                    if !allowed_columns.contains(&col_name.to_string()) {
+                                        continue;
+                                    }
+                                    let expr = build_leaf_expr(
+                                        py, col_name, &tuple[1], &tuple[2], df_col, df_lit,
+                                        df_in_list,
+                                    )?;
+                                    exprs.push(expr);
+                                }
+                                serde_json::Value::Object(_) => {
+                                    if let Some(nested) = build_filter_node(
+                                        py,
+                                        item,
+                                        allowed_columns,
+                                        df_col,
+                                        df_lit,
+                                        df_in_list,
+                                    )? {
+                                        exprs.push(nested);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if exprs.is_empty() {
+                            return Ok(None);
+                        }
+                        let mut combined = exprs.remove(0);
+                        for e in exprs {
+                            combined = if is_and {
+                                combined.call_method1("__and__", (e,))?
+                            } else {
+                                combined.call_method1("__or__", (e,))?
+                            };
+                        }
+                        return Ok(Some(combined));
+                    }
+                }
+                Ok(None)
             }
+            _ => Ok(None),
         }
-    } else {
-        // List context → return column strings
-        let context_cols: Vec<String> = context.extract()?;
-        let patterns = pattern.into_vec();
-        let mut result =
-            allow_columns(&patterns, &context_cols).map_err(|e| PyValueError::new_err(e))?;
-        if let Some(extras) = include {
-            for extra in extras.into_vec() {
-                if !result.contains(&extra) {
-                    result.push(extra);
+    }
+
+    fn build_leaf_expr<'py>(
+        py: Python<'py>,
+        col_name: &str,
+        op_val: &serde_json::Value,
+        value: &serde_json::Value,
+        df_col: &Bound<'py, PyAny>,
+        df_lit: &Bound<'py, PyAny>,
+        df_in_list: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let op = op_val
+            .as_str()
+            .ok_or_else(|| PyValueError::new_err("filter operator must be a string"))?;
+        let c = df_col.call1((col_name,))?;
+
+        match op {
+            "in" | "not in" => {
+                let arr = value.as_array().ok_or_else(|| {
+                    PyValueError::new_err(format!("'{op}' operator requires a list value"))
+                })?;
+                let py_list: Vec<Bound<'py, PyAny>> = arr
+                    .iter()
+                    .map(|v| json_value_to_py(py, v, df_lit))
+                    .collect::<PyResult<Vec<_>>>()?;
+                let negated = op == "not in";
+                df_in_list.call1((c, py_list, negated))
+            }
+            _ => {
+                let v = json_value_to_py(py, value, df_lit)?;
+                match op {
+                    "=" => c.call_method1("__eq__", (v,)),
+                    "!=" => c.call_method1("__ne__", (v,)),
+                    ">" => c.call_method1("__gt__", (v,)),
+                    ">=" => c.call_method1("__ge__", (v,)),
+                    "<" => c.call_method1("__lt__", (v,)),
+                    "<=" => c.call_method1("__le__", (v,)),
+                    _ => Err(PyValueError::new_err(format!(
+                        "Unknown filter operator: '{op}'"
+                    ))),
                 }
             }
         }
-        Ok(result.into_pyobject(py)?.into_any())
     }
-}
 
-/// Python-exposed exclude function. Polymorphic based on context type:
-/// - list[str] context → returns list of non-matching column strings
-/// - dict context (filter tree) → returns a DataFusion Expr (excluding matched columns)
-#[pyfunction]
-#[pyo3(name = "exclude", signature = (pattern, context, include=None))]
-pub fn py_exclude<'py>(
-    py: Python<'py>,
-    pattern: PatternArg,
-    context: &Bound<'py, PyAny>,
-    include: Option<PatternArg>,
-) -> PyResult<Bound<'py, PyAny>> {
-    if let Ok(dict) = context.downcast::<PyDict>() {
-        // Dict context → build filter Expr for columns NOT matching the pattern
-        let filter_json: serde_json::Value =
-            depythonize(dict).map_err(|e| PyValueError::new_err(format!("Invalid filter dict: {e}")))?;
-        let all_columns = extract_filter_columns(&filter_json);
-        let patterns = pattern.into_vec();
-        let excluded =
-            exclude_columns(&patterns, &all_columns).map_err(|e| PyValueError::new_err(e))?;
-        match build_filter_py_expr(py, &filter_json, &excluded)? {
-            Some(expr) => Ok(expr),
-            None => {
-                let df_mod = py.import("datafusion")?;
-                let df_lit = df_mod.getattr("lit")?;
-                df_lit.call1((true,))
-            }
-        }
-    } else {
-        // List context → return column strings
-        let context_cols: Vec<String> = context.extract()?;
-        let patterns = pattern.into_vec();
-        let mut result =
-            exclude_columns(&patterns, &context_cols).map_err(|e| PyValueError::new_err(e))?;
-        if let Some(extras) = include {
-            for extra in extras.into_vec() {
-                if !result.contains(&extra) {
-                    result.push(extra);
+    /// Convert a serde_json::Value to a Python DataFusion lit() expression.
+    fn json_value_to_py<'py>(
+        py: Python<'py>,
+        value: &serde_json::Value,
+        df_lit: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match value {
+            serde_json::Value::String(s) => df_lit.call1((s.as_str(),)),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    df_lit.call1((i,))
+                } else if let Some(f) = n.as_f64() {
+                    df_lit.call1((f,))
+                } else {
+                    Err(PyValueError::new_err(format!(
+                        "Unsupported number in filter: {n}"
+                    )))
                 }
             }
-        }
-        Ok(result.into_pyobject(py)?.into_any())
-    }
-}
-
-/// Accepts either a single string or a list of strings from Python.
-pub enum PatternArg {
-    Single(String),
-    Multiple(Vec<String>),
-}
-
-impl PatternArg {
-    fn into_vec(self) -> Vec<String> {
-        match self {
-            PatternArg::Single(s) => vec![s],
-            PatternArg::Multiple(v) => v,
+            serde_json::Value::Bool(b) => df_lit.call1((*b,)),
+            serde_json::Value::Null => df_lit.call1((py.None(),)),
+            _ => Err(PyValueError::new_err(format!(
+                "Unsupported filter value type: {value}"
+            ))),
         }
     }
-}
 
-impl<'py> pyo3::FromPyObject<'py> for PatternArg {
-    fn extract_bound(ob: &pyo3::Bound<'py, pyo3::PyAny>) -> PyResult<Self> {
-        if let Ok(s) = ob.extract::<String>() {
-            Ok(PatternArg::Single(s))
+    /// Accepts either a single string or a list of strings from Python.
+    pub enum PatternArg {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+
+    impl PatternArg {
+        fn into_vec(self) -> Vec<String> {
+            match self {
+                PatternArg::Single(s) => vec![s],
+                PatternArg::Multiple(v) => v,
+            }
+        }
+    }
+
+    impl<'py> pyo3::FromPyObject<'py> for PatternArg {
+        fn extract_bound(ob: &pyo3::Bound<'py, pyo3::PyAny>) -> PyResult<Self> {
+            if let Ok(s) = ob.extract::<String>() {
+                Ok(PatternArg::Single(s))
+            } else {
+                Ok(PatternArg::Multiple(ob.extract::<Vec<String>>()?))
+            }
+        }
+    }
+
+    /// Python-exposed allow function. Polymorphic based on context type:
+    /// - list[str] context → returns list of matching column strings
+    /// - dict context (filter tree) → returns a DataFusion Expr
+    #[pyfunction]
+    #[pyo3(name = "allow", signature = (pattern, context, include=None))]
+    pub fn py_allow<'py>(
+        py: Python<'py>,
+        pattern: PatternArg,
+        context: &Bound<'py, PyAny>,
+        include: Option<PatternArg>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if let Ok(dict) = context.downcast::<PyDict>() {
+            // Dict context → build filter Expr
+            let filter_json: serde_json::Value = depythonize(dict)
+                .map_err(|e| PyValueError::new_err(format!("Invalid filter dict: {e}")))?;
+            let all_columns = extract_filter_columns(&filter_json);
+            let patterns = pattern.into_vec();
+            let matched =
+                allow_columns(&patterns, &all_columns).map_err(|e| PyValueError::new_err(e))?;
+            match build_filter_py_expr(py, &filter_json, &matched)? {
+                Some(expr) => Ok(expr),
+                None => {
+                    let df_mod = py.import("datafusion")?;
+                    let df_lit = df_mod.getattr("lit")?;
+                    df_lit.call1((true,))
+                }
+            }
         } else {
-            Ok(PatternArg::Multiple(ob.extract::<Vec<String>>()?))
+            // List context → return column strings
+            let context_cols: Vec<String> = context.extract()?;
+            let patterns = pattern.into_vec();
+            let mut result =
+                allow_columns(&patterns, &context_cols).map_err(|e| PyValueError::new_err(e))?;
+            if let Some(extras) = include {
+                for extra in extras.into_vec() {
+                    if !result.contains(&extra) {
+                        result.push(extra);
+                    }
+                }
+            }
+            Ok(result.into_pyobject(py)?.into_any())
+        }
+    }
+
+    /// Python-exposed exclude function. Polymorphic based on context type:
+    /// - list[str] context → returns list of non-matching column strings
+    /// - dict context (filter tree) → returns a DataFusion Expr (excluding matched columns)
+    #[pyfunction]
+    #[pyo3(name = "exclude", signature = (pattern, context, include=None))]
+    pub fn py_exclude<'py>(
+        py: Python<'py>,
+        pattern: PatternArg,
+        context: &Bound<'py, PyAny>,
+        include: Option<PatternArg>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if let Ok(dict) = context.downcast::<PyDict>() {
+            let filter_json: serde_json::Value = depythonize(dict)
+                .map_err(|e| PyValueError::new_err(format!("Invalid filter dict: {e}")))?;
+            let all_columns = extract_filter_columns(&filter_json);
+            let patterns = pattern.into_vec();
+            let excluded =
+                exclude_columns(&patterns, &all_columns).map_err(|e| PyValueError::new_err(e))?;
+            match build_filter_py_expr(py, &filter_json, &excluded)? {
+                Some(expr) => Ok(expr),
+                None => {
+                    let df_mod = py.import("datafusion")?;
+                    let df_lit = df_mod.getattr("lit")?;
+                    df_lit.call1((true,))
+                }
+            }
+        } else {
+            let context_cols: Vec<String> = context.extract()?;
+            let patterns = pattern.into_vec();
+            let mut result =
+                exclude_columns(&patterns, &context_cols).map_err(|e| PyValueError::new_err(e))?;
+            if let Some(extras) = include {
+                for extra in extras.into_vec() {
+                    if !result.contains(&extra) {
+                        result.push(extra);
+                    }
+                }
+            }
+            Ok(result.into_pyobject(py)?.into_any())
         }
     }
 }

@@ -1,5 +1,3 @@
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -148,77 +146,87 @@ pub fn find_best_pre_agg<'a>(
 
 // ── PyO3 wrapper ──
 
-#[pyclass(name = "PreAggregation")]
-#[derive(Debug, Clone)]
-pub struct PyPreAggregation {
-    pub inner: PreAggregation,
-}
+#[cfg(feature = "python")]
+pub use py_wrapper::*;
 
-#[pymethods]
-impl PyPreAggregation {
-    #[new]
-    fn new(
-        name: String,
-        group_by: Vec<String>,
-        raw_aggregations: HashMap<String, Vec<String>>,
-        file_path: String,
-    ) -> PyResult<Self> {
-        let inner = PreAggregation::new(name, group_by, raw_aggregations, file_path)
-            .map_err(|e| PyValueError::new_err(e))?;
-        Ok(PyPreAggregation { inner })
+#[cfg(feature = "python")]
+mod py_wrapper {
+    use super::*;
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+
+    #[pyclass(name = "PreAggregation")]
+    #[derive(Debug, Clone)]
+    pub struct PyPreAggregation {
+        pub inner: PreAggregation,
     }
 
-    #[getter]
-    fn name(&self) -> &str {
-        &self.inner.name
-    }
+    #[pymethods]
+    impl PyPreAggregation {
+        #[new]
+        fn new(
+            name: String,
+            group_by: Vec<String>,
+            raw_aggregations: HashMap<String, Vec<String>>,
+            file_path: String,
+        ) -> PyResult<Self> {
+            let inner = PreAggregation::new(name, group_by, raw_aggregations, file_path)
+                .map_err(|e| PyValueError::new_err(e))?;
+            Ok(PyPreAggregation { inner })
+        }
 
-    #[getter]
-    fn group_by(&self) -> Vec<String> {
-        self.inner.group_by.clone()
-    }
+        #[getter]
+        fn name(&self) -> &str {
+            &self.inner.name
+        }
 
-    #[getter]
-    fn aggregations(&self) -> HashMap<String, Vec<String>> {
-        self.inner.aggregations.clone()
-    }
+        #[getter]
+        fn group_by(&self) -> Vec<String> {
+            self.inner.group_by.clone()
+        }
 
-    #[getter]
-    fn file_path(&self) -> &str {
-        &self.inner.file_path
-    }
+        #[getter]
+        fn aggregations(&self) -> HashMap<String, Vec<String>> {
+            self.inner.aggregations.clone()
+        }
 
-    #[getter]
-    fn row_count(&self) -> u64 {
-        self.inner.row_count
-    }
+        #[getter]
+        fn file_path(&self) -> &str {
+            &self.inner.file_path
+        }
 
-    #[setter]
-    fn set_row_count(&mut self, count: u64) {
-        self.inner.row_count = count;
-    }
+        #[getter]
+        fn row_count(&self) -> u64 {
+            self.inner.row_count
+        }
 
-    #[getter]
-    fn written_at(&self) -> Option<String> {
-        self.inner.written_at.clone()
-    }
+        #[setter]
+        fn set_row_count(&mut self, count: u64) {
+            self.inner.row_count = count;
+        }
 
-    #[setter]
-    fn set_written_at(&mut self, val: Option<String>) {
-        self.inner.written_at = val;
-    }
+        #[getter]
+        fn written_at(&self) -> Option<String> {
+            self.inner.written_at.clone()
+        }
 
-    fn covers(
-        &self,
-        requested_group_by: Vec<String>,
-        requested_agg_components: HashMap<String, HashSet<String>>,
-        filter_columns: Vec<String>,
-    ) -> bool {
-        self.inner.covers(
-            &requested_group_by,
-            &requested_agg_components,
-            &filter_columns,
-        )
+        #[setter]
+        fn set_written_at(&mut self, val: Option<String>) {
+            self.inner.written_at = val;
+        }
+
+        fn covers(
+            &self,
+            requested_group_by: Vec<String>,
+            requested_agg_components: HashMap<String, HashSet<String>>,
+            filter_columns: Vec<String>,
+        ) -> bool {
+            self.inner.covers(
+                &requested_group_by,
+                &requested_agg_components,
+                &filter_columns,
+            )
+        }
     }
 }
 

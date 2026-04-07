@@ -1,0 +1,559 @@
+//! Standalone Rust DataModel — semantic layer using DataFusion DataFrame API.
+//!
+//! Enables pure-Rust usage without Python. Measures are closures that build
+//! DataFusion DataFrames using `allow()`/`exclude()` from `column_context`.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use arrow::array::RecordBatch;
+use datafusion::common::DataFusionError;
+use datafusion::execution::context::SessionContext;
+use datafusion::prelude::*;
+use tokio::runtime::Runtime;
+
+use crate::model::column_context;
+use crate::model::joins::{Join, JoinGraph};
+use crate::model::pre_agg::PreAggregation;
+use crate::model::query_context::{MeasureMetadata, QueryContext};
+use crate::optimizer::auto_join_rule::AutoJoinRule;
+use crate::optimizer::pre_agg_rule::PreAggSubstitution;
+use crate::post_process;
+
+/// A measure is a closure that takes a QueryContext and DataModel reference,
+/// and returns a DataFusion DataFrame.
+///
+/// Measures use the DataFusion DataFrame API with `allow()`/`exclude()`:
+/// ```rust,ignore
+/// Arc::new(|qc: &QueryContext, dm: &DataModel| {
+///     let table = dm.table("orders")?;
+///     Ok(table
+///         .filter(allow("*", &qc.filter_columns())?)?
+///         .aggregate(
+///             allow_exprs(&["*".into()], &qc.groups)?,
+///             vec![sum(col("amount")).alias("revenue")],
+///         )?)
+/// })
+/// ```
+pub type MeasureFn =
+    Arc<dyn Fn(&QueryContext, &DataModel) -> Result<DataFrame, DataFusionError> + Send + Sync>;
+
+/// Standalone Rust semantic layer model backed by DataFusion.
+///
+/// Manages data sources, joins, measures, pre-aggregations, and query execution.
+pub struct DataModel {
+    ctx: SessionContext,
+    rt: Arc<Runtime>,
+    join_graph: Option<JoinGraph>,
+    table_schemas: HashMap<String, Vec<String>>,
+    measures: HashMap<String, MeasureFn>,
+    measure_output_cols: HashMap<String, Vec<String>>,
+    pre_agg_objects: Vec<PreAggregation>,
+}
+
+impl DataModel {
+    /// Create a new DataModel with an empty SessionContext.
+    pub fn new() -> Result<Self, DataFusionError> {
+        let rt = Runtime::new()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(DataModel {
+            ctx: SessionContext::new(),
+            rt: Arc::new(rt),
+            join_graph: None,
+            table_schemas: HashMap::new(),
+            measures: HashMap::new(),
+            measure_output_cols: HashMap::new(),
+            pre_agg_objects: Vec::new(),
+        })
+    }
+
+    /// Register a RecordBatch as a named table.
+    pub fn register_record_batch(
+        &mut self,
+        name: &str,
+        batch: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        let schema_names: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("{}.{}", name, f.name()))
+            .collect();
+
+        let schema = batch.schema();
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])?;
+        self.rt.block_on(async {
+            self.ctx.register_table(name, Arc::new(mem_table))
+        })?;
+        self.table_schemas.insert(name.to_string(), schema_names);
+        Ok(())
+    }
+
+    /// Register a Parquet file as a named table.
+    pub fn register_parquet(
+        &mut self,
+        name: &str,
+        path: &str,
+    ) -> Result<(), DataFusionError> {
+        self.rt.block_on(async {
+            self.ctx
+                .register_parquet(name, path, Default::default())
+                .await
+        })?;
+        // Extract schema from the registered table
+        let schema_names = self.rt.block_on(async {
+            let df = self.ctx.table(name).await?;
+            Ok::<Vec<String>, DataFusionError>(
+                df.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| format!("{}.{}", name, f.name().clone()))
+                    .collect(),
+            )
+        })?;
+        self.table_schemas.insert(name.to_string(), schema_names);
+        Ok(())
+    }
+
+    /// Register a CSV file as a named table.
+    pub fn register_csv(
+        &mut self,
+        name: &str,
+        path: &str,
+    ) -> Result<(), DataFusionError> {
+        self.rt.block_on(async {
+            self.ctx
+                .register_csv(name, path, Default::default())
+                .await
+        })?;
+        let schema_names = self.rt.block_on(async {
+            let df = self.ctx.table(name).await?;
+            Ok::<Vec<String>, DataFusionError>(
+                df.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| format!("{}.{}", name, f.name().clone()))
+                    .collect(),
+            )
+        })?;
+        self.table_schemas.insert(name.to_string(), schema_names);
+        Ok(())
+    }
+
+    /// Set the join graph from a list of Join specifications.
+    pub fn set_joins(&mut self, joins: &[Join]) -> Result<(), String> {
+        self.join_graph = Some(JoinGraph::new(joins)?);
+        Ok(())
+    }
+
+    /// Set pre-aggregation objects.
+    pub fn set_pre_aggregations(&mut self, pre_aggs: Vec<PreAggregation>) {
+        self.pre_agg_objects = pre_aggs;
+    }
+
+    /// Register a measure function.
+    ///
+    /// The measure is probed with an empty QueryContext to extract output columns.
+    pub fn register_measure(
+        &mut self,
+        name: &str,
+        measure_fn: MeasureFn,
+    ) -> Result<(), DataFusionError> {
+        // Probe with empty context to extract output columns
+        let probe_qc = QueryContext::new(
+            vec![name.to_string()],
+            None, None, None, None, None, None, None,
+        )
+        .map_err(|e| DataFusionError::Plan(e))?;
+
+        let mut output_cols = Vec::new();
+        if let Ok(df) = measure_fn(&probe_qc, self) {
+            output_cols = df
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+        }
+
+        self.measures.insert(name.to_string(), measure_fn);
+        self.measure_output_cols
+            .insert(name.to_string(), output_cols);
+        Ok(())
+    }
+
+    /// Get a DataFusion DataFrame for a registered table.
+    ///
+    /// Eagerly pre-joins all reachable tables via the JoinGraph so that
+    /// cross-table column references work automatically.
+    pub fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
+        let mut inner = self.rt.block_on(self.ctx.table(name))?;
+
+        if let Some(ref join_graph) = self.join_graph {
+            let mut joined_tables: HashSet<String> = HashSet::new();
+            joined_tables.insert(name.to_string());
+
+            for target in join_graph.tables() {
+                if joined_tables.contains(target) {
+                    continue;
+                }
+                let path = match join_graph.find_path(name, target) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                for step in &path {
+                    if joined_tables.contains(&step.right) {
+                        continue;
+                    }
+                    let right_df = self.rt.block_on(self.ctx.table(&step.right))?;
+                    let left_on: Vec<&str> = step.left_on.iter().map(|s| s.as_str()).collect();
+                    let right_on: Vec<&str> = step.right_on.iter().map(|s| s.as_str()).collect();
+                    let join_type = match step.how.as_str() {
+                        "inner" => JoinType::Inner,
+                        "left" => JoinType::Left,
+                        "right" => JoinType::Right,
+                        "full" => JoinType::Full,
+                        _ => JoinType::Inner,
+                    };
+                    inner = inner.join(right_df, join_type, &left_on, &right_on, None)?;
+                    joined_tables.insert(step.right.clone());
+                }
+            }
+        }
+        Ok(inner)
+    }
+
+    /// Return all qualified column names across all tables.
+    pub fn all_columns(&self) -> Vec<String> {
+        self.table_schemas
+            .values()
+            .flat_map(|cols| cols.iter().cloned())
+            .collect()
+    }
+
+    /// Access the SessionContext (for advanced use cases).
+    pub fn session_context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
+    /// Access column_context::allow for use in measures.
+    pub fn allow_exprs(
+        &self,
+        patterns: &[String],
+        context: &[String],
+    ) -> Result<Vec<Expr>, String> {
+        column_context::allow_exprs(patterns, context)
+    }
+
+    /// Access column_context::exclude for use in measures.
+    pub fn exclude_exprs(
+        &self,
+        patterns: &[String],
+        context: &[String],
+    ) -> Result<Vec<Expr>, String> {
+        column_context::exclude_exprs(patterns, context)
+    }
+
+    /// Execute a query and return results as RecordBatches.
+    ///
+    /// 1. Validates the QueryContext
+    /// 2. Calls each measure function to produce DataFrames
+    /// 3. Optionally applies pre-agg and auto-join optimizer rules
+    /// 4. Executes each measure and collects results
+    /// 5. Post-processes: joins results, applies havings, sorts, limit/offset
+    pub fn query(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
+        // Validate
+        let measure_metadata: Vec<MeasureMetadata> = self
+            .measures
+            .keys()
+            .map(|name| MeasureMetadata {
+                name: name.clone(),
+                output_columns: self
+                    .measure_output_cols
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let all_cols: HashSet<String> = self.all_columns().into_iter().collect();
+        qc.validate(&measure_metadata, &all_cols)
+            .map_err(|e| DataFusionError::Plan(e))?;
+
+        // Register optimizer rules if applicable
+        if !self.pre_agg_objects.is_empty() && qc.use_pre_agg {
+            let rule = PreAggSubstitution::new(self.pre_agg_objects.clone());
+            self.ctx.add_optimizer_rule(Arc::new(rule));
+        }
+        if let Some(ref jg) = self.join_graph {
+            let rule = AutoJoinRule::new(jg.clone(), self.table_schemas.clone());
+            self.ctx.add_optimizer_rule(Arc::new(rule));
+        }
+
+        // Execute each measure
+        let mut measure_batches: Vec<(&str, Vec<RecordBatch>)> = Vec::new();
+        for measure_name in &qc.measures {
+            let measure_fn = self.measures.get(measure_name).ok_or_else(|| {
+                DataFusionError::Plan(format!("Unknown measure: '{}'", measure_name))
+            })?;
+
+            let df = measure_fn(qc, self)?;
+            let batches = self.rt.block_on(df.collect())?;
+            if !batches.is_empty() {
+                measure_batches.push((measure_name.as_str(), batches));
+            }
+        }
+
+        if measure_batches.is_empty() {
+            return Err(DataFusionError::Plan(
+                "No measure results produced".into(),
+            ));
+        }
+
+        // Post-process in Rust
+        post_process::post_process_measure_results(&self.rt, measure_batches, qc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::functions_aggregate::sum::sum;
+
+    fn make_orders_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("quantity", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "US", "EU", "US", "EU", "US",
+                ])),
+                Arc::new(arrow::array::Int64Array::from(vec![100, 200, 150, 250, 300])),
+                Arc::new(arrow::array::Int64Array::from(vec![10, 20, 15, 25, 30])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_basic_query_no_groups() {
+        let mut dm = DataModel::new().unwrap();
+        dm.register_record_batch("orders", make_orders_batch())
+            .unwrap();
+
+        dm.register_measure(
+            "revenue",
+            Arc::new(|_qc, dm| {
+                dm.table("orders")?
+                    .aggregate(vec![], vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        let qc =
+            QueryContext::new(vec!["revenue".into()], None, None, None, None, None, None, None)
+                .unwrap();
+
+        let result = dm.query(&qc).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        let col = result[0]
+            .column_by_name("revenue")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 1000);
+    }
+
+    #[test]
+    fn test_query_with_groups() {
+        let mut dm = DataModel::new().unwrap();
+        dm.register_record_batch("orders", make_orders_batch())
+            .unwrap();
+
+        dm.register_measure(
+            "revenue",
+            Arc::new(|qc, dm| {
+                let group_exprs =
+                    column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                dm.table("orders")?
+                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = dm.query(&qc).unwrap();
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[test]
+    fn test_query_with_having_and_sort() {
+        let mut dm = DataModel::new().unwrap();
+        dm.register_record_batch("orders", make_orders_batch())
+            .unwrap();
+
+        dm.register_measure(
+            "revenue",
+            Arc::new(|qc, dm| {
+                let group_exprs =
+                    column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                dm.table("orders")?
+                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            Some(serde_json::json!({"AND": [["revenue", ">", 500]]})),
+            Some(vec![("revenue".into(), "desc".into())]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = dm.query(&qc).unwrap();
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1);
+        let col = result[0]
+            .column_by_name("revenue")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 550);
+    }
+
+    #[test]
+    fn test_multi_measure() {
+        let mut dm = DataModel::new().unwrap();
+        dm.register_record_batch("orders", make_orders_batch())
+            .unwrap();
+
+        dm.register_measure(
+            "revenue",
+            Arc::new(|_qc, dm| {
+                dm.table("orders")?
+                    .aggregate(vec![], vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        dm.register_measure(
+            "total_quantity",
+            Arc::new(|_qc, dm| {
+                dm.table("orders")?
+                    .aggregate(vec![], vec![sum(col("quantity")).alias("total_quantity")])
+            }),
+        )
+        .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["revenue".into(), "total_quantity".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = dm.query(&qc).unwrap();
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1);
+    }
+
+    #[test]
+    fn test_auto_join() {
+        let mut dm = DataModel::new().unwrap();
+
+        let players_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let players = RecordBatch::try_new(
+            players_schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["Alice", "Bob"])),
+            ],
+        )
+        .unwrap();
+
+        let stats_schema = Arc::new(Schema::new(vec![
+            Field::new("player_id", DataType::Int64, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        let stats = RecordBatch::try_new(
+            stats_schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2, 1])),
+                Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        dm.register_record_batch("players", players).unwrap();
+        dm.register_record_batch("player_stats", stats).unwrap();
+
+        dm.set_joins(&[Join {
+            left: "player_stats".into(),
+            right: "players".into(),
+            left_on: vec!["player_id".into()],
+            right_on: vec!["id".into()],
+            how: "inner".into(),
+            direction: "right2left".into(),
+        }])
+        .unwrap();
+
+        dm.register_measure(
+            "total_score",
+            Arc::new(|qc, dm| {
+                let group_exprs =
+                    column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                dm.table("player_stats")?
+                    .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
+            }),
+        )
+        .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["total_score".into()],
+            None,
+            Some(vec!["players.name".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = dm.query(&qc).unwrap();
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+}

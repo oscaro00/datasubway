@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Callable
 
 import datafusion
@@ -40,11 +41,14 @@ def measure(data_model: Any) -> Callable:
 
         try:
             probe_result = fn(empty_qc)
-        except Exception:
-            # If the measure fails with empty context, that's ok —
-            # it may depend on filters/groups that are empty.
-            # We still register it; runtime errors will surface at query time.
-            pass
+        except Exception as e:
+            # Measure may depend on filters/groups that are empty during probe.
+            # Warn so failures are visible rather than silently breaking validation.
+            warnings.warn(
+                f"Measure '{name}' probe failed: {e}. "
+                f"Output columns unknown — sort/having validation may reject valid columns.",
+                stacklevel=2,
+            )
 
         if probe_result is not None:
             if not isinstance(probe_result, datafusion.DataFrame):
