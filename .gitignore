@@ -21,5 +21,8 @@ Cargo.lock
 # OS
 *.DS_Store
 
+# Claude Code
+.claude/
+
 # Pre-aggregation output
 _pre_aggregations/
