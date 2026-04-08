@@ -25,6 +25,37 @@ The purpose of this library is to define a data model using python focusing on t
 
 
 
+## Using as a Local Dependency
+
+To use `datasubway` as a dependency in another Rust project on your machine, add a path dependency to that project's `Cargo.toml`:
+
+```toml
+[dependencies]
+datasubway = { path = "/Users/oscarobrien/Developer/Repos/datasubway" }
+```
+
+Adjust the path to wherever this repo lives on your system. Relative paths also work (e.g. `path = "../datasubway"`).
+
+### Keeping the dependency up to date
+
+With a `path` dependency, Cargo always builds from the current state of the source files on disk. There is no cached/pinned version — any time you `cargo build` in the consuming project, it picks up whatever is in the `datasubway` directory. So the workflow is:
+
+1. Make changes in this repo (`datasubway`)
+2. Run `cargo build` (or `cargo check`) in the consuming project — it automatically recompiles with the latest changes
+
+No extra steps are needed. There is no equivalent of `cargo update` for path dependencies since they always point at live source.
+
+### If you later publish or push to a remote
+
+If you want to switch from a local path to a git dependency (e.g. to share across machines), replace the path entry:
+
+```toml
+[dependencies]
+datasubway = { git = "https://github.com/your-user/datasubway.git", branch = "datafusion_rust" }
+```
+
+With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pull the latest, run `cargo update -p datasubway` in the consuming project.
+
 ## TO DO
 
 - Do more validation in QueryContext __init__
