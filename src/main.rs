@@ -8,6 +8,7 @@ use datasubway::data_model::DataModel;
 use datasubway::model::column_context::{allow, ColumnInput::*};
 use datasubway::model::joins::Join;
 use datasubway::model::query_context::QueryContext;
+use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dm = DataModel::new()?;
@@ -53,16 +54,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dm.register_measure(
         "revenue",
         Arc::new(|qc, dm| {
+            let filter_expr = allow(&["*".into()], FilterTree(&qc.filters))?.into_filter_expr();
             let group_exprs = allow(&["*".into()], Columns(&qc.groups))?.into_exprs();
             dm.table("orders")?
+                .filter(filter_expr)?
                 .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
         }),
     )?;
 
-    // Query with cross-table grouping (AutoJoinRule resolves the join)
+    // Query with cross-table grouping and a filter (AutoJoinRule resolves the join)
     let qc = QueryContext::new(
         vec!["revenue".into()],
-        None,
+        Some(json!({"AND": [["orders.region", "=", "US"]]})),
         Some(vec!["customers.name".into()]),
         None,
         Some(vec![("revenue".into(), "desc".into())]),

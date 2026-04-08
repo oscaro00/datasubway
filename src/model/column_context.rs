@@ -1,4 +1,4 @@
-use crate::post_process::filter_tree_to_expr;
+use super::filter_tree::filter_tree_to_expr;
 use datafusion::common::DataFusionError;
 use datafusion_expr::Expr;
 
