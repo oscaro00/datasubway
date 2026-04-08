@@ -13,7 +13,7 @@ use datafusion::prelude::*;
 use tokio::runtime::Runtime;
 
 use crate::model::column_context;
-use crate::model::joins::{Join, JoinGraph};
+use crate::model::joins::{Join, JoinGraph, JoinHow};
 use crate::model::pre_agg::PreAggregation;
 use crate::model::query_context::{MeasureMetadata, QueryContext};
 use crate::optimizer::auto_join_rule::AutoJoinRule;
@@ -202,12 +202,9 @@ impl DataModel {
                     let right_df = self.rt.block_on(self.ctx.table(&step.right))?;
                     let left_on: Vec<&str> = step.left_on.iter().map(|s| s.as_str()).collect();
                     let right_on: Vec<&str> = step.right_on.iter().map(|s| s.as_str()).collect();
-                    let join_type = match step.how.as_str() {
-                        "inner" => JoinType::Inner,
-                        "left" => JoinType::Left,
-                        "right" => JoinType::Right,
-                        "full" => JoinType::Full,
-                        _ => JoinType::Inner,
+                    let join_type = match step.how {
+                        JoinHow::Inner => JoinType::Inner,
+                        JoinHow::Left => JoinType::Left,
                     };
                     inner = inner.join(right_df, join_type, &left_on, &right_on, None)?;
                     joined_tables.insert(step.right.clone());
@@ -311,6 +308,7 @@ impl DataModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::joins::JoinDirection;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions_aggregate::sum::sum;
 
@@ -526,8 +524,8 @@ mod tests {
             right: "players".into(),
             left_on: vec!["player_id".into()],
             right_on: vec!["id".into()],
-            how: "inner".into(),
-            direction: "right2left".into(),
+            how: JoinHow::Inner,
+            direction: JoinDirection::Right2Left,
         }])
         .unwrap();
 
@@ -613,16 +611,16 @@ mod tests {
                 right: "players".into(),
                 left_on: vec!["player_id".into()],
                 right_on: vec!["id".into()],
-                how: "inner".into(),
-                direction: "right2left".into(),
+                how: JoinHow::Inner,
+                direction: JoinDirection::Right2Left,
             },
             Join {
                 left: "players".into(),
                 right: "teams".into(),
                 left_on: vec!["team_id".into()],
                 right_on: vec!["id".into()],
-                how: "inner".into(),
-                direction: "right2left".into(),
+                how: JoinHow::Inner,
+                direction: JoinDirection::Right2Left,
             },
         ])
         .unwrap();

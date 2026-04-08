@@ -5,7 +5,7 @@ use datafusion_optimizer::OptimizerRule;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::model::joins::JoinGraph;
+use crate::model::joins::{JoinGraph, JoinHow};
 
 /// Optimizer rule that automatically injects Join nodes into a LogicalPlan
 /// when columns reference tables that are scanned but not yet joined.
@@ -189,12 +189,9 @@ impl AutoJoinRule {
         for step in join_steps {
             let right_scan = self.build_table_scan(&step.right)?;
 
-            let join_type = match step.how.as_str() {
-                "inner" => JoinType::Inner,
-                "left" => JoinType::Left,
-                "right" => JoinType::Right,
-                "full" => JoinType::Full,
-                _ => JoinType::Inner,
+            let join_type = match step.how {
+                JoinHow::Inner => JoinType::Inner,
+                JoinHow::Left => JoinType::Left,
             };
 
             let left_keys: Vec<Column> = step
@@ -352,7 +349,7 @@ impl datafusion_expr::TableSource for EmptyTableSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::joins::Join;
+    use crate::model::joins::{Join, JoinDirection, JoinHow};
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -369,16 +366,16 @@ mod tests {
                 right: "customers".into(),
                 left_on: vec!["customer_id".into()],
                 right_on: vec!["id".into()],
-                how: "left".into(),
-                direction: "right2left".into(),
+                how: JoinHow::Left,
+                direction: JoinDirection::Right2Left,
             },
             Join {
                 left: "orders".into(),
                 right: "products".into(),
                 left_on: vec!["product_id".into()],
                 right_on: vec!["id".into()],
-                how: "left".into(),
-                direction: "right2left".into(),
+                how: JoinHow::Left,
+                direction: JoinDirection::Right2Left,
             },
         ];
         JoinGraph::new(&joins).unwrap()
@@ -601,16 +598,16 @@ mod tests {
                 right: "customers".into(),
                 left_on: vec!["customer_id".into()],
                 right_on: vec!["id".into()],
-                how: "left".into(),
-                direction: "right2left".into(),
+                how: JoinHow::Left,
+                direction: JoinDirection::Right2Left,
             },
             Join {
                 left: "customers".into(),
                 right: "loyalty".into(),
                 left_on: vec!["loyalty_id".into()],
                 right_on: vec!["id".into()],
-                how: "left".into(),
-                direction: "right2left".into(),
+                how: JoinHow::Left,
+                direction: JoinDirection::Right2Left,
             },
         ];
         let graph = JoinGraph::new(&joins).unwrap();

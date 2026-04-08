@@ -1,6 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Whether the join is inner or left.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinHow {
+    Left,
+    Inner,
+}
+
+/// Whether the join edge is bidirectional or right-to-left only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinDirection {
+    Both,
+    Right2Left,
+}
+
 /// A single join specification between two tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Join {
@@ -8,8 +24,8 @@ pub struct Join {
     pub right: String,
     pub left_on: Vec<String>,
     pub right_on: Vec<String>,
-    pub how: String,
-    pub direction: String,
+    pub how: JoinHow,
+    pub direction: JoinDirection,
 }
 
 /// Adjacency-list based join graph.
@@ -37,7 +53,7 @@ impl JoinGraph {
                 .or_default()
                 .insert(join.right.clone(), join.clone());
 
-            if join.direction == "both" {
+            if join.direction == JoinDirection::Both {
                 // Add reverse edge with swapped on-columns
                 let reverse = Join {
                     left: join.right.clone(),
@@ -163,16 +179,16 @@ mod tests {
                 right: "customers".into(),
                 left_on: vec!["customer_id".into()],
                 right_on: vec!["id".into()],
-                how: "left".into(),
-                direction: "right2left".into(),
+                how: JoinHow::Left,
+                direction: JoinDirection::Right2Left,
             },
             Join {
                 left: "orders".into(),
                 right: "products".into(),
                 left_on: vec!["product_id".into()],
                 right_on: vec!["id".into()],
-                how: "left".into(),
-                direction: "right2left".into(),
+                how: JoinHow::Left,
+                direction: JoinDirection::Right2Left,
             },
         ]
     }
@@ -205,8 +221,8 @@ mod tests {
             right: "b".into(),
             left_on: vec!["id".into()],
             right_on: vec!["a_id".into()],
-            how: "inner".into(),
-            direction: "both".into(),
+            how: JoinHow::Inner,
+            direction: JoinDirection::Both,
         }];
         let graph = JoinGraph::new(&joins).unwrap();
         assert!(graph.find_path("a", "b").is_some());
@@ -221,24 +237,24 @@ mod tests {
                 right: "b".into(),
                 left_on: vec!["id".into()],
                 right_on: vec!["id".into()],
-                how: "inner".into(),
-                direction: "both".into(),
+                how: JoinHow::Inner,
+                direction: JoinDirection::Both,
             },
             Join {
                 left: "b".into(),
                 right: "c".into(),
                 left_on: vec!["id".into()],
                 right_on: vec!["id".into()],
-                how: "inner".into(),
-                direction: "both".into(),
+                how: JoinHow::Inner,
+                direction: JoinDirection::Both,
             },
             Join {
                 left: "c".into(),
                 right: "a".into(),
                 left_on: vec!["id".into()],
                 right_on: vec!["id".into()],
-                how: "inner".into(),
-                direction: "both".into(),
+                how: JoinHow::Inner,
+                direction: JoinDirection::Both,
             },
         ];
         let result = JoinGraph::new(&joins);

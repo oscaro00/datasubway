@@ -6,7 +6,7 @@ use datafusion::prelude::*;
 use datafusion_functions_aggregate::sum::sum;
 use datasubway::data_model::DataModel;
 use datasubway::model::column_context::{allow, ColumnInput::*};
-use datasubway::model::joins::Join;
+use datasubway::model::joins::{Join, JoinDirection, JoinHow};
 use datasubway::model::query_context::QueryContext;
 use serde_json::json;
 
@@ -46,8 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         right: "customers".into(),
         left_on: vec!["customer_id".into()],
         right_on: vec!["id".into()],
-        how: "inner".into(),
-        direction: "right2left".into(),
+        how: JoinHow::Inner,
+        direction: JoinDirection::Right2Left,
     }])?;
 
     // Register a measure
