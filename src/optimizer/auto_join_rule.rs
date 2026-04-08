@@ -126,7 +126,11 @@ impl AutoJoinRule {
         // Build a scan using an empty source -- the actual table provider
         // will be resolved by DataFusion during execution since it's registered
         // in the SessionContext. We create a placeholder scan with the schema.
-        let columns = self.table_schemas.get(table_name).cloned().unwrap_or_default();
+        let columns = self
+            .table_schemas
+            .get(table_name)
+            .cloned()
+            .unwrap_or_default();
         let fields: Vec<arrow::datatypes::Field> = columns
             .iter()
             .map(|c| arrow::datatypes::Field::new(c, arrow::datatypes::DataType::Null, true))
@@ -305,18 +309,14 @@ impl AutoJoinRule {
             .iter()
             .find(|candidate| {
                 scanned_tables.iter().all(|other| {
-                    *candidate == other
-                        || self.join_graph.find_path(candidate, other).is_some()
+                    *candidate == other || self.join_graph.find_path(candidate, other).is_some()
                 })
             })
             .or_else(|| scanned_tables.iter().next())
             .cloned();
 
         if let Some(base) = base_table {
-            let others: HashSet<&String> = all_tables
-                .into_iter()
-                .filter(|t| **t != base)
-                .collect();
+            let others: HashSet<&String> = all_tables.into_iter().filter(|t| **t != base).collect();
             if others.is_empty() {
                 return Ok(Transformed::no(plan));
             }
@@ -469,8 +469,7 @@ mod tests {
             .unwrap();
             let mem_table =
                 datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-            ctx.register_table("products", Arc::new(mem_table))
-                .unwrap();
+            ctx.register_table("products", Arc::new(mem_table)).unwrap();
         });
         ctx
     }
@@ -616,10 +615,7 @@ mod tests {
         ];
         let graph = JoinGraph::new(&joins).unwrap();
         let mut schemas = make_table_schemas();
-        schemas.insert(
-            "loyalty".into(),
-            vec!["id".into(), "tier".into()],
-        );
+        schemas.insert("loyalty".into(), vec!["id".into(), "tier".into()]);
         let rule = AutoJoinRule::new(graph, schemas);
 
         // Both customers and loyalty are missing
@@ -683,9 +679,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let rule = AutoJoinRule::new(make_join_graph(), make_table_schemas());
 
-        let plan = rt.block_on(async {
-            ctx.table("orders").await.unwrap().logical_plan().clone()
-        });
+        let plan = rt.block_on(async { ctx.table("orders").await.unwrap().logical_plan().clone() });
 
         // No joins initially
         assert!(!AutoJoinRule::plan_has_joins(&plan));
@@ -695,9 +689,7 @@ mod tests {
         missing.insert(&target);
         let steps = rule.compute_join_steps("orders", &missing).unwrap();
 
-        let rewritten = rule
-            .inject_joins_into_plan(plan, "orders", &steps)
-            .unwrap();
+        let rewritten = rule.inject_joins_into_plan(plan, "orders", &steps).unwrap();
 
         assert!(
             AutoJoinRule::plan_has_joins(&rewritten),

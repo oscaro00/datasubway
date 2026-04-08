@@ -5,23 +5,19 @@ edition = "2021"
 
 [lib]
 name = "datasubway"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
-[features]
-default = ["python"]
-python = ["dep:pyo3", "dep:pythonize", "arrow/pyarrow"]
+[[bin]]
+name = "datasubway"
+path = "src/main.rs"
 
 [dependencies]
-pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
 datafusion = "52"
 datafusion-common = "52"
 datafusion-expr = "52"
 datafusion-optimizer = "52"
 datafusion-functions-aggregate = "52"
-datafusion-substrait = "52"
 arrow = { version = "57" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-prost = "0.14"
-pythonize = { version = "0.26", optional = true }

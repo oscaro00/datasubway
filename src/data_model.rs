@@ -17,6 +17,7 @@ use crate::model::joins::{Join, JoinGraph};
 use crate::model::pre_agg::PreAggregation;
 use crate::model::query_context::{MeasureMetadata, QueryContext};
 use crate::optimizer::auto_join_rule::AutoJoinRule;
+use crate::optimizer::eliminate_unused_joins::EliminateUnusedJoins;
 use crate::optimizer::pre_agg_rule::PreAggSubstitution;
 use crate::post_process;
 
@@ -54,8 +55,7 @@ pub struct DataModel {
 impl DataModel {
     /// Create a new DataModel with an empty SessionContext.
     pub fn new() -> Result<Self, DataFusionError> {
-        let rt = Runtime::new()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let rt = Runtime::new().map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(DataModel {
             ctx: SessionContext::new(),
             rt: Arc::new(rt),
@@ -82,19 +82,14 @@ impl DataModel {
 
         let schema = batch.schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])?;
-        self.rt.block_on(async {
-            self.ctx.register_table(name, Arc::new(mem_table))
-        })?;
+        self.rt
+            .block_on(async { self.ctx.register_table(name, Arc::new(mem_table)) })?;
         self.table_schemas.insert(name.to_string(), schema_names);
         Ok(())
     }
 
     /// Register a Parquet file as a named table.
-    pub fn register_parquet(
-        &mut self,
-        name: &str,
-        path: &str,
-    ) -> Result<(), DataFusionError> {
+    pub fn register_parquet(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
         self.rt.block_on(async {
             self.ctx
                 .register_parquet(name, path, Default::default())
@@ -116,16 +111,9 @@ impl DataModel {
     }
 
     /// Register a CSV file as a named table.
-    pub fn register_csv(
-        &mut self,
-        name: &str,
-        path: &str,
-    ) -> Result<(), DataFusionError> {
-        self.rt.block_on(async {
-            self.ctx
-                .register_csv(name, path, Default::default())
-                .await
-        })?;
+    pub fn register_csv(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
+        self.rt
+            .block_on(async { self.ctx.register_csv(name, path, Default::default()).await })?;
         let schema_names = self.rt.block_on(async {
             let df = self.ctx.table(name).await?;
             Ok::<Vec<String>, DataFusionError>(
@@ -162,7 +150,13 @@ impl DataModel {
         // Probe with empty context to extract output columns
         let probe_qc = QueryContext::new(
             vec![name.to_string()],
-            None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .map_err(|e| DataFusionError::Plan(e))?;
 
@@ -185,7 +179,8 @@ impl DataModel {
     /// Get a DataFusion DataFrame for a registered table.
     ///
     /// Eagerly pre-joins all reachable tables via the JoinGraph so that
-    /// cross-table column references work automatically.
+    /// cross-table column references work in the DataFrame API (which validates
+    /// schemas at expression-building time, before the optimizer runs).
     pub fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
         let mut inner = self.rt.block_on(self.ctx.table(name))?;
 
@@ -287,6 +282,8 @@ impl DataModel {
         if let Some(ref jg) = self.join_graph {
             let rule = AutoJoinRule::new(jg.clone(), self.table_schemas.clone());
             self.ctx.add_optimizer_rule(Arc::new(rule));
+            let elim_rule = EliminateUnusedJoins::new(jg.clone());
+            self.ctx.add_optimizer_rule(Arc::new(elim_rule));
         }
 
         // Execute each measure
@@ -304,9 +301,7 @@ impl DataModel {
         }
 
         if measure_batches.is_empty() {
-            return Err(DataFusionError::Plan(
-                "No measure results produced".into(),
-            ));
+            return Err(DataFusionError::Plan("No measure results produced".into()));
         }
 
         // Post-process in Rust
@@ -332,7 +327,9 @@ mod tests {
                 Arc::new(arrow::array::StringArray::from(vec![
                     "US", "EU", "US", "EU", "US",
                 ])),
-                Arc::new(arrow::array::Int64Array::from(vec![100, 200, 150, 250, 300])),
+                Arc::new(arrow::array::Int64Array::from(vec![
+                    100, 200, 150, 250, 300,
+                ])),
                 Arc::new(arrow::array::Int64Array::from(vec![10, 20, 15, 25, 30])),
             ],
         )
@@ -354,9 +351,17 @@ mod tests {
         )
         .unwrap();
 
-        let qc =
-            QueryContext::new(vec!["revenue".into()], None, None, None, None, None, None, None)
-                .unwrap();
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let result = dm.query(&qc).unwrap();
         assert_eq!(result.len(), 1);
@@ -379,8 +384,7 @@ mod tests {
         dm.register_measure(
             "revenue",
             Arc::new(|qc, dm| {
-                let group_exprs =
-                    column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
                 dm.table("orders")?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
             }),
@@ -413,8 +417,7 @@ mod tests {
         dm.register_measure(
             "revenue",
             Arc::new(|qc, dm| {
-                let group_exprs =
-                    column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
                 dm.table("orders")?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
             }),
@@ -532,8 +535,7 @@ mod tests {
         dm.register_measure(
             "total_score",
             Arc::new(|qc, dm| {
-                let group_exprs =
-                    column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
                 dm.table("player_stats")?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
             }),
@@ -555,5 +557,124 @@ mod tests {
         let result = dm.query(&qc).unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
+    }
+
+    #[test]
+    fn test_unreferenced_join_eliminated() {
+        // Setup: 3 tables, but the query only references player_stats and players.
+        // "teams" is joined into the graph but never referenced in the query.
+        // The EliminateUnusedJoins optimizer rule should remove the teams join.
+        let mut dm = DataModel::new().unwrap();
+
+        let players = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("team_id", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["Alice", "Bob"])),
+                Arc::new(arrow::array::Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+
+        let stats = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("player_id", DataType::Int64, false),
+                Field::new("score", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2, 1])),
+                Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let teams = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("team_name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![10, 20])),
+                Arc::new(arrow::array::StringArray::from(vec!["Red", "Blue"])),
+            ],
+        )
+        .unwrap();
+
+        dm.register_record_batch("players", players).unwrap();
+        dm.register_record_batch("player_stats", stats).unwrap();
+        dm.register_record_batch("teams", teams).unwrap();
+
+        dm.set_joins(&[
+            Join {
+                left: "player_stats".into(),
+                right: "players".into(),
+                left_on: vec!["player_id".into()],
+                right_on: vec!["id".into()],
+                how: "inner".into(),
+                direction: "right2left".into(),
+            },
+            Join {
+                left: "players".into(),
+                right: "teams".into(),
+                left_on: vec!["team_id".into()],
+                right_on: vec!["id".into()],
+                how: "inner".into(),
+                direction: "right2left".into(),
+            },
+        ])
+        .unwrap();
+
+        // Register a measure that references player_stats.score and players.name
+        // but NOT teams
+        dm.register_measure(
+            "total_score",
+            Arc::new(|qc, dm| {
+                let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                dm.table("player_stats")?
+                    .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
+            }),
+        )
+        .unwrap();
+
+        // Query through DataModel::query() which registers optimizer rules
+        let qc = QueryContext::new(
+            vec!["total_score".into()],
+            None,
+            Some(vec!["players.name".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = dm.query(&qc).unwrap();
+
+        // Verify correct results: Alice=40, Bob=20
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2, "Should have 2 rows (Alice and Bob)");
+
+        // Also verify the plan does NOT contain "teams" by building a DF
+        // with the optimizer registered (it was registered by query() above)
+        let df = dm.table("player_stats").unwrap();
+        let group_exprs = vec![col("players.name")];
+        let agg_df = df
+            .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
+            .unwrap();
+
+        let plan = agg_df.into_optimized_plan().unwrap();
+        let plan_str = format!("{}", plan.display_indent());
+        println!("OPTIMIZED PLAN:\n{}", plan_str);
+
+        assert!(
+            !plan_str.contains("teams"),
+            "Optimized plan should eliminate unreferenced 'teams' join.\nPlan:\n{}",
+            plan_str
+        );
     }
 }
