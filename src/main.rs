@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
 
-    let results = dm.query(&qc)?;
+    let results = dm.collect(&qc)?;
     for batch in &results {
         println!("{:?}", batch);
     }

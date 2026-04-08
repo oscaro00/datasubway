@@ -130,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,                          // offset
         None,                          // use_pre_agg (default true)
     )?;
-    let results = dm.query(&qc)?;
+    let results = dm.collect(&qc)?;
 
     // Grouped by region, sorted descending
     let qc = QueryContext::new(
@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         None,
     )?;
-    let results = dm.query(&qc)?;
+    let results = dm.collect(&qc)?;
 
     // Cross-table grouping — the join is resolved automatically
     let qc = QueryContext::new(
@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         None,
     )?;
-    let results = dm.query(&qc)?;
+    let results = dm.collect(&qc)?;
 
     // With filters and havings
     let qc = QueryContext::new(
@@ -169,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(0),   // offset
         None,
     )?;
-    let results = dm.query(&qc)?;
+    let results = dm.collect(&qc)?;
 
     for batch in &results {
         println!("{:?}", batch);
@@ -248,7 +248,6 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
-- Need an explain method in data_model.rs (should be like query() without the collect())
 - Need a way to track output group_by columns, so measures with the same group_by columns can be selected
 - Parameter to only look at pre aggregations within a certain time frame
 

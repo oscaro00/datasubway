@@ -297,14 +297,14 @@ impl DataModel {
         Ok(measure_dfs)
     }
 
-    /// Execute a query and return results as RecordBatches.
+    /// Collect query results as RecordBatches.
     ///
     /// 1. Validates the QueryContext
     /// 2. Registers optimizer rules
     /// 3. Calls each measure function to produce DataFrames
     /// 4. Combines measures (joins, havings, sorts, limit/offset)
     /// 5. Collects and returns results
-    pub fn query(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
+    pub fn collect(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
         let measure_dfs = self.prepare_measure_dfs(qc)?;
         let borrowed: Vec<(&str, DataFrame)> = measure_dfs
             .iter()
@@ -315,7 +315,7 @@ impl DataModel {
 
     /// Return an explain DataFrame for the query plan without executing it.
     ///
-    /// Works like `query()` but calls DataFusion's `explain()` instead of
+    /// Works like `collect()` but calls DataFusion's `explain()` instead of
     /// collecting results. Accepts the same `verbose` and `analyze` flags
     /// as `DataFrame::explain()`.
     pub fn explain(
@@ -389,7 +389,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.query(&qc).unwrap();
+        let result = dm.collect(&qc).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
         let col = result[0]
@@ -434,7 +434,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.query(&qc).unwrap();
+        let result = dm.collect(&qc).unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
@@ -472,7 +472,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.query(&qc).unwrap();
+        let result = dm.collect(&qc).unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
         let col = result[0]
@@ -520,7 +520,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.query(&qc).unwrap();
+        let result = dm.collect(&qc).unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
@@ -595,7 +595,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.query(&qc).unwrap();
+        let result = dm.collect(&qc).unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
@@ -686,7 +686,7 @@ mod tests {
         )
         .unwrap();
 
-        // Query through DataModel::query() which registers optimizer rules
+        // Query through DataModel::collect() which registers optimizer rules
         let qc = QueryContext::new(
             vec!["total_score".into()],
             None,
@@ -699,14 +699,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.query(&qc).unwrap();
+        let result = dm.collect(&qc).unwrap();
 
         // Verify correct results: Alice=40, Bob=20
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2, "Should have 2 rows (Alice and Bob)");
 
         // Also verify the plan does NOT contain "teams" by building a DF
-        // with the optimizer registered (it was registered by query() above)
+        // with the optimizer registered (it was registered by collect() above)
         let df = dm.table("player_stats").unwrap();
         let group_exprs = vec![col("players.name")];
         let agg_df = df
