@@ -245,14 +245,12 @@ impl DataModel {
         column_context::exclude(patterns, input)
     }
 
-    /// Execute a query and return results as RecordBatches.
-    ///
-    /// 1. Validates the QueryContext
-    /// 2. Calls each measure function to produce DataFrames
-    /// 3. Optionally applies pre-agg and auto-join optimizer rules
-    /// 4. Executes each measure and collects results
-    /// 5. Post-processes: joins results, applies havings, sorts, limit/offset
-    pub fn query(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
+    /// Validate the QueryContext, register optimizer rules, and build a
+    /// DataFrame for each requested measure (without collecting).
+    fn prepare_measure_dfs(
+        &self,
+        qc: &QueryContext,
+    ) -> Result<Vec<(String, DataFrame)>, DataFusionError> {
         // Validate
         let measure_metadata: Vec<MeasureMetadata> = self
             .measures
@@ -282,26 +280,57 @@ impl DataModel {
             self.ctx.add_optimizer_rule(Arc::new(elim_rule));
         }
 
-        // Execute each measure
-        let mut measure_batches: Vec<(&str, Vec<RecordBatch>)> = Vec::new();
+        // Build each measure DataFrame (no collect)
+        let mut measure_dfs: Vec<(String, DataFrame)> = Vec::new();
         for measure_name in &qc.measures {
             let measure_fn = self.measures.get(measure_name).ok_or_else(|| {
                 DataFusionError::Plan(format!("Unknown measure: '{}'", measure_name))
             })?;
-
             let df = measure_fn(qc, self)?;
-            let batches = self.rt.block_on(df.collect())?;
-            if !batches.is_empty() {
-                measure_batches.push((measure_name.as_str(), batches));
-            }
+            measure_dfs.push((measure_name.clone(), df));
         }
 
-        if measure_batches.is_empty() {
+        if measure_dfs.is_empty() {
             return Err(DataFusionError::Plan("No measure results produced".into()));
         }
 
-        // Combine measures in Rust
-        combine_measures::combine_measure_results(&self.rt, measure_batches, qc)
+        Ok(measure_dfs)
+    }
+
+    /// Execute a query and return results as RecordBatches.
+    ///
+    /// 1. Validates the QueryContext
+    /// 2. Registers optimizer rules
+    /// 3. Calls each measure function to produce DataFrames
+    /// 4. Combines measures (joins, havings, sorts, limit/offset)
+    /// 5. Collects and returns results
+    pub fn query(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let measure_dfs = self.prepare_measure_dfs(qc)?;
+        let borrowed: Vec<(&str, DataFrame)> = measure_dfs
+            .iter()
+            .map(|(n, df)| (n.as_str(), df.clone()))
+            .collect();
+        combine_measures::combine_measure_results(&self.rt, borrowed, qc)
+    }
+
+    /// Return an explain DataFrame for the query plan without executing it.
+    ///
+    /// Works like `query()` but calls DataFusion's `explain()` instead of
+    /// collecting results. Accepts the same `verbose` and `analyze` flags
+    /// as `DataFrame::explain()`.
+    pub fn explain(
+        &self,
+        qc: &QueryContext,
+        verbose: bool,
+        analyze: bool,
+    ) -> Result<DataFrame, DataFusionError> {
+        let measure_dfs = self.prepare_measure_dfs(qc)?;
+        let borrowed: Vec<(&str, DataFrame)> = measure_dfs
+            .iter()
+            .map(|(n, df)| (n.as_str(), df.clone()))
+            .collect();
+        let combined_df = combine_measures::combine_measure_dfs(borrowed, qc)?;
+        combined_df.explain(verbose, analyze)
     }
 }
 

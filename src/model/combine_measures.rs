@@ -1,13 +1,10 @@
 //! Combining measure results: joining, havings, sorting, limit/offset.
 //!
-//! After each measure produces Arrow RecordBatches, this module combines them
-//! into a single result table using DataFusion for joins, filtering, and sorting.
-
-use std::sync::Arc;
+//! After each measure produces a DataFrame, this module combines them
+//! into a single result using DataFusion for joins, filtering, and sorting.
 
 use arrow::array::RecordBatch;
 use datafusion::common::DataFusionError;
-use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::SortExpr;
 use datafusion::prelude::*;
 use tokio::runtime::Runtime;
@@ -15,50 +12,25 @@ use tokio::runtime::Runtime;
 use crate::model::filter_tree::filter_tree_to_expr;
 use crate::model::query_context::QueryContext;
 
-/// Combine multiple measure results into a single final result.
+/// Combine multiple measure DataFrames into a single DataFrame.
 ///
 /// Steps:
-/// 1. Register each measure's batches in a temp SessionContext
-/// 2. Join them (cross join if no groups, full outer join on group cols)
-/// 3. Apply having filters
-/// 4. Apply sorts
-/// 5. Apply offset + limit
-pub fn combine_measure_results(
-    rt: &Runtime,
-    measure_batches: Vec<(&str, Vec<RecordBatch>)>,
+/// 1. Join them (cross join if no groups, full outer join on group cols)
+/// 2. Apply having filters
+/// 3. Apply sorts
+/// 4. Apply offset + limit
+pub fn combine_measure_dfs(
+    measure_dfs: Vec<(&str, DataFrame)>,
     qc: &QueryContext,
-) -> Result<Vec<RecordBatch>, DataFusionError> {
-    rt.block_on(async { combine_measure_results_async(measure_batches, qc).await })
-}
-
-async fn combine_measure_results_async(
-    measure_batches: Vec<(&str, Vec<RecordBatch>)>,
-    qc: &QueryContext,
-) -> Result<Vec<RecordBatch>, DataFusionError> {
-    let ctx = SessionContext::new();
-
-    // Register each measure's batches as a named table
-    let mut table_names = Vec::new();
-    for (i, (name, batches)) in measure_batches.iter().enumerate() {
-        if batches.is_empty() {
-            return Err(DataFusionError::Plan(format!(
-                "Measure '{}' produced no results",
-                name
-            )));
-        }
-        let table_name = format!("_measure_{}", i);
-        let schema = batches[0].schema();
-        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])?;
-        ctx.register_table(&table_name, Arc::new(mem_table))?;
-        table_names.push(table_name);
+) -> Result<DataFrame, DataFusionError> {
+    if measure_dfs.is_empty() {
+        return Err(DataFusionError::Plan("No measure results produced".into()));
     }
 
-    // Build the combined DataFrame
-    let mut result_df = ctx.table(&table_names[0]).await?;
+    let mut iter = measure_dfs.into_iter();
+    let (_, mut result_df) = iter.next().unwrap();
 
-    for other_name in &table_names[1..] {
-        let other_df = ctx.table(other_name).await?;
-
+    for (_, other_df) in iter {
         if qc.groups.is_empty() {
             // Cross join for scalar (no group-by) results
             result_df = result_df.join(other_df, JoinType::Inner, &[], &[], None)?;
@@ -116,15 +88,22 @@ async fn combine_measure_results_async(
 
     // Apply offset
     if qc.offset > 0 {
-        // DataFusion doesn't have a direct offset-only method;
-        // use limit(offset + limit) then skip in Arrow, or use SQL.
-        // Actually, DataFrame::limit(skip, fetch) handles both.
         result_df = result_df.limit(qc.offset, Some(qc.limit))?;
     } else if qc.limit < 10000 {
         result_df = result_df.limit(0, Some(qc.limit))?;
     }
 
-    result_df.collect().await
+    Ok(result_df)
+}
+
+/// Combine multiple measure DataFrames and collect into RecordBatches.
+pub fn combine_measure_results(
+    rt: &Runtime,
+    measure_dfs: Vec<(&str, DataFrame)>,
+    qc: &QueryContext,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    let df = combine_measure_dfs(measure_dfs, qc)?;
+    rt.block_on(df.collect())
 }
 
 /// Find group columns common to both left and right column lists.
@@ -163,7 +142,21 @@ pub fn find_common_group_cols(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::context::SessionContext;
     use serde_json::json;
+    use std::sync::Arc;
+
+    /// Helper: register a RecordBatch as a table and return a DataFrame.
+    fn batch_to_df(rt: &Runtime, ctx: &SessionContext, name: &str, batch: RecordBatch) -> DataFrame {
+        let schema = batch.schema();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        rt.block_on(async {
+            ctx.register_table(name, Arc::new(mem_table)).unwrap();
+            ctx.table(name).await.unwrap()
+        })
+    }
 
     #[test]
     fn test_find_common_group_cols_qualified() {
@@ -195,29 +188,21 @@ mod tests {
     #[test]
     fn test_combine_single_measure() {
         let rt = Runtime::new().unwrap();
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("revenue", arrow::datatypes::DataType::Int64, false),
-        ]));
+        let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
-            schema,
+            Arc::new(Schema::new(vec![Field::new("revenue", DataType::Int64, false)])),
             vec![Arc::new(arrow::array::Int64Array::from(vec![1000]))],
         )
         .unwrap();
+        let df = batch_to_df(&rt, &ctx, "m0", batch);
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None,
         )
         .unwrap();
 
-        let result = combine_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
-
+        let result = combine_measure_results(&rt, vec![("revenue", df)], &qc).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
     }
@@ -225,18 +210,19 @@ mod tests {
     #[test]
     fn test_combine_with_having() {
         let rt = Runtime::new().unwrap();
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
-            arrow::datatypes::Field::new("revenue", arrow::datatypes::DataType::Int64, false),
-        ]));
+        let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
-            schema,
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("revenue", DataType::Int64, false),
+            ])),
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["US", "EU"])),
                 Arc::new(arrow::array::Int64Array::from(vec![550, 450])),
             ],
         )
         .unwrap();
+        let df = batch_to_df(&rt, &ctx, "m0", batch);
 
         let havings = json!({"AND": [["revenue", ">", 500]]});
         let qc = QueryContext::new(
@@ -244,15 +230,11 @@ mod tests {
             None,
             Some(vec!["orders.region".into()]),
             Some(havings),
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None,
         )
         .unwrap();
 
-        let result = combine_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
-
+        let result = combine_measure_results(&rt, vec![("revenue", df)], &qc).unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
@@ -260,18 +242,19 @@ mod tests {
     #[test]
     fn test_combine_with_sort() {
         let rt = Runtime::new().unwrap();
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
-            arrow::datatypes::Field::new("revenue", arrow::datatypes::DataType::Int64, false),
-        ]));
+        let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
-            schema,
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("revenue", DataType::Int64, false),
+            ])),
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["US", "EU"])),
                 Arc::new(arrow::array::Int64Array::from(vec![550, 450])),
             ],
         )
         .unwrap();
+        let df = batch_to_df(&rt, &ctx, "m0", batch);
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
@@ -279,14 +262,11 @@ mod tests {
             Some(vec!["orders.region".into()]),
             None,
             Some(vec![("revenue".into(), "asc".into())]),
-            None,
-            None,
-            None,
+            None, None, None,
         )
         .unwrap();
 
-        let result = combine_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
-
+        let result = combine_measure_results(&rt, vec![("revenue", df)], &qc).unwrap();
         assert_eq!(result.len(), 1);
         let col = result[0]
             .column_by_name("revenue")
@@ -301,18 +281,19 @@ mod tests {
     #[test]
     fn test_combine_with_limit_offset() {
         let rt = Runtime::new().unwrap();
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
-            arrow::datatypes::Field::new("revenue", arrow::datatypes::DataType::Int64, false),
-        ]));
+        let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
-            schema,
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("revenue", DataType::Int64, false),
+            ])),
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["US", "EU", "APAC"])),
                 Arc::new(arrow::array::Int64Array::from(vec![550, 450, 300])),
             ],
         )
         .unwrap();
+        let df = batch_to_df(&rt, &ctx, "m0", batch);
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
@@ -326,8 +307,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = combine_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
-
+        let result = combine_measure_results(&rt, vec![("revenue", df)], &qc).unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
         let col = result[0]
@@ -336,50 +316,40 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
             .unwrap();
-        assert_eq!(col.value(0), 450); // second row after desc sort
+        assert_eq!(col.value(0), 450);
     }
 
     #[test]
     fn test_combine_multi_measure_no_groups() {
         let rt = Runtime::new().unwrap();
+        let ctx = SessionContext::new();
 
-        let schema1 = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("revenue", arrow::datatypes::DataType::Int64, false),
-        ]));
         let batch1 = RecordBatch::try_new(
-            schema1,
+            Arc::new(Schema::new(vec![Field::new("revenue", DataType::Int64, false)])),
             vec![Arc::new(arrow::array::Int64Array::from(vec![1000]))],
         )
         .unwrap();
-
-        let schema2 = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("quantity", arrow::datatypes::DataType::Int64, false),
-        ]));
         let batch2 = RecordBatch::try_new(
-            schema2,
+            Arc::new(Schema::new(vec![Field::new("quantity", DataType::Int64, false)])),
             vec![Arc::new(arrow::array::Int64Array::from(vec![100]))],
         )
         .unwrap();
 
+        let df1 = batch_to_df(&rt, &ctx, "m0", batch1);
+        let df2 = batch_to_df(&rt, &ctx, "m1", batch2);
+
         let qc = QueryContext::new(
             vec!["revenue".into(), "total_quantity".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None,
         )
         .unwrap();
 
         let result = combine_measure_results(
             &rt,
-            vec![("revenue", vec![batch1]), ("total_quantity", vec![batch2])],
+            vec![("revenue", df1), ("total_quantity", df2)],
             &qc,
         )
         .unwrap();
-
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
@@ -387,26 +357,24 @@ mod tests {
     #[test]
     fn test_combine_multi_measure_with_groups() {
         let rt = Runtime::new().unwrap();
+        let ctx = SessionContext::new();
 
-        let schema1 = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
-            arrow::datatypes::Field::new("revenue", arrow::datatypes::DataType::Int64, false),
-        ]));
         let batch1 = RecordBatch::try_new(
-            schema1,
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("revenue", DataType::Int64, false),
+            ])),
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["US", "EU"])),
                 Arc::new(arrow::array::Int64Array::from(vec![550, 450])),
             ],
         )
         .unwrap();
-
-        let schema2 = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
-            arrow::datatypes::Field::new("quantity", arrow::datatypes::DataType::Int64, false),
-        ]));
         let batch2 = RecordBatch::try_new(
-            schema2,
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("quantity", DataType::Int64, false),
+            ])),
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["US", "EU"])),
                 Arc::new(arrow::array::Int64Array::from(vec![55, 45])),
@@ -414,25 +382,23 @@ mod tests {
         )
         .unwrap();
 
+        let df1 = batch_to_df(&rt, &ctx, "m0", batch1);
+        let df2 = batch_to_df(&rt, &ctx, "m1", batch2);
+
         let qc = QueryContext::new(
             vec!["revenue".into(), "total_quantity".into()],
             None,
             Some(vec!["orders.region".into()]),
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None,
         )
         .unwrap();
 
         let result = combine_measure_results(
             &rt,
-            vec![("revenue", vec![batch1]), ("total_quantity", vec![batch2])],
+            vec![("revenue", df1), ("total_quantity", df2)],
             &qc,
         )
         .unwrap();
-
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
