@@ -18,7 +18,7 @@ use crate::model::joins::{Join, JoinGraph, JoinHow};
 use crate::model::pre_agg::PreAggregation;
 use crate::model::query_context::{MeasureMetadata, QueryContext};
 use crate::optimizer::auto_join_rule::AutoJoinRule;
-use crate::optimizer::eliminate_unused_joins::EliminateUnusedJoins;
+use crate::optimizer::eliminate_joins_rule::EliminateUnusedJoins;
 use crate::optimizer::pre_agg_rule::PreAggSubstitution;
 
 /// A measure is a closure that takes a QueryContext and DataModel reference,

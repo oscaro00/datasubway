@@ -1,4 +1,3 @@
-pub mod agg_rewrite;
 pub mod auto_join_rule;
-pub mod eliminate_unused_joins;
+pub mod eliminate_joins_rule;
 pub mod pre_agg_rule;

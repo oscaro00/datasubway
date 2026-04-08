@@ -248,7 +248,8 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
-- Do more validation in QueryContext __init__
+- Need an explain method in data_model.rs (should be like query() without the collect())
+- Need a way to track output group_by columns, so measures with the same group_by columns can be selected
 - Parameter to only look at pre aggregations within a certain time frame
 
 

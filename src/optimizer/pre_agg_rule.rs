@@ -1,11 +1,75 @@
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::{Result as DFResult, TableReference};
+use datafusion_common::{Column, Result as DFResult, TableReference};
+use datafusion_expr::expr::AggregateFunction;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_functions_aggregate::min_max::{max, min};
+use datafusion_functions_aggregate::sum::sum;
 use datafusion_optimizer::OptimizerRule;
 use std::collections::{HashMap, HashSet};
 
 use crate::model::pre_agg::{agg_needed_components, find_best_pre_agg, PreAggregation};
-use crate::optimizer::agg_rewrite::rewrite_agg_expr;
+
+// ── Aggregate expression rewriting ──────────────────────────────────────────
+
+/// Rewrite an aggregate expression to use pre-agg component columns.
+///
+/// For example:
+///   sum(orders.amount) → sum(orders.amount-sum)
+///   avg(orders.amount) → sum(orders.amount-sum) / sum(orders.amount-count)
+///   count(orders.amount) → sum(orders.amount-count)
+///   min(orders.amount) → min(orders.amount-min)
+///   max(orders.amount) → max(orders.amount-max)
+fn rewrite_agg_expr(expr: &Expr) -> Option<Expr> {
+    match expr {
+        Expr::AggregateFunction(agg) => rewrite_aggregate_function(agg),
+        Expr::Alias(alias) => {
+            let rewritten = rewrite_agg_expr(&alias.expr)?;
+            Some(rewritten.alias(&alias.name))
+        }
+        _ => None,
+    }
+}
+
+fn agg_rewrite_col_expr(name: &str) -> Expr {
+    Expr::Column(Column::from_name(name))
+}
+
+fn rewrite_aggregate_function(agg: &AggregateFunction) -> Option<Expr> {
+    let col_name = extract_agg_column_name(&agg.params.args[0])?;
+    let func_name = agg.func.name();
+
+    match func_name {
+        "sum" => {
+            let comp_col = PreAggregation::component_column(&col_name, "sum");
+            Some(sum(agg_rewrite_col_expr(&comp_col)))
+        }
+        "count" => {
+            let comp_col = PreAggregation::component_column(&col_name, "count");
+            Some(sum(agg_rewrite_col_expr(&comp_col)))
+        }
+        "min" => {
+            let comp_col = PreAggregation::component_column(&col_name, "min");
+            Some(min(agg_rewrite_col_expr(&comp_col)))
+        }
+        "max" => {
+            let comp_col = PreAggregation::component_column(&col_name, "max");
+            Some(max(agg_rewrite_col_expr(&comp_col)))
+        }
+        "avg" => {
+            let sum_col = PreAggregation::component_column(&col_name, "sum");
+            let count_col = PreAggregation::component_column(&col_name, "count");
+            Some(sum(agg_rewrite_col_expr(&sum_col)) / sum(agg_rewrite_col_expr(&count_col)))
+        }
+        _ => None,
+    }
+}
+
+fn extract_agg_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(col) => Some(col.name.clone()),
+        _ => None,
+    }
+}
 
 /// OptimizerRule that substitutes raw table scans with pre-aggregated tables
 /// when a suitable pre-aggregation exists.
@@ -290,7 +354,9 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
     use datafusion::prelude::{col, lit};
-    use datafusion_functions_aggregate::sum::sum;
+    use datafusion_functions_aggregate::average::avg;
+    use datafusion_functions_aggregate::count::count;
+    use datafusion_functions_aggregate::min_max::{max as max_fn, min as min_fn};
     use datafusion_optimizer::OptimizerContext;
     use std::sync::Arc;
 
@@ -520,5 +586,54 @@ mod tests {
             !pre_agg.covers(&group_by, &agg_components, &filter_cols),
             "Pre-agg should NOT cover plan with filter on non-group-by column"
         );
+    }
+
+    // ── agg rewrite tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_rewrite_sum() {
+        let expr = sum(agg_rewrite_col_expr("orders.amount"));
+        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let s = format!("{}", rewritten);
+        assert!(s.contains("orders.amount-sum"), "Got: {}", s);
+    }
+
+    #[test]
+    fn test_rewrite_count() {
+        let expr = count(agg_rewrite_col_expr("orders.amount"));
+        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let s = format!("{}", rewritten);
+        assert!(s.contains("orders.amount-count"), "Got: {}", s);
+    }
+
+    #[test]
+    fn test_rewrite_avg() {
+        let expr = avg(agg_rewrite_col_expr("orders.amount"));
+        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let s = format!("{}", rewritten);
+        assert!(s.contains("orders.amount-sum"), "Got: {}", s);
+        assert!(s.contains("orders.amount-count"), "Got: {}", s);
+    }
+
+    #[test]
+    fn test_rewrite_min() {
+        let expr = min_fn(agg_rewrite_col_expr("orders.amount"));
+        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let s = format!("{}", rewritten);
+        assert!(s.contains("orders.amount-min"), "Got: {}", s);
+    }
+
+    #[test]
+    fn test_rewrite_max() {
+        let expr = max_fn(agg_rewrite_col_expr("orders.amount"));
+        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let s = format!("{}", rewritten);
+        assert!(s.contains("orders.amount-max"), "Got: {}", s);
+    }
+
+    #[test]
+    fn test_non_agg_returns_none() {
+        let expr = agg_rewrite_col_expr("orders.amount");
+        assert!(rewrite_agg_expr(&expr).is_none());
     }
 }
