@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::*;
 use datafusion_functions_aggregate::sum::sum;
 use datasubway::data_model::DataModel;
-use datasubway::model::column_context;
+use datasubway::model::column_context::{allow, ColumnInput::*};
 use datasubway::model::joins::Join;
 use datasubway::model::query_context::QueryContext;
 
@@ -53,8 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dm.register_measure(
         "revenue",
         Arc::new(|qc, dm| {
-            let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups)
-                .map_err(|e| datafusion::common::DataFusionError::Plan(e))?;
+            let group_exprs = allow(&["*".into()], Columns(&qc.groups))?.into_exprs();
             dm.table("orders")?
                 .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
         }),

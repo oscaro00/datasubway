@@ -104,13 +104,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 4. Register measures ────────────────────────────────────────────
     // Measures are closures that build DataFusion DataFrames.
-    // allow_exprs("*", ...) includes only the columns present in the query
+    // allow("*", ...) includes only the columns present in the query
     // context, so the same measure works with any grouping.
     dm.register_measure(
         "revenue",
         Arc::new(|qc, dm| {
-            let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups)
-                .map_err(|e| datafusion::common::DataFusionError::Plan(e))?;
+            let group_exprs = column_context::allow(
+                &["*".into()], column_context::ColumnInput::Columns(&qc.groups)
+            )?.into_exprs();
             dm.table("orders")?
                 .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
         }),

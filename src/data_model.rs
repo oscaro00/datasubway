@@ -28,12 +28,11 @@ use crate::post_process;
 /// ```rust,ignore
 /// Arc::new(|qc: &QueryContext, dm: &DataModel| {
 ///     let table = dm.table("orders")?;
+///     let filter = allow(&["*".into()], ColumnInput::FilterTree(&qc.filters))?.into_filter_expr();
+///     let groups = allow(&["*".into()], ColumnInput::Columns(&qc.groups))?.into_exprs();
 ///     Ok(table
-///         .filter(allow("*", &qc.filter_columns())?)?
-///         .aggregate(
-///             allow_exprs(&["*".into()], &qc.groups)?,
-///             vec![sum(col("amount")).alias("revenue")],
-///         )?)
+///         .filter(filter)?
+///         .aggregate(groups, vec![sum(col("amount")).alias("revenue")])?)
 /// })
 /// ```
 pub type MeasureFn =
@@ -232,21 +231,21 @@ impl DataModel {
     }
 
     /// Access column_context::allow for use in measures.
-    pub fn allow_exprs(
+    pub fn allow(
         &self,
         patterns: &[String],
-        context: &[String],
-    ) -> Result<Vec<Expr>, String> {
-        column_context::allow_exprs(patterns, context)
+        input: column_context::ColumnInput,
+    ) -> Result<column_context::ColumnOutput, DataFusionError> {
+        column_context::allow(patterns, input)
     }
 
     /// Access column_context::exclude for use in measures.
-    pub fn exclude_exprs(
+    pub fn exclude(
         &self,
         patterns: &[String],
-        context: &[String],
-    ) -> Result<Vec<Expr>, String> {
-        column_context::exclude_exprs(patterns, context)
+        input: column_context::ColumnInput,
+    ) -> Result<column_context::ColumnOutput, DataFusionError> {
+        column_context::exclude(patterns, input)
     }
 
     /// Execute a query and return results as RecordBatches.
@@ -384,7 +383,7 @@ mod tests {
         dm.register_measure(
             "revenue",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                let group_exprs = column_context::allow(&["*".into()], column_context::ColumnInput::Columns(&qc.groups)).unwrap().into_exprs();
                 dm.table("orders")?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
             }),
@@ -417,7 +416,7 @@ mod tests {
         dm.register_measure(
             "revenue",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                let group_exprs = column_context::allow(&["*".into()], column_context::ColumnInput::Columns(&qc.groups)).unwrap().into_exprs();
                 dm.table("orders")?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
             }),
@@ -535,7 +534,7 @@ mod tests {
         dm.register_measure(
             "total_score",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                let group_exprs = column_context::allow(&["*".into()], column_context::ColumnInput::Columns(&qc.groups)).unwrap().into_exprs();
                 dm.table("player_stats")?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
             }),
@@ -633,7 +632,7 @@ mod tests {
         dm.register_measure(
             "total_score",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups).unwrap();
+                let group_exprs = column_context::allow(&["*".into()], column_context::ColumnInput::Columns(&qc.groups)).unwrap().into_exprs();
                 dm.table("player_stats")?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
             }),
