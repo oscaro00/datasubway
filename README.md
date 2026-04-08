@@ -25,6 +25,195 @@ The purpose of this library is to define a data model using python focusing on t
 
 
 
+## Example Usage
+
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::prelude::*;
+use datafusion_functions_aggregate::sum::sum;
+use datasubway::data_model::DataModel;
+use datasubway::model::column_context;
+use datasubway::model::joins::Join;
+use datasubway::model::pre_agg::PreAggregation;
+use datasubway::model::query_context::QueryContext;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut dm = DataModel::new()?;
+
+    // ── 1. Register tables ──────────────────────────────────────────────
+    let orders = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("customer_id", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["US", "EU", "US", "EU", "US"])),
+            Arc::new(Int64Array::from(vec![100, 200, 150, 250, 300])),
+            Arc::new(Int64Array::from(vec![1, 2, 1, 2, 1])),
+        ],
+    )?;
+
+    let customers = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+        ],
+    )?;
+
+    dm.register_record_batch("orders", orders)?;
+    dm.register_record_batch("customers", customers)?;
+
+    // You can also register from files:
+    // dm.register_parquet("orders", "data/orders.parquet")?;
+    // dm.register_csv("orders", "data/orders.csv")?;
+
+    // ── 2. Define joins ─────────────────────────────────────────────────
+    // direction: "right2left" means orders can reach customers (not reverse).
+    //            "both" allows traversal in either direction.
+    dm.set_joins(&[Join {
+        left: "orders".into(),
+        right: "customers".into(),
+        left_on: vec!["customer_id".into()],
+        right_on: vec!["id".into()],
+        how: "inner".into(),
+        direction: "right2left".into(),
+    }])?;
+
+    // ── 3. Define pre-aggregations (optional) ───────────────────────────
+    // Pre-aggregations store grouped results in local parquet files.
+    // The engine automatically picks the best one when it covers the query.
+    dm.set_pre_aggregations(vec![
+        PreAggregation::new(
+            "regional_revenue".into(),
+            vec!["orders.region".into()],
+            HashMap::from([
+                ("orders.amount".into(), vec!["sum".into(), "mean".into()]),
+            ]),
+            "_pre_aggregations/regional_revenue.parquet".into(),
+        )?,
+    ]);
+
+    // ── 4. Register measures ────────────────────────────────────────────
+    // Measures are closures that build DataFusion DataFrames.
+    // allow_exprs("*", ...) includes only the columns present in the query
+    // context, so the same measure works with any grouping.
+    dm.register_measure(
+        "revenue",
+        Arc::new(|qc, dm| {
+            let group_exprs = column_context::allow_exprs(&["*".into()], &qc.groups)
+                .map_err(|e| datafusion::common::DataFusionError::Plan(e))?;
+            dm.table("orders")?
+                .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+        }),
+    )?;
+
+    // ── 5. Query: call measures with a QueryContext ─────────────────────
+
+    // Simple: total revenue, no grouping
+    let qc = QueryContext::new(
+        vec!["revenue".into()],       // measures
+        None,                          // filters
+        None,                          // groups
+        None,                          // havings
+        None,                          // sorts
+        None,                          // limit (default 10000)
+        None,                          // offset
+        None,                          // use_pre_agg (default true)
+    )?;
+    let results = dm.query(&qc)?;
+
+    // Grouped by region, sorted descending
+    let qc = QueryContext::new(
+        vec!["revenue".into()],
+        None,
+        Some(vec!["orders.region".into()]),
+        None,
+        Some(vec![("revenue".into(), "desc".into())]),
+        None,
+        None,
+        None,
+    )?;
+    let results = dm.query(&qc)?;
+
+    // Cross-table grouping — the join is resolved automatically
+    let qc = QueryContext::new(
+        vec!["revenue".into()],
+        None,
+        Some(vec!["customers.name".into()]),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    let results = dm.query(&qc)?;
+
+    // With filters and havings
+    let qc = QueryContext::new(
+        vec!["revenue".into()],
+        Some(serde_json::json!({"AND": [["orders.region", "=", "US"]]})),
+        Some(vec!["customers.name".into()]),
+        Some(serde_json::json!({"AND": [["revenue", ">", 100]]})),
+        Some(vec![("revenue".into(), "desc".into())]),
+        Some(5),   // limit
+        Some(0),   // offset
+        None,
+    )?;
+    let results = dm.query(&qc)?;
+
+    for batch in &results {
+        println!("{:?}", batch);
+    }
+    Ok(())
+}
+```
+
+## Building, Testing, and Running
+
+```bash
+# Build the library and binary
+cargo build
+
+# Run all tests (unit tests are inline in each module)
+cargo test
+
+# Run the example binary (src/main.rs)
+cargo run
+
+# Type-check without producing artifacts (faster feedback loop)
+cargo check
+
+# Build with optimizations
+cargo build --release
+```
+
+### Running specific tests
+
+```bash
+# Run tests in a specific module
+cargo test --lib data_model
+cargo test --lib model::joins
+cargo test --lib model::pre_agg
+cargo test --lib model::query_context
+cargo test --lib model::column_context
+cargo test --lib optimizer
+
+# Run a single test by name
+cargo test test_auto_join
+
+# Show stdout from tests (println! output)
+cargo test -- --nocapture
+```
+
 ## Using as a Local Dependency
 
 To use `datasubway` as a dependency in another Rust project on your machine, add a path dependency to that project's `Cargo.toml`:
