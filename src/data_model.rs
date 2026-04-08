@@ -13,13 +13,13 @@ use datafusion::prelude::*;
 use tokio::runtime::Runtime;
 
 use crate::model::column_context;
+use crate::model::combine_measures;
 use crate::model::joins::{Join, JoinGraph, JoinHow};
 use crate::model::pre_agg::PreAggregation;
 use crate::model::query_context::{MeasureMetadata, QueryContext};
 use crate::optimizer::auto_join_rule::AutoJoinRule;
 use crate::optimizer::eliminate_unused_joins::EliminateUnusedJoins;
 use crate::optimizer::pre_agg_rule::PreAggSubstitution;
-use crate::post_process;
 
 /// A measure is a closure that takes a QueryContext and DataModel reference,
 /// and returns a DataFusion DataFrame.
@@ -300,8 +300,8 @@ impl DataModel {
             return Err(DataFusionError::Plan("No measure results produced".into()));
         }
 
-        // Post-process in Rust
-        post_process::post_process_measure_results(&self.rt, measure_batches, qc)
+        // Combine measures in Rust
+        combine_measures::combine_measure_results(&self.rt, measure_batches, qc)
     }
 }
 
@@ -381,7 +381,12 @@ mod tests {
         dm.register_measure(
             "revenue",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow(&["*".into()], column_context::ColumnInput::Columns(&qc.groups)).unwrap().into_exprs();
+                let group_exprs = column_context::allow(
+                    &["*".into()],
+                    column_context::ColumnInput::Columns(&qc.groups),
+                )
+                .unwrap()
+                .into_exprs();
                 dm.table("orders")?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
             }),
@@ -414,7 +419,12 @@ mod tests {
         dm.register_measure(
             "revenue",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow(&["*".into()], column_context::ColumnInput::Columns(&qc.groups)).unwrap().into_exprs();
+                let group_exprs = column_context::allow(
+                    &["*".into()],
+                    column_context::ColumnInput::Columns(&qc.groups),
+                )
+                .unwrap()
+                .into_exprs();
                 dm.table("orders")?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
             }),
@@ -532,7 +542,12 @@ mod tests {
         dm.register_measure(
             "total_score",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow(&["*".into()], column_context::ColumnInput::Columns(&qc.groups)).unwrap().into_exprs();
+                let group_exprs = column_context::allow(
+                    &["*".into()],
+                    column_context::ColumnInput::Columns(&qc.groups),
+                )
+                .unwrap()
+                .into_exprs();
                 dm.table("player_stats")?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
             }),
@@ -630,7 +645,12 @@ mod tests {
         dm.register_measure(
             "total_score",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow(&["*".into()], column_context::ColumnInput::Columns(&qc.groups)).unwrap().into_exprs();
+                let group_exprs = column_context::allow(
+                    &["*".into()],
+                    column_context::ColumnInput::Columns(&qc.groups),
+                )
+                .unwrap()
+                .into_exprs();
                 dm.table("player_stats")?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
             }),

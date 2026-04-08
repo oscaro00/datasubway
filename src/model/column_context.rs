@@ -209,8 +209,8 @@ pub fn exclude(patterns: &[String], input: ColumnInput) -> Result<ColumnOutput, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ColumnInput::*;
     use serde_json::json;
+    use ColumnInput::*;
 
     fn sample_context() -> Vec<String> {
         vec![
@@ -227,43 +227,57 @@ mod tests {
 
     #[test]
     fn test_allow_wildcard() {
-        let result = allow(&["*".into()], Columns(&sample_context())).unwrap().into_exprs();
+        let result = allow(&["*".into()], Columns(&sample_context()))
+            .unwrap()
+            .into_exprs();
         assert_eq!(result.len(), 6);
     }
 
     #[test]
     fn test_allow_table_wildcard() {
-        let result = allow(&["orders.*".into()], Columns(&sample_context())).unwrap().into_exprs();
+        let result = allow(&["orders.*".into()], Columns(&sample_context()))
+            .unwrap()
+            .into_exprs();
         assert_eq!(result.len(), 3);
     }
 
     #[test]
     fn test_allow_column_wildcard() {
-        let result = allow(&["*.country".into()], Columns(&sample_context())).unwrap().into_exprs();
+        let result = allow(&["*.country".into()], Columns(&sample_context()))
+            .unwrap()
+            .into_exprs();
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_allow_exact() {
-        let result = allow(&["orders.amount".into()], Columns(&sample_context())).unwrap().into_exprs();
+        let result = allow(&["orders.amount".into()], Columns(&sample_context()))
+            .unwrap()
+            .into_exprs();
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_exclude_table_wildcard() {
-        let result = exclude(&["orders.*".into()], Columns(&sample_context())).unwrap().into_exprs();
+        let result = exclude(&["orders.*".into()], Columns(&sample_context()))
+            .unwrap()
+            .into_exprs();
         assert_eq!(result.len(), 3);
     }
 
     #[test]
     fn test_exclude_wildcard() {
-        let result = exclude(&["*".into()], Columns(&sample_context())).unwrap().into_exprs();
+        let result = exclude(&["*".into()], Columns(&sample_context()))
+            .unwrap()
+            .into_exprs();
         assert_eq!(result.len(), 0);
     }
 
     #[test]
     fn test_allow_no_match() {
-        let result = allow(&["nonexistent.*".into()], Columns(&sample_context())).unwrap().into_exprs();
+        let result = allow(&["nonexistent.*".into()], Columns(&sample_context()))
+            .unwrap()
+            .into_exprs();
         assert_eq!(result.len(), 0);
     }
 
@@ -292,10 +306,20 @@ mod tests {
             ["orders.region", "=", "US"],
             ["customers.name", "=", "Bob"]
         ]});
-        let expr = allow(&["orders.*".into()], FilterTree(&tree)).unwrap().into_filter_expr();
+        let expr = allow(&["orders.*".into()], FilterTree(&tree))
+            .unwrap()
+            .into_filter_expr();
         let s = format!("{}", expr);
-        assert!(s.contains("orders.region"), "Expected orders.region in: {}", s);
-        assert!(!s.contains("customers.name"), "Should not contain customers.name in: {}", s);
+        assert!(
+            s.contains("orders.region"),
+            "Expected orders.region in: {}",
+            s
+        );
+        assert!(
+            !s.contains("customers.name"),
+            "Should not contain customers.name in: {}",
+            s
+        );
     }
 
     #[test]
@@ -304,10 +328,20 @@ mod tests {
             ["orders.region", "=", "US"],
             ["customers.name", "=", "Bob"]
         ]});
-        let expr = exclude(&["orders.*".into()], FilterTree(&tree)).unwrap().into_filter_expr();
+        let expr = exclude(&["orders.*".into()], FilterTree(&tree))
+            .unwrap()
+            .into_filter_expr();
         let s = format!("{}", expr);
-        assert!(!s.contains("orders.region"), "Should not contain orders.region in: {}", s);
-        assert!(s.contains("customers.name"), "Expected customers.name in: {}", s);
+        assert!(
+            !s.contains("orders.region"),
+            "Should not contain orders.region in: {}",
+            s
+        );
+        assert!(
+            s.contains("customers.name"),
+            "Expected customers.name in: {}",
+            s
+        );
     }
 
     #[test]
@@ -315,9 +349,15 @@ mod tests {
         let tree = json!({"AND": [
             ["customers.name", "=", "Bob"]
         ]});
-        let expr = allow(&["orders.*".into()], FilterTree(&tree)).unwrap().into_filter_expr();
+        let expr = allow(&["orders.*".into()], FilterTree(&tree))
+            .unwrap()
+            .into_filter_expr();
         let s = format!("{}", expr);
-        assert!(s.contains("true"), "All pruned should return lit(true), got: {}", s);
+        assert!(
+            s.contains("true"),
+            "All pruned should return lit(true), got: {}",
+            s
+        );
     }
 
     #[test]
@@ -329,11 +369,25 @@ mod tests {
                 ["customers.country", "=", "CA"]
             ]}
         ]});
-        let expr = allow(&["orders.*".into()], FilterTree(&tree)).unwrap().into_filter_expr();
+        let expr = allow(&["orders.*".into()], FilterTree(&tree))
+            .unwrap()
+            .into_filter_expr();
         let s = format!("{}", expr);
-        assert!(s.contains("orders.region"), "Expected orders.region in: {}", s);
-        assert!(s.contains("orders.amount"), "Expected orders.amount in: {}", s);
-        assert!(!s.contains("customers.country"), "Should not contain customers.country in: {}", s);
+        assert!(
+            s.contains("orders.region"),
+            "Expected orders.region in: {}",
+            s
+        );
+        assert!(
+            s.contains("orders.amount"),
+            "Expected orders.amount in: {}",
+            s
+        );
+        assert!(
+            !s.contains("customers.country"),
+            "Should not contain customers.country in: {}",
+            s
+        );
     }
 
     #[test]
@@ -342,9 +396,19 @@ mod tests {
             ["orders.region", "=", "US"],
             ["customers.name", "=", "Bob"]
         ]});
-        let expr = allow(&["*".into()], FilterTree(&tree)).unwrap().into_filter_expr();
+        let expr = allow(&["*".into()], FilterTree(&tree))
+            .unwrap()
+            .into_filter_expr();
         let s = format!("{}", expr);
-        assert!(s.contains("orders.region"), "Expected orders.region in: {}", s);
-        assert!(s.contains("customers.name"), "Expected customers.name in: {}", s);
+        assert!(
+            s.contains("orders.region"),
+            "Expected orders.region in: {}",
+            s
+        );
+        assert!(
+            s.contains("customers.name"),
+            "Expected customers.name in: {}",
+            s
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Post-processing of measure results: joining, havings, sorting, limit/offset.
+//! Combining measure results: joining, havings, sorting, limit/offset.
 //!
 //! After each measure produces Arrow RecordBatches, this module combines them
 //! into a single result table using DataFusion for joins, filtering, and sorting.
@@ -15,7 +15,7 @@ use tokio::runtime::Runtime;
 use crate::model::filter_tree::filter_tree_to_expr;
 use crate::model::query_context::QueryContext;
 
-/// Post-process multiple measure results into a single final result.
+/// Combine multiple measure results into a single final result.
 ///
 /// Steps:
 /// 1. Register each measure's batches in a temp SessionContext
@@ -23,15 +23,15 @@ use crate::model::query_context::QueryContext;
 /// 3. Apply having filters
 /// 4. Apply sorts
 /// 5. Apply offset + limit
-pub fn post_process_measure_results(
+pub fn combine_measure_results(
     rt: &Runtime,
     measure_batches: Vec<(&str, Vec<RecordBatch>)>,
     qc: &QueryContext,
 ) -> Result<Vec<RecordBatch>, DataFusionError> {
-    rt.block_on(async { post_process_measure_results_async(measure_batches, qc).await })
+    rt.block_on(async { combine_measure_results_async(measure_batches, qc).await })
 }
 
-async fn post_process_measure_results_async(
+async fn combine_measure_results_async(
     measure_batches: Vec<(&str, Vec<RecordBatch>)>,
     qc: &QueryContext,
 ) -> Result<Vec<RecordBatch>, DataFusionError> {
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_process_single_measure() {
+    fn test_combine_single_measure() {
         let rt = Runtime::new().unwrap();
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("revenue", arrow::datatypes::DataType::Int64, false),
@@ -216,15 +216,14 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            post_process_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
+        let result = combine_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
     }
 
     #[test]
-    fn test_post_process_with_having() {
+    fn test_combine_with_having() {
         let rt = Runtime::new().unwrap();
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
@@ -252,15 +251,14 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            post_process_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
+        let result = combine_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
 
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
 
     #[test]
-    fn test_post_process_with_sort() {
+    fn test_combine_with_sort() {
         let rt = Runtime::new().unwrap();
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
@@ -287,8 +285,7 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            post_process_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
+        let result = combine_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
 
         assert_eq!(result.len(), 1);
         let col = result[0]
@@ -302,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_process_with_limit_offset() {
+    fn test_combine_with_limit_offset() {
         let rt = Runtime::new().unwrap();
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
@@ -329,8 +326,7 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            post_process_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
+        let result = combine_measure_results(&rt, vec![("revenue", vec![batch])], &qc).unwrap();
 
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
@@ -344,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_process_multi_measure_no_groups() {
+    fn test_combine_multi_measure_no_groups() {
         let rt = Runtime::new().unwrap();
 
         let schema1 = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -377,7 +373,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = post_process_measure_results(
+        let result = combine_measure_results(
             &rt,
             vec![("revenue", vec![batch1]), ("total_quantity", vec![batch2])],
             &qc,
@@ -389,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_process_multi_measure_with_groups() {
+    fn test_combine_multi_measure_with_groups() {
         let rt = Runtime::new().unwrap();
 
         let schema1 = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -430,7 +426,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = post_process_measure_results(
+        let result = combine_measure_results(
             &rt,
             vec![("revenue", vec![batch1]), ("total_quantity", vec![batch2])],
             &qc,
