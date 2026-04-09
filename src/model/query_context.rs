@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::data_model::AllowExcludeRecord;
+
 /// Validated query context — mirrors the Python QueryContext but validated in Rust.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryContext {
@@ -135,6 +137,8 @@ impl QueryContext {
 pub struct MeasureMetadata {
     pub name: String,
     pub output_columns: Vec<String>,
+    pub aggregate_columns: Vec<String>,
+    pub allow_exclude_calls: Vec<AllowExcludeRecord>,
 }
 
 fn extract_columns_from_filter_tree(value: &serde_json::Value) -> Vec<String> {
@@ -213,6 +217,8 @@ mod tests {
         MeasureMetadata {
             name: name.into(),
             output_columns: output_cols.iter().map(|s| s.to_string()).collect(),
+            aggregate_columns: Vec::new(),
+            allow_exclude_calls: Vec::new(),
         }
     }
 

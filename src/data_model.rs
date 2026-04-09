@@ -4,12 +4,13 @@
 //! DataFusion DataFrames using `allow()`/`exclude()` from `column_context`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use datafusion::common::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::*;
+use datafusion_expr::LogicalPlan;
 use tokio::runtime::Runtime;
 
 use crate::model::column_context;
@@ -21,22 +22,75 @@ use crate::optimizer::auto_join_rule::AutoJoinRule;
 use crate::optimizer::eliminate_joins_rule::EliminateUnusedJoins;
 use crate::optimizer::pre_agg_rule::PreAggSubstitution;
 
+/// Records a single `allow()`/`exclude()` call made during measure probing.
+#[derive(Debug, Clone)]
+pub struct AllowExcludeRecord {
+    pub kind: AllowExcludeKind,
+    pub patterns: Vec<String>,
+    pub input_type: ColumnInputType,
+    pub columns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AllowExcludeKind {
+    Allow,
+    Exclude,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnInputType {
+    Columns,
+    FilterTree,
+}
+
 /// A measure is a closure that takes a QueryContext and DataModel reference,
 /// and returns a DataFusion DataFrame.
 ///
-/// Measures use the DataFusion DataFrame API with `allow()`/`exclude()`:
+/// Measures should use `dm.allow()`/`dm.exclude()` (not `column_context::allow/exclude` directly)
+/// so that probe recording captures the call metadata.
+///
 /// ```rust,ignore
 /// Arc::new(|qc: &QueryContext, dm: &DataModel| {
-///     let table = dm.table("orders")?;
-///     let filter = allow(&["*".into()], ColumnInput::FilterTree(&qc.filters))?.into_filter_expr();
-///     let groups = allow(&["*".into()], ColumnInput::Columns(&qc.groups))?.into_exprs();
-///     Ok(table
+///     let filter = dm.allow(&["*".into()], ColumnInput::FilterTree(&qc.filters), None)?.into_filter_expr();
+///     let groups = dm.allow(&["*".into()], ColumnInput::Columns(&qc.groups), None)?.into_exprs();
+///     dm.table("orders")?
 ///         .filter(filter)?
-///         .aggregate(groups, vec![sum(col("amount")).alias("revenue")])?)
+///         .aggregate(groups, vec![sum(col("amount")).alias("revenue")])
 /// })
 /// ```
 pub type MeasureFn =
     Arc<dyn Fn(&QueryContext, &DataModel) -> Result<DataFrame, DataFusionError> + Send + Sync>;
+
+/// Extract aggregate column names from the outermost Aggregate node in the plan.
+///
+/// Only the final (outermost) aggregate matters — inner aggregates are not
+/// traversed. Returns the output names (aliases) of `aggr_expr` entries.
+fn extract_outermost_aggregate_columns(plan: &LogicalPlan) -> Vec<String> {
+    match plan {
+        LogicalPlan::Aggregate(agg) => agg
+            .aggr_expr
+            .iter()
+            .filter_map(extract_expr_output_name)
+            .collect(),
+        _ => {
+            for child in plan.inputs() {
+                let result = extract_outermost_aggregate_columns(child);
+                if !result.is_empty() {
+                    return result;
+                }
+            }
+            vec![]
+        }
+    }
+}
+
+fn extract_expr_output_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Alias(alias) => Some(alias.name.clone()),
+        Expr::Column(col) => Some(col.name.clone()),
+        _ => Some(format!("{}", expr)),
+    }
+}
 
 /// Standalone Rust semantic layer model backed by DataFusion.
 ///
@@ -47,8 +101,9 @@ pub struct DataModel {
     join_graph: Option<JoinGraph>,
     table_schemas: HashMap<String, Vec<String>>,
     measures: HashMap<String, MeasureFn>,
-    measure_output_cols: HashMap<String, Vec<String>>,
+    measure_metadata: HashMap<String, MeasureMetadata>,
     pre_agg_objects: Vec<PreAggregation>,
+    probe_recorder: Option<Arc<Mutex<Vec<AllowExcludeRecord>>>>,
 }
 
 impl DataModel {
@@ -61,8 +116,9 @@ impl DataModel {
             join_graph: None,
             table_schemas: HashMap::new(),
             measures: HashMap::new(),
-            measure_output_cols: HashMap::new(),
+            measure_metadata: HashMap::new(),
             pre_agg_objects: Vec::new(),
+            probe_recorder: None,
         })
     }
 
@@ -140,13 +196,14 @@ impl DataModel {
 
     /// Register a measure function.
     ///
-    /// The measure is probed with an empty QueryContext to extract output columns.
+    /// The measure is probed with an empty QueryContext to extract output columns,
+    /// classify aggregate vs group-by columns, and record allow/exclude call metadata.
     pub fn register_measure(
         &mut self,
         name: &str,
         measure_fn: MeasureFn,
     ) -> Result<(), DataFusionError> {
-        // Probe with empty context to extract output columns
+        // Probe with empty context to extract metadata
         let probe_qc = QueryContext::new(
             vec![name.to_string()],
             None,
@@ -159,7 +216,13 @@ impl DataModel {
         )
         .map_err(|e| DataFusionError::Plan(e))?;
 
+        // Enable recording
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        self.probe_recorder = Some(recorder.clone());
+
         let mut output_cols = Vec::new();
+        let mut aggregate_cols = Vec::new();
+
         if let Ok(df) = measure_fn(&probe_qc, self) {
             output_cols = df
                 .schema()
@@ -167,11 +230,24 @@ impl DataModel {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect();
+            aggregate_cols = extract_outermost_aggregate_columns(df.logical_plan());
         }
 
+        // Collect recordings and disable
+        let calls = Arc::try_unwrap(recorder)
+            .map(|mutex| mutex.into_inner().unwrap())
+            .unwrap_or_default();
+        self.probe_recorder = None;
+
+        let metadata = MeasureMetadata {
+            name: name.to_string(),
+            output_columns: output_cols,
+            aggregate_columns: aggregate_cols,
+            allow_exclude_calls: calls,
+        };
+
         self.measures.insert(name.to_string(), measure_fn);
-        self.measure_output_cols
-            .insert(name.to_string(), output_cols);
+        self.measure_metadata.insert(name.to_string(), metadata);
         Ok(())
     }
 
@@ -227,22 +303,48 @@ impl DataModel {
         &self.ctx
     }
 
-    /// Access column_context::allow for use in measures.
+    /// Apply `allow()` column context. Use this in measure closures instead of
+    /// calling `column_context::allow` directly so that probe recording works.
     pub fn allow(
         &self,
         patterns: &[String],
         input: column_context::ColumnInput,
+        columns: Option<&[String]>,
     ) -> Result<column_context::ColumnOutput, DataFusionError> {
-        column_context::allow(patterns, input)
+        if let Some(ref recorder) = self.probe_recorder {
+            recorder.lock().unwrap().push(AllowExcludeRecord {
+                kind: AllowExcludeKind::Allow,
+                patterns: patterns.to_vec(),
+                input_type: match &input {
+                    column_context::ColumnInput::Columns(_) => ColumnInputType::Columns,
+                    column_context::ColumnInput::FilterTree(_) => ColumnInputType::FilterTree,
+                },
+                columns: columns.map(|c| c.to_vec()),
+            });
+        }
+        column_context::allow(patterns, input, columns)
     }
 
-    /// Access column_context::exclude for use in measures.
+    /// Apply `exclude()` column context. Use this in measure closures instead of
+    /// calling `column_context::exclude` directly so that probe recording works.
     pub fn exclude(
         &self,
         patterns: &[String],
         input: column_context::ColumnInput,
+        columns: Option<&[String]>,
     ) -> Result<column_context::ColumnOutput, DataFusionError> {
-        column_context::exclude(patterns, input)
+        if let Some(ref recorder) = self.probe_recorder {
+            recorder.lock().unwrap().push(AllowExcludeRecord {
+                kind: AllowExcludeKind::Exclude,
+                patterns: patterns.to_vec(),
+                input_type: match &input {
+                    column_context::ColumnInput::Columns(_) => ColumnInputType::Columns,
+                    column_context::ColumnInput::FilterTree(_) => ColumnInputType::FilterTree,
+                },
+                columns: columns.map(|c| c.to_vec()),
+            });
+        }
+        column_context::exclude(patterns, input, columns)
     }
 
     /// Validate the QueryContext, register optimizer rules, and build a
@@ -253,16 +355,9 @@ impl DataModel {
     ) -> Result<Vec<(String, DataFrame)>, DataFusionError> {
         // Validate
         let measure_metadata: Vec<MeasureMetadata> = self
-            .measures
-            .keys()
-            .map(|name| MeasureMetadata {
-                name: name.clone(),
-                output_columns: self
-                    .measure_output_cols
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_default(),
-            })
+            .measure_metadata
+            .values()
+            .cloned()
             .collect();
         let all_cols: HashSet<String> = self.all_columns().into_iter().collect();
         qc.validate(&measure_metadata, &all_cols)
@@ -410,12 +505,13 @@ mod tests {
         dm.register_measure(
             "revenue",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow(
-                    &["*".into()],
-                    column_context::ColumnInput::Columns(&qc.groups),
-                )
-                .unwrap()
-                .into_exprs();
+                let group_exprs = dm
+                    .allow(
+                        &["*".into()],
+                        column_context::ColumnInput::Columns(&qc.groups),
+                        None,
+                    )?
+                    .into_exprs();
                 dm.table("orders")?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
             }),
@@ -448,12 +544,13 @@ mod tests {
         dm.register_measure(
             "revenue",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow(
-                    &["*".into()],
-                    column_context::ColumnInput::Columns(&qc.groups),
-                )
-                .unwrap()
-                .into_exprs();
+                let group_exprs = dm
+                    .allow(
+                        &["*".into()],
+                        column_context::ColumnInput::Columns(&qc.groups),
+                        None,
+                    )?
+                    .into_exprs();
                 dm.table("orders")?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
             }),
@@ -571,12 +668,13 @@ mod tests {
         dm.register_measure(
             "total_score",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow(
-                    &["*".into()],
-                    column_context::ColumnInput::Columns(&qc.groups),
-                )
-                .unwrap()
-                .into_exprs();
+                let group_exprs = dm
+                    .allow(
+                        &["*".into()],
+                        column_context::ColumnInput::Columns(&qc.groups),
+                        None,
+                    )?
+                    .into_exprs();
                 dm.table("player_stats")?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
             }),
@@ -674,12 +772,13 @@ mod tests {
         dm.register_measure(
             "total_score",
             Arc::new(|qc, dm| {
-                let group_exprs = column_context::allow(
-                    &["*".into()],
-                    column_context::ColumnInput::Columns(&qc.groups),
-                )
-                .unwrap()
-                .into_exprs();
+                let group_exprs = dm
+                    .allow(
+                        &["*".into()],
+                        column_context::ColumnInput::Columns(&qc.groups),
+                        None,
+                    )?
+                    .into_exprs();
                 dm.table("player_stats")?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
             }),

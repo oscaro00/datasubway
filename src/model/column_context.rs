@@ -156,17 +156,101 @@ fn prune_condition(
     }
 }
 
+/// Merge conditions from the original tree whose column is in `explicit` into `pruned`.
+///
+/// Walks both trees in parallel. For each AND/OR key, any leaf condition from `original`
+/// whose column is in `explicit` but missing from `pruned` is added.
+fn include_explicit_columns(
+    original: &serde_json::Value,
+    pruned: &serde_json::Value,
+    explicit: &std::collections::HashSet<&str>,
+) -> serde_json::Value {
+    if explicit.is_empty() {
+        return pruned.clone();
+    }
+    match (original, pruned) {
+        (serde_json::Value::Object(orig_map), serde_json::Value::Object(pruned_map)) => {
+            let mut result = pruned_map.clone();
+            for (key, orig_conditions) in orig_map {
+                if let Some(orig_arr) = orig_conditions.as_array() {
+                    let pruned_arr = result
+                        .get(key)
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let mut merged = pruned_arr.clone();
+                    for cond in orig_arr {
+                        match cond {
+                            serde_json::Value::Array(leaf) if leaf.len() >= 3 => {
+                                if let Some(col_name) = leaf[0].as_str() {
+                                    if explicit.contains(col_name)
+                                        && !pruned_arr.contains(cond)
+                                    {
+                                        merged.push(cond.clone());
+                                    }
+                                }
+                            }
+                            serde_json::Value::Object(_) => {
+                                // Nested filter tree — recurse
+                                let empty_obj =
+                                    serde_json::Value::Object(serde_json::Map::new());
+                                let pruned_nested = pruned_arr
+                                    .iter()
+                                    .find(|p| p.is_object())
+                                    .unwrap_or(&empty_obj);
+                                let merged_nested =
+                                    include_explicit_columns(cond, pruned_nested, explicit);
+                                if !merged_nested
+                                    .as_object()
+                                    .map_or(true, |m| m.is_empty())
+                                {
+                                    // Replace or add the nested object
+                                    if let Some(idx) = merged.iter().position(|p| p.is_object()) {
+                                        merged[idx] = merged_nested;
+                                    } else {
+                                        merged.push(merged_nested);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !merged.is_empty() {
+                        result.insert(key.clone(), serde_json::Value::Array(merged));
+                    }
+                }
+            }
+            serde_json::Value::Object(result)
+        }
+        _ => pruned.clone(),
+    }
+}
+
 /// Return matching columns as expressions, or prune a filter tree to matching conditions.
 ///
-/// - `ColumnInput::Columns`: returns `ColumnOutput::Exprs` with col() expressions for columns matching the patterns
-/// - `ColumnInput::FilterTree`: returns `ColumnOutput::FilterExpr` with an Expr built from the pruned filter tree
-pub fn allow(patterns: &[String], input: ColumnInput) -> Result<ColumnOutput, DataFusionError> {
+/// - `ColumnInput::Columns`: returns `ColumnOutput::Exprs` with col() expressions for columns matching the patterns,
+///   plus any explicitly listed `columns` (always included).
+/// - `ColumnInput::FilterTree`: returns `ColumnOutput::FilterExpr` with an Expr built from the pruned filter tree,
+///   also keeping conditions whose column is in `columns`.
+///
+/// Use `DataModel::allow()` instead of calling this directly so that probe recording works.
+pub(crate) fn allow(
+    patterns: &[String],
+    input: ColumnInput,
+    columns: Option<&[String]>,
+) -> Result<ColumnOutput, DataFusionError> {
     let parsed = parse_patterns(patterns)?;
+    let explicit: std::collections::HashSet<&str> = columns
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     match input {
         ColumnInput::Columns(context) => {
             let cols: Vec<String> = context
                 .iter()
-                .filter(|c| matches_any(c, &parsed))
+                .filter(|c| matches_any(c, &parsed) || explicit.contains(c.as_str()))
                 .cloned()
                 .collect();
             Ok(ColumnOutput::Exprs(
@@ -175,6 +259,7 @@ pub fn allow(patterns: &[String], input: ColumnInput) -> Result<ColumnOutput, Da
         }
         ColumnInput::FilterTree(tree) => {
             let pruned = prune_filter_tree(tree, &parsed, false);
+            let pruned = include_explicit_columns(tree, &pruned, &explicit);
             let expr = filter_tree_to_expr(&pruned)?;
             Ok(ColumnOutput::FilterExpr(expr))
         }
@@ -183,15 +268,28 @@ pub fn allow(patterns: &[String], input: ColumnInput) -> Result<ColumnOutput, Da
 
 /// Return non-matching columns as expressions, or prune a filter tree to non-matching conditions.
 ///
-/// - `ColumnInput::Columns`: returns `ColumnOutput::Exprs` with col() expressions for columns NOT matching the patterns
-/// - `ColumnInput::FilterTree`: returns `ColumnOutput::FilterExpr` with an Expr built from conditions whose columns do NOT match
-pub fn exclude(patterns: &[String], input: ColumnInput) -> Result<ColumnOutput, DataFusionError> {
+/// - `ColumnInput::Columns`: returns `ColumnOutput::Exprs` with col() expressions for columns NOT matching the patterns,
+///   plus any explicitly listed `columns` (always included).
+/// - `ColumnInput::FilterTree`: returns `ColumnOutput::FilterExpr` with an Expr built from conditions whose columns do NOT match,
+///   also keeping conditions whose column is in `columns`.
+///
+/// Use `DataModel::exclude()` instead of calling this directly so that probe recording works.
+pub(crate) fn exclude(
+    patterns: &[String],
+    input: ColumnInput,
+    columns: Option<&[String]>,
+) -> Result<ColumnOutput, DataFusionError> {
     let parsed = parse_patterns(patterns)?;
+    let explicit: std::collections::HashSet<&str> = columns
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     match input {
         ColumnInput::Columns(context) => {
             let cols: Vec<String> = context
                 .iter()
-                .filter(|c| !matches_any(c, &parsed))
+                .filter(|c| !matches_any(c, &parsed) || explicit.contains(c.as_str()))
                 .cloned()
                 .collect();
             Ok(ColumnOutput::Exprs(
@@ -200,6 +298,7 @@ pub fn exclude(patterns: &[String], input: ColumnInput) -> Result<ColumnOutput, 
         }
         ColumnInput::FilterTree(tree) => {
             let pruned = prune_filter_tree(tree, &parsed, true);
+            let pruned = include_explicit_columns(tree, &pruned, &explicit);
             let expr = filter_tree_to_expr(&pruned)?;
             Ok(ColumnOutput::FilterExpr(expr))
         }
@@ -227,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_allow_wildcard() {
-        let result = allow(&["*".into()], Columns(&sample_context()))
+        let result = allow(&["*".into()], Columns(&sample_context()), None)
             .unwrap()
             .into_exprs();
         assert_eq!(result.len(), 6);
@@ -235,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_allow_table_wildcard() {
-        let result = allow(&["orders.*".into()], Columns(&sample_context()))
+        let result = allow(&["orders.*".into()], Columns(&sample_context()), None)
             .unwrap()
             .into_exprs();
         assert_eq!(result.len(), 3);
@@ -243,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_allow_column_wildcard() {
-        let result = allow(&["*.country".into()], Columns(&sample_context()))
+        let result = allow(&["*.country".into()], Columns(&sample_context()), None)
             .unwrap()
             .into_exprs();
         assert_eq!(result.len(), 1);
@@ -251,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_allow_exact() {
-        let result = allow(&["orders.amount".into()], Columns(&sample_context()))
+        let result = allow(&["orders.amount".into()], Columns(&sample_context()), None)
             .unwrap()
             .into_exprs();
         assert_eq!(result.len(), 1);
@@ -259,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_exclude_table_wildcard() {
-        let result = exclude(&["orders.*".into()], Columns(&sample_context()))
+        let result = exclude(&["orders.*".into()], Columns(&sample_context()), None)
             .unwrap()
             .into_exprs();
         assert_eq!(result.len(), 3);
@@ -267,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_exclude_wildcard() {
-        let result = exclude(&["*".into()], Columns(&sample_context()))
+        let result = exclude(&["*".into()], Columns(&sample_context()), None)
             .unwrap()
             .into_exprs();
         assert_eq!(result.len(), 0);
@@ -275,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_allow_no_match() {
-        let result = allow(&["nonexistent.*".into()], Columns(&sample_context()))
+        let result = allow(&["nonexistent.*".into()], Columns(&sample_context()), None)
             .unwrap()
             .into_exprs();
         assert_eq!(result.len(), 0);
@@ -286,6 +385,7 @@ mod tests {
         let result = allow(
             &["orders.region".into(), "customers.name".into()],
             Columns(&sample_context()),
+            None,
         )
         .unwrap()
         .into_exprs();
@@ -306,7 +406,7 @@ mod tests {
             ["orders.region", "=", "US"],
             ["customers.name", "=", "Bob"]
         ]});
-        let expr = allow(&["orders.*".into()], FilterTree(&tree))
+        let expr = allow(&["orders.*".into()], FilterTree(&tree), None)
             .unwrap()
             .into_filter_expr();
         let s = format!("{}", expr);
@@ -328,7 +428,7 @@ mod tests {
             ["orders.region", "=", "US"],
             ["customers.name", "=", "Bob"]
         ]});
-        let expr = exclude(&["orders.*".into()], FilterTree(&tree))
+        let expr = exclude(&["orders.*".into()], FilterTree(&tree), None)
             .unwrap()
             .into_filter_expr();
         let s = format!("{}", expr);
@@ -349,7 +449,7 @@ mod tests {
         let tree = json!({"AND": [
             ["customers.name", "=", "Bob"]
         ]});
-        let expr = allow(&["orders.*".into()], FilterTree(&tree))
+        let expr = allow(&["orders.*".into()], FilterTree(&tree), None)
             .unwrap()
             .into_filter_expr();
         let s = format!("{}", expr);
@@ -369,7 +469,7 @@ mod tests {
                 ["customers.country", "=", "CA"]
             ]}
         ]});
-        let expr = allow(&["orders.*".into()], FilterTree(&tree))
+        let expr = allow(&["orders.*".into()], FilterTree(&tree), None)
             .unwrap()
             .into_filter_expr();
         let s = format!("{}", expr);
@@ -396,7 +496,7 @@ mod tests {
             ["orders.region", "=", "US"],
             ["customers.name", "=", "Bob"]
         ]});
-        let expr = allow(&["*".into()], FilterTree(&tree))
+        let expr = allow(&["*".into()], FilterTree(&tree), None)
             .unwrap()
             .into_filter_expr();
         let s = format!("{}", expr);
