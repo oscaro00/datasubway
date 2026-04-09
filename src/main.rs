@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -7,6 +8,7 @@ use datafusion_functions_aggregate::sum::sum;
 use datasubway::data_model::DataModel;
 use datasubway::model::column_context::ColumnInput::*;
 use datasubway::model::joins::{Join, JoinDirection, JoinHow};
+use datasubway::model::pre_agg::PreAggregation;
 use datasubway::model::query_context::QueryContext;
 use serde_json::json;
 
@@ -80,6 +82,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for batch in &results {
         println!("{:?}", batch);
     }
+
+    // ── Pre-aggregation demo ────────────────────────────────────────────
+    //
+    // Pre-aggregations store grouped results in local parquet files.
+    // The optimizer automatically rewrites queries to use them when they
+    // cover the requested group-by columns and aggregations.
+
+    println!("\n=== Pre-Aggregation Demo ===\n");
+
+    // Build a pre-aggregated RecordBatch with component columns.
+    // This represents a pre-computed "revenue by region" summary.
+    let preagg_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount-sum", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["EU", "US"])),
+            Arc::new(Int64Array::from(vec![450, 550])), // pre-computed sums
+        ],
+    )?;
+
+    // Write to a temp parquet file
+    let tmp_dir = std::env::temp_dir().join("datasubway_demo");
+    std::fs::create_dir_all(&tmp_dir)?;
+    let preagg_path = tmp_dir.join("regional_revenue.parquet");
+    {
+        let file = std::fs::File::create(&preagg_path)?;
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, preagg_batch.schema(), None)?;
+        writer.write(&preagg_batch)?;
+        writer.close()?;
+    }
+
+    // Register the pre-agg parquet and set up the PreAggregation metadata
+    dm.register_parquet("regional_revenue_preagg", preagg_path.to_str().unwrap())?;
+
+    let mut pa = PreAggregation::new(
+        "regional_revenue_preagg".into(),
+        vec!["region".into()],
+        HashMap::from([("amount".into(), vec!["sum".into()])]),
+        preagg_path.to_str().unwrap().into(),
+    )
+    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    pa.row_count = 2;
+
+    dm.set_pre_aggregations(vec![pa]);
+
+    // Query revenue grouped by region — the optimizer should use the pre-agg
+    let qc_preagg = QueryContext::new(
+        vec!["revenue".into()],
+        None,
+        Some(vec!["orders.region".into()]),
+        None,
+        Some(vec![("orders.region".into(), "asc".into())]),
+        None,
+        None,
+        None, // use_pre_agg defaults to true
+    )?;
+
+    // Show the explain plan — should reference the pre-agg table
+    println!("Explain plan (pre-agg enabled):");
+    let explain_df = dm.explain(&qc_preagg, false, false)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let explain_batches = rt.block_on(async { explain_df.collect().await })?;
+    for batch in &explain_batches {
+        let plan_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            println!("  {}", plan_col.value(i));
+        }
+    }
+
+    // Collect and print results
+    println!("\nResults (from pre-agg):");
+    let results = dm.collect(&qc_preagg)?;
+    for batch in &results {
+        println!("{:?}", batch);
+    }
+
+    // Clean up temp file
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 
     Ok(())
 }

@@ -1,11 +1,12 @@
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::{Column, Result as DFResult, TableReference};
+use datafusion_common::{Column, Result as DFResult};
 use datafusion_expr::expr::AggregateFunction;
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
 use datafusion_functions_aggregate::min_max::{max, min};
 use datafusion_functions_aggregate::sum::sum;
 use datafusion_optimizer::OptimizerRule;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::model::pre_agg::{agg_needed_components, find_best_pre_agg, PreAggregation};
 
@@ -73,14 +74,30 @@ fn extract_agg_column_name(expr: &Expr) -> Option<String> {
 
 /// OptimizerRule that substitutes raw table scans with pre-aggregated tables
 /// when a suitable pre-aggregation exists.
-#[derive(Debug)]
 pub struct PreAggSubstitution {
     pre_aggs: Vec<PreAggregation>,
+    /// Table sources for pre-agg tables, keyed by pre-agg name.
+    /// Required so that replaced TableScan nodes have the correct source and schema.
+    table_sources: HashMap<String, Arc<dyn TableSource>>,
+}
+
+impl std::fmt::Debug for PreAggSubstitution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreAggSubstitution")
+            .field("pre_aggs", &self.pre_aggs)
+            .finish()
+    }
 }
 
 impl PreAggSubstitution {
-    pub fn new(pre_aggs: Vec<PreAggregation>) -> Self {
-        Self { pre_aggs }
+    pub fn new(
+        pre_aggs: Vec<PreAggregation>,
+        table_sources: HashMap<String, Arc<dyn TableSource>>,
+    ) -> Self {
+        Self {
+            pre_aggs,
+            table_sources,
+        }
     }
 
     /// Collect all column references from the plan to determine what the pre-agg must cover.
@@ -183,7 +200,11 @@ impl PreAggSubstitution {
     }
 
     /// Rewrite the plan to use a pre-aggregated table.
-    /// This replaces the Aggregate node's inputs and rewrites its expressions.
+    ///
+    /// The key insight: we alias the pre-agg scan with the original table name
+    /// (via `SubqueryAlias`) so that existing column qualifiers (e.g. `orders.region`)
+    /// continue to resolve correctly. Only aggregate expressions need rewriting
+    /// (to reference component columns like `amount-sum`).
     fn rewrite_plan_with_pre_agg(
         &self,
         plan: LogicalPlan,
@@ -198,106 +219,76 @@ impl PreAggSubstitution {
                     .map(|expr| rewrite_agg_expr(expr).unwrap_or_else(|| expr.clone()))
                     .collect();
 
-                // Group-by expressions stay the same (same column names in pre-agg)
+                // Group-by expressions stay the same — the SubqueryAlias on the
+                // pre-agg scan preserves the original table qualifier.
                 let group_exprs = agg.group_expr.clone();
 
-                // Build a new plan that scans the pre-agg table instead of raw tables
-                // For now, we recursively rewrite children to point at the pre-agg table
-                let new_input = self.replace_table_scans(&agg.input, pre_agg)?;
+                let new_input = self.rewrite_plan_with_pre_agg((*agg.input).clone(), pre_agg)?;
 
                 LogicalPlanBuilder::from(new_input)
                     .aggregate(group_exprs, rewritten_aggs)?
                     .build()
             }
             LogicalPlan::Filter(filter) => {
-                // Keep filters but rewrite the input
                 let new_input = self.rewrite_plan_with_pre_agg((*filter.input).clone(), pre_agg)?;
                 LogicalPlanBuilder::from(new_input)
                     .filter(filter.predicate.clone())?
                     .build()
             }
             LogicalPlan::Projection(proj) => {
-                let new_input = self.rewrite_plan_with_pre_agg((*proj.input).clone(), pre_agg)?;
-                LogicalPlanBuilder::from(new_input)
-                    .project(proj.expr.clone())?
-                    .build()
+                // Skip intermediate projections — they reference original table columns
+                // that don't exist in the pre-agg table. The parent Aggregate node
+                // already specifies which columns it needs.
+                self.rewrite_plan_with_pre_agg((*proj.input).clone(), pre_agg)
             }
-            // For other nodes (TableScan, Join, etc.), replace table scans
-            other => self.replace_table_scans(&other, pre_agg),
-        }
-    }
-
-    /// Replace all TableScan and Join nodes with a single scan of the pre-agg table.
-    fn replace_table_scans(
-        &self,
-        plan: &LogicalPlan,
-        pre_agg: &PreAggregation,
-    ) -> DFResult<LogicalPlan> {
-        // The pre-agg table contains all the data we need.
-        // Replace any TableScan/Join tree with a scan of the pre-agg parquet.
-        let table_ref = TableReference::bare(pre_agg.name.clone());
-        // Build column list: group-by cols + all component cols
-        let mut columns: Vec<String> = pre_agg.group_by.clone();
-        for (col, components) in &pre_agg.aggregations {
-            for comp in components {
-                columns.push(PreAggregation::component_column(col, comp));
-            }
-        }
-
-        // Create a scan of the pre-agg table
-        // Note: This assumes the pre-agg is registered as a table in the SessionContext
-        // The engine must register pre-agg parquet files before optimization
-        match plan {
-            LogicalPlan::TableScan(scan) => {
-                // Replace with pre-agg table scan
-                let mut new_scan = scan.clone();
-                new_scan.table_name = table_ref;
-                Ok(LogicalPlan::TableScan(new_scan))
+            LogicalPlan::TableScan(ref scan) => {
+                self.build_pre_agg_scan(pre_agg, scan.table_name.table())
             }
             LogicalPlan::Join(_) => {
-                // For joins, we need to find any table scan in the subtree
-                // and replace the whole join with a single pre-agg scan
-                // For now, find the first table scan and replace it
-                self.find_and_replace_first_scan(plan, pre_agg)
+                // For joins, find the first table name and use that as the alias
+                let original_name = Self::find_first_table_name(&plan)
+                    .unwrap_or_else(|| pre_agg.name.clone());
+                self.build_pre_agg_scan(pre_agg, &original_name)
             }
+            // For other nodes (Sort, Limit, etc.), recurse into children.
+            // Expressions keep their original qualifiers since the SubqueryAlias
+            // ensures they still resolve.
             other => {
-                // Recurse into children
-                let inputs: Vec<LogicalPlan> = other
+                let new_inputs: Vec<LogicalPlan> = other
                     .inputs()
                     .into_iter()
-                    .map(|input| self.replace_table_scans(input, pre_agg))
+                    .map(|input| self.rewrite_plan_with_pre_agg(input.clone(), pre_agg))
                     .collect::<DFResult<Vec<_>>>()?;
-
-                if inputs.is_empty() {
-                    Ok(other.clone())
-                } else {
-                    other.with_new_exprs(other.expressions(), inputs)
-                }
+                other.with_new_exprs(other.expressions(), new_inputs)
             }
         }
     }
 
-    fn find_and_replace_first_scan(
+    /// Build a pre-agg scan aliased with the original table name so that
+    /// existing column qualifiers (e.g. `orders.region`) remain valid.
+    fn build_pre_agg_scan(
         &self,
-        plan: &LogicalPlan,
         pre_agg: &PreAggregation,
+        original_table_name: &str,
     ) -> DFResult<LogicalPlan> {
+        let source = self.table_sources.get(&pre_agg.name).ok_or_else(|| {
+            datafusion_common::DataFusionError::Plan(format!(
+                "Pre-agg table source not found for '{}'",
+                pre_agg.name
+            ))
+        })?;
+        LogicalPlanBuilder::scan(&pre_agg.name, Arc::clone(source), None)?
+            .alias(original_table_name)?
+            .build()
+    }
+
+    fn find_first_table_name(plan: &LogicalPlan) -> Option<String> {
         match plan {
-            LogicalPlan::TableScan(scan) => {
-                let table_ref = TableReference::bare(pre_agg.name.clone());
-                let mut new_scan = scan.clone();
-                new_scan.table_name = table_ref;
-                Ok(LogicalPlan::TableScan(new_scan))
-            }
-            other => {
-                // Return first table scan found in depth-first order
-                for input in other.inputs() {
-                    if let Ok(result) = self.find_and_replace_first_scan(input, pre_agg) {
-                        return Ok(result);
-                    }
-                }
-                Ok(other.clone())
-            }
+            LogicalPlan::TableScan(scan) => Some(scan.table_name.table().to_string()),
+            other => other
+                .inputs()
+                .into_iter()
+                .find_map(Self::find_first_table_name),
         }
     }
 }
@@ -529,7 +520,7 @@ mod tests {
         )
         .unwrap();
 
-        let rule = PreAggSubstitution::new(vec![pa]);
+        let rule = PreAggSubstitution::new(vec![pa], HashMap::new());
         let config = OptimizerContext::new();
         let result = rule.rewrite(plan, &config).unwrap();
 
@@ -552,7 +543,7 @@ mod tests {
             agg.logical_plan().clone()
         });
 
-        let rule = PreAggSubstitution::new(vec![]);
+        let rule = PreAggSubstitution::new(vec![], HashMap::new());
         let config = OptimizerContext::new();
         let result = rule.rewrite(plan, &config).unwrap();
 

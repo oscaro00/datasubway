@@ -54,13 +54,28 @@ impl AutoJoinRule {
     /// Collect all table names that have TableScan nodes in the plan.
     fn collect_scanned_tables(plan: &LogicalPlan) -> HashSet<String> {
         let mut tables = HashSet::new();
-        let _ = plan.apply(|node| {
-            if let LogicalPlan::TableScan(scan) = node {
+        Self::collect_scanned_tables_recursive(plan, &mut tables);
+        tables
+    }
+
+    fn collect_scanned_tables_recursive(plan: &LogicalPlan, tables: &mut HashSet<String>) {
+        match plan {
+            LogicalPlan::TableScan(scan) => {
                 tables.insert(scan.table_name.table().to_string());
             }
-            Ok(TreeNodeRecursion::Continue)
-        });
-        tables
+            LogicalPlan::SubqueryAlias(alias) => {
+                // A SubqueryAlias (e.g. from pre-agg rewriting) presents its
+                // subtree as a single named table. Use the alias name and do
+                // NOT descend — otherwise the underlying TableScan would be
+                // double-counted as a separate table.
+                tables.insert(alias.alias.table().to_string());
+            }
+            other => {
+                for child in other.inputs() {
+                    Self::collect_scanned_tables_recursive(child, tables);
+                }
+            }
+        }
     }
 
     /// Find the "base" table scan node name. We pick the first TableScan

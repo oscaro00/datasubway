@@ -248,8 +248,6 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
-- Need a way to track output group_by columns, so measures with the same group_by columns can be selected
-- Need to actually write out pre aggregations and make sure they work
 - Parameter to only look at pre aggregations within a certain time frame
 
 

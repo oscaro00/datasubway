@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use datafusion::common::DataFusionError;
-use datafusion::execution::context::SessionContext;
+use datafusion::datasource::DefaultTableSource;
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::prelude::*;
-use datafusion_expr::LogicalPlan;
+use datafusion_expr::{LogicalPlan, TableSource};
 use tokio::runtime::Runtime;
 
 use crate::model::column_context;
@@ -110,8 +111,13 @@ impl DataModel {
     /// Create a new DataModel with an empty SessionContext.
     pub fn new() -> Result<Self, DataFusionError> {
         let rt = Runtime::new().map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Disable Utf8View for parquet so string types stay consistent across
+        // data sources (MemTable uses Utf8, Parquet defaults to Utf8View).
+        // This matters for pre-aggregation where the optimizer swaps table scans.
+        let config = SessionConfig::new()
+            .set_bool("datafusion.execution.parquet.schema_force_view_types", false);
         Ok(DataModel {
-            ctx: SessionContext::new(),
+            ctx: SessionContext::new_with_config(config),
             rt: Arc::new(rt),
             join_graph: None,
             table_schemas: HashMap::new(),
@@ -365,7 +371,19 @@ impl DataModel {
 
         // Register optimizer rules if applicable
         if !self.pre_agg_objects.is_empty() && qc.use_pre_agg {
-            let rule = PreAggSubstitution::new(self.pre_agg_objects.clone());
+            // Look up table sources for each pre-agg so the optimizer can build
+            // proper TableScan nodes with correct source and schema.
+            let mut table_sources: HashMap<String, Arc<dyn TableSource>> = HashMap::new();
+            for pa in &self.pre_agg_objects {
+                let provider = self.rt.block_on(async {
+                    self.ctx.table_provider(&pa.name).await
+                })?;
+                table_sources.insert(
+                    pa.name.clone(),
+                    Arc::new(DefaultTableSource::new(provider)),
+                );
+            }
+            let rule = PreAggSubstitution::new(self.pre_agg_objects.clone(), table_sources);
             self.ctx.add_optimizer_rule(Arc::new(rule));
         }
         if let Some(ref jg) = self.join_graph {
@@ -432,8 +450,11 @@ impl DataModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::column_context::ColumnInput::*;
     use crate::model::joins::JoinDirection;
+    use crate::model::pre_agg::PreAggregation;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::functions_aggregate::count::count;
     use datafusion::functions_aggregate::sum::sum;
 
     fn make_orders_batch() -> RecordBatch {
@@ -821,5 +842,407 @@ mod tests {
             "Optimized plan should eliminate unreferenced 'teams' join.\nPlan:\n{}",
             plan_str
         );
+    }
+
+    // ── Pre-aggregation integration tests (parquet round-trip) ─────────
+
+    fn write_batch_to_parquet(batch: &RecordBatch, path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Build a DataModel with orders table + a pre-agg parquet registered.
+    /// Returns (DataModel, TempDir) — keep TempDir alive for the test duration.
+    fn setup_pre_agg_dm(
+        preagg_batch: RecordBatch,
+        preagg_name: &str,
+        pre_agg: PreAggregation,
+    ) -> (DataModel, tempfile::TempDir) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let preagg_path = tmp_dir.path().join(format!("{}.parquet", preagg_name));
+        write_batch_to_parquet(&preagg_batch, &preagg_path);
+
+        let mut dm = DataModel::new().unwrap();
+        dm.register_record_batch("orders", make_orders_batch())
+            .unwrap();
+        dm.register_parquet(preagg_name, preagg_path.to_str().unwrap())
+            .unwrap();
+        dm.set_pre_aggregations(vec![pre_agg]);
+
+        (dm, tmp_dir)
+    }
+
+    fn make_sum_preagg_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount-sum", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["EU", "US"])),
+                Arc::new(arrow::array::Int64Array::from(vec![450, 550])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_sum_pre_agg_object(preagg_name: &str, file_path: &str) -> PreAggregation {
+        let mut pa = PreAggregation::new(
+            preagg_name.into(),
+            vec!["region".into()],
+            HashMap::from([("amount".into(), vec!["sum".into()])]),
+            file_path.into(),
+        )
+        .unwrap();
+        pa.row_count = 2;
+        pa
+    }
+
+    #[test]
+    fn test_pre_agg_sum_from_parquet() {
+        let preagg_batch = make_sum_preagg_batch();
+        let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let (mut dm, _tmp) =
+            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa);
+
+        dm.register_measure(
+            "revenue",
+            Arc::new(|qc, dm| {
+                let filter_expr =
+                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
+                let group_exprs =
+                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
+                dm.table("orders")?
+                    .filter(filter_expr)?
+                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            Some(vec![("orders.region".into(), "asc".into())]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Verify explain references pre-agg table
+        let explain_df = dm.explain(&qc, false, false).unwrap();
+        let explain_batches = dm.rt.block_on(async { explain_df.collect().await }).unwrap();
+        let explain_str = format!("{:?}", explain_batches);
+        assert!(
+            explain_str.contains("regional_preagg"),
+            "Explain should reference pre-agg table.\nExplain:\n{}",
+            explain_str
+        );
+
+        // Need a fresh DataModel for collect (optimizer rules accumulate)
+        let preagg_batch = make_sum_preagg_batch();
+        let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let (mut dm2, _tmp2) =
+            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa);
+
+        dm2.register_measure(
+            "revenue",
+            Arc::new(|qc, dm| {
+                let filter_expr =
+                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
+                let group_exprs =
+                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
+                dm.table("orders")?
+                    .filter(filter_expr)?
+                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        let result = dm2.collect(&qc).unwrap();
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2, "Should have 2 rows (EU and US)");
+
+        // Check values: EU=450, US=550 (sorted by region asc)
+        let batch = &result[0];
+        let revenue_col = batch
+            .column_by_name("revenue")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let region_col = batch
+            .column_by_name("region")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(region_col.value(0), "EU");
+        assert_eq!(revenue_col.value(0), 450);
+        assert_eq!(region_col.value(1), "US");
+        assert_eq!(revenue_col.value(1), 550);
+    }
+
+    #[test]
+    fn test_pre_agg_with_filter() {
+        let preagg_batch = make_sum_preagg_batch();
+        let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let (mut dm, _tmp) =
+            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa);
+
+        dm.register_measure(
+            "revenue",
+            Arc::new(|qc, dm| {
+                let filter_expr =
+                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
+                let group_exprs =
+                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
+                dm.table("orders")?
+                    .filter(filter_expr)?
+                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            Some(serde_json::json!({"AND": [["orders.region", "=", "US"]]})),
+            Some(vec!["orders.region".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = dm.collect(&qc).unwrap();
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "Should have 1 row (US only)");
+
+        let batch = &result[0];
+        let revenue_col = batch
+            .column_by_name("revenue")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(revenue_col.value(0), 550);
+    }
+
+    #[test]
+    fn test_pre_agg_disabled_falls_back() {
+        let preagg_batch = make_sum_preagg_batch();
+        let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let (mut dm, _tmp) =
+            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa);
+
+        dm.register_measure(
+            "revenue",
+            Arc::new(|qc, dm| {
+                let filter_expr =
+                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
+                let group_exprs =
+                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
+                dm.table("orders")?
+                    .filter(filter_expr)?
+                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            Some(vec![("orders.region".into(), "asc".into())]),
+            None,
+            None,
+            Some(false), // disable pre-agg
+        )
+        .unwrap();
+
+        // Verify explain does NOT reference pre-agg table
+        let explain_df = dm.explain(&qc, false, false).unwrap();
+        let explain_batches = dm.rt.block_on(async { explain_df.collect().await }).unwrap();
+        let explain_str = format!("{:?}", explain_batches);
+        assert!(
+            !explain_str.contains("regional_preagg"),
+            "Explain should NOT reference pre-agg when disabled.\nExplain:\n{}",
+            explain_str
+        );
+    }
+
+    #[test]
+    fn test_pre_agg_no_coverage_falls_back() {
+        // Pre-agg only covers "region", but query groups by "category" (not covered)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let orders_with_category = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["US", "EU", "US"])),
+                Arc::new(arrow::array::StringArray::from(vec!["A", "B", "A"])),
+                Arc::new(arrow::array::Int64Array::from(vec![100, 200, 150])),
+            ],
+        )
+        .unwrap();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let preagg_path = tmp_dir.path().join("regional_preagg.parquet");
+        let preagg_batch = make_sum_preagg_batch();
+        write_batch_to_parquet(&preagg_batch, &preagg_path);
+
+        let mut dm = DataModel::new().unwrap();
+        dm.register_record_batch("orders", orders_with_category)
+            .unwrap();
+        dm.register_parquet("regional_preagg", preagg_path.to_str().unwrap())
+            .unwrap();
+
+        let mut pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        pa.row_count = 2;
+        dm.set_pre_aggregations(vec![pa]);
+
+        dm.register_measure(
+            "revenue",
+            Arc::new(|qc, dm| {
+                let filter_expr =
+                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
+                let group_exprs =
+                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
+                dm.table("orders")?
+                    .filter(filter_expr)?
+                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+            }),
+        )
+        .unwrap();
+
+        // Group by category — pre-agg doesn't cover this
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.category".into()]),
+            None,
+            Some(vec![("orders.category".into(), "asc".into())]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = dm.collect(&qc).unwrap();
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2, "Should have 2 rows (A and B)");
+
+        let batch = &result[0];
+        let revenue_col = batch
+            .column_by_name("revenue")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let category_col = batch
+            .column_by_name("category")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(category_col.value(0), "A");
+        assert_eq!(revenue_col.value(0), 250); // 100+150
+        assert_eq!(category_col.value(1), "B");
+        assert_eq!(revenue_col.value(1), 200);
+    }
+
+    #[test]
+    fn test_pre_agg_count_rewrite() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount-count", DataType::Int64, false),
+        ]));
+        let preagg_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["EU", "US"])),
+                Arc::new(arrow::array::Int64Array::from(vec![2, 3])),
+            ],
+        )
+        .unwrap();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let preagg_path = tmp_dir.path().join("count_preagg.parquet");
+        write_batch_to_parquet(&preagg_batch, &preagg_path);
+
+        let mut dm = DataModel::new().unwrap();
+        dm.register_record_batch("orders", make_orders_batch())
+            .unwrap();
+        dm.register_parquet("count_preagg", preagg_path.to_str().unwrap())
+            .unwrap();
+
+        let mut pa = PreAggregation::new(
+            "count_preagg".into(),
+            vec!["region".into()],
+            HashMap::from([("amount".into(), vec!["count".into()])]),
+            "count_preagg.parquet".into(),
+        )
+        .unwrap();
+        pa.row_count = 2;
+        dm.set_pre_aggregations(vec![pa]);
+
+        dm.register_measure(
+            "order_count",
+            Arc::new(|qc, dm| {
+                let filter_expr =
+                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
+                let group_exprs =
+                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
+                dm.table("orders")?
+                    .filter(filter_expr)?
+                    .aggregate(group_exprs, vec![count(col("amount")).alias("order_count")])
+            }),
+        )
+        .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["order_count".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            Some(vec![("orders.region".into(), "asc".into())]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = dm.collect(&qc).unwrap();
+        let batch = &result[0];
+        let count_col = batch
+            .column_by_name("order_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let region_col = batch
+            .column_by_name("region")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(region_col.value(0), "EU");
+        assert_eq!(count_col.value(0), 2);
+        assert_eq!(region_col.value(1), "US");
+        assert_eq!(count_col.value(1), 3);
     }
 }
