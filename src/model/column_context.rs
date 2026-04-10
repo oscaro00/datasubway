@@ -184,27 +184,21 @@ fn include_explicit_columns(
                         match cond {
                             serde_json::Value::Array(leaf) if leaf.len() >= 3 => {
                                 if let Some(col_name) = leaf[0].as_str() {
-                                    if explicit.contains(col_name)
-                                        && !pruned_arr.contains(cond)
-                                    {
+                                    if explicit.contains(col_name) && !pruned_arr.contains(cond) {
                                         merged.push(cond.clone());
                                     }
                                 }
                             }
                             serde_json::Value::Object(_) => {
                                 // Nested filter tree — recurse
-                                let empty_obj =
-                                    serde_json::Value::Object(serde_json::Map::new());
+                                let empty_obj = serde_json::Value::Object(serde_json::Map::new());
                                 let pruned_nested = pruned_arr
                                     .iter()
                                     .find(|p| p.is_object())
                                     .unwrap_or(&empty_obj);
                                 let merged_nested =
                                     include_explicit_columns(cond, pruned_nested, explicit);
-                                if !merged_nested
-                                    .as_object()
-                                    .map_or(true, |m| m.is_empty())
-                                {
+                                if !merged_nested.as_object().map_or(true, |m| m.is_empty()) {
                                     // Replace or add the nested object
                                     if let Some(idx) = merged.iter().position(|p| p.is_object()) {
                                         merged[idx] = merged_nested;
@@ -241,11 +235,8 @@ pub(crate) fn allow(
     columns: Option<&[String]>,
 ) -> Result<ColumnOutput, DataFusionError> {
     let parsed = parse_patterns(patterns)?;
-    let explicit: std::collections::HashSet<&str> = columns
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let explicit: std::collections::HashSet<&str> =
+        columns.unwrap_or(&[]).iter().map(|s| s.as_str()).collect();
     match input {
         ColumnInput::Columns(context) => {
             let cols: Vec<String> = context
@@ -280,11 +271,8 @@ pub(crate) fn exclude(
     columns: Option<&[String]>,
 ) -> Result<ColumnOutput, DataFusionError> {
     let parsed = parse_patterns(patterns)?;
-    let explicit: std::collections::HashSet<&str> = columns
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let explicit: std::collections::HashSet<&str> =
+        columns.unwrap_or(&[]).iter().map(|s| s.as_str()).collect();
     match input {
         ColumnInput::Columns(context) => {
             let cols: Vec<String> = context

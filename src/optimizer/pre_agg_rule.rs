@@ -246,8 +246,8 @@ impl PreAggSubstitution {
             }
             LogicalPlan::Join(_) => {
                 // For joins, find the first table name and use that as the alias
-                let original_name = Self::find_first_table_name(&plan)
-                    .unwrap_or_else(|| pre_agg.name.clone());
+                let original_name =
+                    Self::find_first_table_name(&plan).unwrap_or_else(|| pre_agg.name.clone());
                 self.build_pre_agg_scan(pre_agg, &original_name)
             }
             // For other nodes (Sort, Limit, etc.), recurse into children.
@@ -366,11 +366,9 @@ mod tests {
         )
         .unwrap();
 
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            schema.clone(),
-            vec![vec![batch.clone()]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![batch.clone()]])
+                .unwrap();
         ctx.register_table("orders", Arc::new(mem_table)).unwrap();
 
         // Register a pre-agg table with component columns

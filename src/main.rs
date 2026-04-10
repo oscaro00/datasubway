@@ -56,20 +56,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register a measure
     dm.register_measure(
         "revenue",
-        Arc::new(|qc, dm| Box::pin(async move {
-            let filter_expr = dm
-                .allow(&["*".into()], FilterTree(&qc.filters), None)?
-                .into_filter_expr();
-            let group_exprs = dm
-                .allow(&["*".into()], Columns(&qc.groups), None)?
-                .into_exprs();
-            dm.table("orders").await?
-                .filter(filter_expr)?
-                .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-        })),
-    ).await?;
+        Arc::new(|qc, dm| {
+            Box::pin(async move {
+                let filter_expr = dm
+                    .allow(&["*".into()], FilterTree(&qc.filters), None)?
+                    .into_filter_expr();
+                let group_exprs = dm
+                    .allow(&["*".into()], Columns(&qc.groups), None)?
+                    .into_exprs();
+                dm.table("orders")
+                    .await?
+                    .filter(filter_expr)?
+                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+            })
+        }),
+    )
+    .await?;
 
-    // Query with cross-table grouping and a filter (AutoJoinRule resolves the join)
+    // Query with cross-table grouping and a filter (eager joins from table())
     let qc = QueryContext::new(
         vec!["revenue".into()],
         Some(json!({"AND": [["orders.region", "=", "US"]]})),
@@ -119,7 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Register the pre-agg parquet and set up the PreAggregation metadata
-    dm.register_parquet("regional_revenue_preagg", preagg_path.to_str().unwrap()).await?;
+    dm.register_parquet("regional_revenue_preagg", preagg_path.to_str().unwrap())
+        .await?;
 
     let mut pa = PreAggregation::new(
         "regional_revenue_preagg".into(),

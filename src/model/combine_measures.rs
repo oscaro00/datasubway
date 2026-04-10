@@ -185,7 +185,11 @@ mod tests {
     async fn test_combine_single_measure() {
         let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("revenue", DataType::Int64, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "revenue",
+                DataType::Int64,
+                false,
+            )])),
             vec![Arc::new(arrow::array::Int64Array::from(vec![1000]))],
         )
         .unwrap();
@@ -193,11 +197,19 @@ mod tests {
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
-            None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
-        let result = combine_measure_results(vec![("revenue", df)], &qc).await.unwrap();
+        let result = combine_measure_results(vec![("revenue", df)], &qc)
+            .await
+            .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
     }
@@ -224,11 +236,16 @@ mod tests {
             None,
             Some(vec!["orders.region".into()]),
             Some(havings),
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
-        let result = combine_measure_results(vec![("revenue", df)], &qc).await.unwrap();
+        let result = combine_measure_results(vec![("revenue", df)], &qc)
+            .await
+            .unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
@@ -255,11 +272,15 @@ mod tests {
             Some(vec!["orders.region".into()]),
             None,
             Some(vec![("revenue".into(), "asc".into())]),
-            None, None, None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
-        let result = combine_measure_results(vec![("revenue", df)], &qc).await.unwrap();
+        let result = combine_measure_results(vec![("revenue", df)], &qc)
+            .await
+            .unwrap();
         assert_eq!(result.len(), 1);
         let col = result[0]
             .column_by_name("revenue")
@@ -299,7 +320,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = combine_measure_results(vec![("revenue", df)], &qc).await.unwrap();
+        let result = combine_measure_results(vec![("revenue", df)], &qc)
+            .await
+            .unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
         let col = result[0]
@@ -316,12 +339,20 @@ mod tests {
         let ctx = SessionContext::new();
 
         let batch1 = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("revenue", DataType::Int64, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "revenue",
+                DataType::Int64,
+                false,
+            )])),
             vec![Arc::new(arrow::array::Int64Array::from(vec![1000]))],
         )
         .unwrap();
         let batch2 = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("quantity", DataType::Int64, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "quantity",
+                DataType::Int64,
+                false,
+            )])),
             vec![Arc::new(arrow::array::Int64Array::from(vec![100]))],
         )
         .unwrap();
@@ -331,16 +362,19 @@ mod tests {
 
         let qc = QueryContext::new(
             vec!["revenue".into(), "total_quantity".into()],
-            None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
-        let result = combine_measure_results(
-            vec![("revenue", df1), ("total_quantity", df2)],
-            &qc,
-        )
-        .await
-        .unwrap();
+        let result = combine_measure_results(vec![("revenue", df1), ("total_quantity", df2)], &qc)
+            .await
+            .unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
@@ -379,16 +413,17 @@ mod tests {
             vec!["revenue".into(), "total_quantity".into()],
             None,
             Some(vec!["orders.region".into()]),
-            None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
-        let result = combine_measure_results(
-            vec![("revenue", df1), ("total_quantity", df2)],
-            &qc,
-        )
-        .await
-        .unwrap();
+        let result = combine_measure_results(vec![("revenue", df1), ("total_quantity", df2)], &qc)
+            .await
+            .unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
