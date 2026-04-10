@@ -282,8 +282,10 @@ impl DataModel {
                         continue;
                     }
                     let right_df = self.rt.block_on(self.ctx.table(&step.right))?;
-                    let left_on: Vec<&str> = step.left_on.iter().map(|s| s.as_str()).collect();
-                    let right_on: Vec<&str> = step.right_on.iter().map(|s| s.as_str()).collect();
+                    let left_on_qualified: Vec<String> = step.left_on.iter().map(|s| format!("{}.{}", step.left, s)).collect();
+                    let right_on_qualified: Vec<String> = step.right_on.iter().map(|s| format!("{}.{}", step.right, s)).collect();
+                    let left_on: Vec<&str> = left_on_qualified.iter().map(|s| s.as_str()).collect();
+                    let right_on: Vec<&str> = right_on_qualified.iter().map(|s| s.as_str()).collect();
                     let join_type = match step.how {
                         JoinHow::Inner => JoinType::Inner,
                         JoinHow::Left => JoinType::Left,

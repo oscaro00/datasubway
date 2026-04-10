@@ -248,6 +248,7 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
+- It would be cleaner for datasubway to expose an async API (accepting an existing SessionContext runtime) rather than managing its own Runtime internally. That would let you use it natively in async handlers without spawn_blocking.
 - Parameter to only look at pre aggregations within a certain time frame
 
 

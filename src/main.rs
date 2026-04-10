@@ -56,10 +56,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dm.register_measure(
         "revenue",
         Arc::new(|qc, dm| {
-            let filter_expr =
-                dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
-            let group_exprs =
-                dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
+            let filter_expr = dm
+                .allow(&["*".into()], FilterTree(&qc.filters), None)?
+                .into_filter_expr();
+            let group_exprs = dm
+                .allow(&["*".into()], Columns(&qc.groups), None)?
+                .into_exprs();
             dm.table("orders")?
                 .filter(filter_expr)?
                 .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
@@ -110,8 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let preagg_path = tmp_dir.join("regional_revenue.parquet");
     {
         let file = std::fs::File::create(&preagg_path)?;
-        let mut writer =
-            parquet::arrow::ArrowWriter::try_new(file, preagg_batch.schema(), None)?;
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, preagg_batch.schema(), None)?;
         writer.write(&preagg_batch)?;
         writer.close()?;
     }
