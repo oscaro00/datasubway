@@ -248,7 +248,8 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
-- It would be cleaner for datasubway to expose an async API (accepting an existing SessionContext runtime) rather than managing its own Runtime internally. That would let you use it natively in async handlers without spawn_blocking.
+- Is the auto join rule necessary if all possible tables are immediately joined to create a valid schema, then eliminate joins rule removes unnecessary tables?
+  - I'm not sure if table() in data_model calls common functions with the auto join rule or not
 - Parameter to only look at pre aggregations within a certain time frame
 
 

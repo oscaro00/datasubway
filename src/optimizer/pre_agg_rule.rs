@@ -366,34 +366,31 @@ mod tests {
         )
         .unwrap();
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let mem_table = datafusion::datasource::MemTable::try_new(
-                schema.clone(),
-                vec![vec![batch.clone()]],
-            )
-            .unwrap();
-            ctx.register_table("orders", Arc::new(mem_table)).unwrap();
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            schema.clone(),
+            vec![vec![batch.clone()]],
+        )
+        .unwrap();
+        ctx.register_table("orders", Arc::new(mem_table)).unwrap();
 
-            // Register a pre-agg table with component columns
-            let preagg_schema = Arc::new(Schema::new(vec![
-                Field::new("region", DataType::Utf8, false),
-                Field::new("amount-sum", DataType::Int64, false),
-            ]));
-            let preagg_batch = RecordBatch::try_new(
-                preagg_schema.clone(),
-                vec![
-                    Arc::new(StringArray::from(vec!["US", "EU"])),
-                    Arc::new(Int64Array::from(vec![100, 200])),
-                ],
-            )
-            .unwrap();
-            let preagg_table =
-                datafusion::datasource::MemTable::try_new(preagg_schema, vec![vec![preagg_batch]])
-                    .unwrap();
-            ctx.register_table("regional_revenue", Arc::new(preagg_table))
+        // Register a pre-agg table with component columns
+        let preagg_schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount-sum", DataType::Int64, false),
+        ]));
+        let preagg_batch = RecordBatch::try_new(
+            preagg_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["US", "EU"])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let preagg_table =
+            datafusion::datasource::MemTable::try_new(preagg_schema, vec![vec![preagg_batch]])
                 .unwrap();
-        });
+        ctx.register_table("regional_revenue", Arc::new(preagg_table))
+            .unwrap();
         ctx
     }
 
@@ -409,18 +406,15 @@ mod tests {
         pa
     }
 
-    #[test]
-    fn test_collect_plan_requirements() {
+    #[tokio::test]
+    async fn test_collect_plan_requirements() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            let agg = df
-                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let agg = df
+            .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         let (group_by, agg_components, filter_cols) =
             PreAggSubstitution::collect_plan_requirements(&plan);
@@ -438,18 +432,15 @@ mod tests {
         assert!(filter_cols.is_empty());
     }
 
-    #[test]
-    fn test_rule_matches_covering_pre_agg() {
+    #[tokio::test]
+    async fn test_rule_matches_covering_pre_agg() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            let agg = df
-                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let agg = df
+            .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         assert!(plan_contains_table_scan(&plan, "orders"));
 
@@ -471,19 +462,16 @@ mod tests {
         assert_eq!(best.unwrap().name, "regional_revenue");
     }
 
-    #[test]
-    fn test_rule_matches_with_filter_columns() {
+    #[tokio::test]
+    async fn test_rule_matches_with_filter_columns() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            let filtered = df.filter(col("region").eq(lit("US"))).unwrap();
-            let agg = filtered
-                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let filtered = df.filter(col("region").eq(lit("US"))).unwrap();
+        let agg = filtered
+            .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         let pre_agg = make_pre_agg();
         let (group_by, agg_components, filter_cols) =
@@ -498,18 +486,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_no_rewrite_when_no_covering_pre_agg() {
+    #[tokio::test]
+    async fn test_no_rewrite_when_no_covering_pre_agg() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            let agg = df
-                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let agg = df
+            .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         // Pre-agg that doesn't cover the request (wrong column)
         let pa = PreAggregation::new(
@@ -530,18 +515,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_no_rewrite_when_empty_pre_aggs() {
+    #[tokio::test]
+    async fn test_no_rewrite_when_empty_pre_aggs() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            let agg = df
-                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let agg = df
+            .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         let rule = PreAggSubstitution::new(vec![], HashMap::new());
         let config = OptimizerContext::new();
@@ -550,20 +532,17 @@ mod tests {
         assert!(!result.transformed, "Empty pre-aggs should not transform");
     }
 
-    #[test]
-    fn test_rule_rejects_uncovered_filter_column() {
+    #[tokio::test]
+    async fn test_rule_rejects_uncovered_filter_column() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            // Filter on "amount" which is NOT in the pre-agg's group_by
-            let filtered = df.filter(col("amount").gt(lit(100))).unwrap();
-            let agg = filtered
-                .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        // Filter on "amount" which is NOT in the pre-agg's group_by
+        let filtered = df.filter(col("amount").gt(lit(100))).unwrap();
+        let agg = filtered
+            .aggregate(vec![col("region")], vec![sum(col("amount")).alias("total")])
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         let pre_agg = make_pre_agg(); // group_by = ["region"], no "amount" in group_by
         let (group_by, agg_components, filter_cols) =

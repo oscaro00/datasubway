@@ -420,88 +420,82 @@ mod tests {
 
     fn make_test_context() -> SessionContext {
         let ctx = SessionContext::new();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        rt.block_on(async {
-            // Orders table
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("region", DataType::Utf8, false),
-                Field::new("amount", DataType::Int64, false),
-                Field::new("customer_id", DataType::Int64, false),
-                Field::new("product_id", DataType::Int64, false),
-            ]));
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(StringArray::from(vec!["US", "EU"])),
-                    Arc::new(Int64Array::from(vec![100, 200])),
-                    Arc::new(Int64Array::from(vec![1, 2])),
-                    Arc::new(Int64Array::from(vec![10, 20])),
-                ],
-            )
-            .unwrap();
-            let mem_table =
-                datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-            ctx.register_table("orders", Arc::new(mem_table)).unwrap();
+        // Orders table
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("customer_id", DataType::Int64, false),
+            Field::new("product_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["US", "EU"])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("orders", Arc::new(mem_table)).unwrap();
 
-            // Customers table
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, false),
-                Field::new("country", DataType::Utf8, false),
-            ]));
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(vec![1, 2])),
-                    Arc::new(StringArray::from(vec!["Alice", "Bob"])),
-                    Arc::new(StringArray::from(vec!["US", "DE"])),
-                ],
-            )
+        // Customers table
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("country", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+                Arc::new(StringArray::from(vec!["US", "DE"])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("customers", Arc::new(mem_table))
             .unwrap();
-            let mem_table =
-                datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-            ctx.register_table("customers", Arc::new(mem_table))
-                .unwrap();
 
-            // Products table
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("product_name", DataType::Utf8, false),
-                Field::new("category", DataType::Utf8, false),
-            ]));
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(vec![10, 20])),
-                    Arc::new(StringArray::from(vec!["Widget", "Gadget"])),
-                    Arc::new(StringArray::from(vec!["A", "B"])),
-                ],
-            )
-            .unwrap();
-            let mem_table =
-                datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-            ctx.register_table("products", Arc::new(mem_table)).unwrap();
-        });
+        // Products table
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("product_name", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(StringArray::from(vec!["Widget", "Gadget"])),
+                Arc::new(StringArray::from(vec!["A", "B"])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("products", Arc::new(mem_table)).unwrap();
+
         ctx
     }
 
-    #[test]
-    fn test_collect_referenced_tables() {
+    #[tokio::test]
+    async fn test_collect_referenced_tables() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            // Reference orders.region and aggregate orders.amount
-            let agg = df
-                .aggregate(
-                    vec![col("orders.region")],
-                    vec![sum(col("orders.amount")).alias("total")],
-                )
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let agg = df
+            .aggregate(
+                vec![col("orders.region")],
+                vec![sum(col("orders.amount")).alias("total")],
+            )
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         let tables = AutoJoinRule::collect_referenced_tables(&plan);
         assert!(
@@ -511,36 +505,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_collect_scanned_tables() {
+    #[tokio::test]
+    async fn test_collect_scanned_tables() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            df.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let plan = df.logical_plan().clone();
 
         let tables = AutoJoinRule::collect_scanned_tables(&plan);
         assert_eq!(tables.len(), 1);
         assert!(tables.contains("orders"));
     }
 
-    #[test]
-    fn test_no_rewrite_single_table() {
+    #[tokio::test]
+    async fn test_no_rewrite_single_table() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            let agg = df
-                .aggregate(
-                    vec![col("orders.region")],
-                    vec![sum(col("orders.amount")).alias("total")],
-                )
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let agg = df
+            .aggregate(
+                vec![col("orders.region")],
+                vec![sum(col("orders.amount")).alias("total")],
+            )
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         let rule = AutoJoinRule::new(make_join_graph(), make_table_schemas());
         let config = OptimizerContext::new();
@@ -551,21 +539,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_no_rewrite_empty_graph() {
+    #[tokio::test]
+    async fn test_no_rewrite_empty_graph() {
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let df = ctx.table("orders").await.unwrap();
-            let agg = df
-                .aggregate(
-                    vec![col("orders.region")],
-                    vec![sum(col("orders.amount")).alias("total")],
-                )
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let df = ctx.table("orders").await.unwrap();
+        let agg = df
+            .aggregate(
+                vec![col("orders.region")],
+                vec![sum(col("orders.amount")).alias("total")],
+            )
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         let empty_graph = JoinGraph::new(&[]).unwrap();
         let rule = AutoJoinRule::new(empty_graph, make_table_schemas());
@@ -645,34 +630,31 @@ mod tests {
         assert_eq!(steps[1].right, "loyalty");
     }
 
-    #[test]
-    fn test_rewrite_injects_join_for_cross_table_ref() {
+    #[tokio::test]
+    async fn test_rewrite_injects_join_for_cross_table_ref() {
         // Build a plan that scans "orders" but references "customers.country"
         // via a join that DataFusion built (two table scans, no join node).
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let plan = rt.block_on(async {
-            let orders = ctx.table("orders").await.unwrap();
-            let customers = ctx.table("customers").await.unwrap();
-            // Join them explicitly so we have a multi-scan plan
-            let joined = orders
-                .join(
-                    customers,
-                    datafusion::prelude::JoinType::Left,
-                    &["customer_id"],
-                    &["id"],
-                    None,
-                )
-                .unwrap();
-            let agg = joined
-                .aggregate(
-                    vec![col("customers.country")],
-                    vec![sum(col("orders.amount")).alias("total")],
-                )
-                .unwrap();
-            agg.logical_plan().clone()
-        });
+        let orders = ctx.table("orders").await.unwrap();
+        let customers = ctx.table("customers").await.unwrap();
+        // Join them explicitly so we have a multi-scan plan
+        let joined = orders
+            .join(
+                customers,
+                datafusion::prelude::JoinType::Left,
+                &["customer_id"],
+                &["id"],
+                None,
+            )
+            .unwrap();
+        let agg = joined
+            .aggregate(
+                vec![col("customers.country")],
+                vec![sum(col("orders.amount")).alias("total")],
+            )
+            .unwrap();
+        let plan = agg.logical_plan().clone();
 
         // This plan already has a join, so the rule should NOT transform it
         let rule = AutoJoinRule::new(make_join_graph(), make_table_schemas());
@@ -684,14 +666,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_inject_joins_adds_join_node() {
+    #[tokio::test]
+    async fn test_inject_joins_adds_join_node() {
         // Verify that inject_joins_into_plan adds Join nodes to a real plan
         let ctx = make_test_context();
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let rule = AutoJoinRule::new(make_join_graph(), make_table_schemas());
 
-        let plan = rt.block_on(async { ctx.table("orders").await.unwrap().logical_plan().clone() });
+        let plan = ctx.table("orders").await.unwrap().logical_plan().clone();
 
         // No joins initially
         assert!(!AutoJoinRule::plan_has_joins(&plan));

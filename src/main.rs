@@ -12,8 +12,9 @@ use datasubway::model::pre_agg::PreAggregation;
 use datasubway::model::query_context::QueryContext;
 use serde_json::json;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut dm = DataModel::new()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut dm = DataModel::new();
 
     // Register tables
     let orders = RecordBatch::try_new(
@@ -55,18 +56,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register a measure
     dm.register_measure(
         "revenue",
-        Arc::new(|qc, dm| {
+        Arc::new(|qc, dm| Box::pin(async move {
             let filter_expr = dm
                 .allow(&["*".into()], FilterTree(&qc.filters), None)?
                 .into_filter_expr();
             let group_exprs = dm
                 .allow(&["*".into()], Columns(&qc.groups), None)?
                 .into_exprs();
-            dm.table("orders")?
+            dm.table("orders").await?
                 .filter(filter_expr)?
                 .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-        }),
-    )?;
+        })),
+    ).await?;
 
     // Query with cross-table grouping and a filter (AutoJoinRule resolves the join)
     let qc = QueryContext::new(
@@ -80,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
 
-    let results = dm.collect(&qc)?;
+    let results = dm.collect(&qc).await?;
     for batch in &results {
         println!("{:?}", batch);
     }
@@ -118,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Register the pre-agg parquet and set up the PreAggregation metadata
-    dm.register_parquet("regional_revenue_preagg", preagg_path.to_str().unwrap())?;
+    dm.register_parquet("regional_revenue_preagg", preagg_path.to_str().unwrap()).await?;
 
     let mut pa = PreAggregation::new(
         "regional_revenue_preagg".into(),
@@ -145,9 +146,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Show the explain plan — should reference the pre-agg table
     println!("Explain plan (pre-agg enabled):");
-    let explain_df = dm.explain(&qc_preagg, false, false)?;
-    let rt = tokio::runtime::Runtime::new()?;
-    let explain_batches = rt.block_on(async { explain_df.collect().await })?;
+    let explain_df = dm.explain(&qc_preagg, false, false).await?;
+    let explain_batches = explain_df.collect().await?;
     for batch in &explain_batches {
         let plan_col = batch
             .column(1)
@@ -161,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Collect and print results
     println!("\nResults (from pre-agg):");
-    let results = dm.collect(&qc_preagg)?;
+    let results = dm.collect(&qc_preagg).await?;
     for batch in &results {
         println!("{:?}", batch);
     }

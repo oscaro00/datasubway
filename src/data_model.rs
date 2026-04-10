@@ -12,7 +12,7 @@ use datafusion::datasource::DefaultTableSource;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::prelude::*;
 use datafusion_expr::{LogicalPlan, TableSource};
-use tokio::runtime::Runtime;
+use futures::future::BoxFuture;
 
 use crate::model::column_context;
 use crate::model::combine_measures;
@@ -51,16 +51,19 @@ pub enum ColumnInputType {
 /// so that probe recording captures the call metadata.
 ///
 /// ```rust,ignore
-/// Arc::new(|qc: &QueryContext, dm: &DataModel| {
+/// Arc::new(|qc: &QueryContext, dm: &DataModel| Box::pin(async move {
 ///     let filter = dm.allow(&["*".into()], ColumnInput::FilterTree(&qc.filters), None)?.into_filter_expr();
 ///     let groups = dm.allow(&["*".into()], ColumnInput::Columns(&qc.groups), None)?.into_exprs();
-///     dm.table("orders")?
+///     dm.table("orders").await?
 ///         .filter(filter)?
 ///         .aggregate(groups, vec![sum(col("amount")).alias("revenue")])
-/// })
+/// }))
 /// ```
-pub type MeasureFn =
-    Arc<dyn Fn(&QueryContext, &DataModel) -> Result<DataFrame, DataFusionError> + Send + Sync>;
+pub type MeasureFn = Arc<
+    dyn for<'a> Fn(&'a QueryContext, &'a DataModel) -> BoxFuture<'a, Result<DataFrame, DataFusionError>>
+        + Send
+        + Sync,
+>;
 
 /// Extract aggregate column names from the outermost Aggregate node in the plan.
 ///
@@ -98,7 +101,6 @@ fn extract_expr_output_name(expr: &Expr) -> Option<String> {
 /// Manages data sources, joins, measures, pre-aggregations, and query execution.
 pub struct DataModel {
     ctx: SessionContext,
-    rt: Arc<Runtime>,
     join_graph: Option<JoinGraph>,
     table_schemas: HashMap<String, Vec<String>>,
     measures: HashMap<String, MeasureFn>,
@@ -108,24 +110,38 @@ pub struct DataModel {
 }
 
 impl DataModel {
-    /// Create a new DataModel with an empty SessionContext.
-    pub fn new() -> Result<Self, DataFusionError> {
-        let rt = Runtime::new().map_err(|e| DataFusionError::External(Box::new(e)))?;
+    /// Create a new DataModel with a default SessionContext.
+    pub fn new() -> Self {
         // Disable Utf8View for parquet so string types stay consistent across
         // data sources (MemTable uses Utf8, Parquet defaults to Utf8View).
         // This matters for pre-aggregation where the optimizer swaps table scans.
         let config = SessionConfig::new()
             .set_bool("datafusion.execution.parquet.schema_force_view_types", false);
-        Ok(DataModel {
+        DataModel {
             ctx: SessionContext::new_with_config(config),
-            rt: Arc::new(rt),
             join_graph: None,
             table_schemas: HashMap::new(),
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
             pre_agg_objects: Vec::new(),
             probe_recorder: None,
-        })
+        }
+    }
+
+    /// Create a DataModel with a caller-provided SessionContext.
+    ///
+    /// Use this when you already have a runtime (e.g., axum, actix-web)
+    /// and want to share the same SessionContext.
+    pub fn with_context(ctx: SessionContext) -> Self {
+        DataModel {
+            ctx,
+            join_graph: None,
+            table_schemas: HashMap::new(),
+            measures: HashMap::new(),
+            measure_metadata: HashMap::new(),
+            pre_agg_objects: Vec::new(),
+            probe_recorder: None,
+        }
     }
 
     /// Register a RecordBatch as a named table.
@@ -143,48 +159,40 @@ impl DataModel {
 
         let schema = batch.schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])?;
-        self.rt
-            .block_on(async { self.ctx.register_table(name, Arc::new(mem_table)) })?;
+        self.ctx.register_table(name, Arc::new(mem_table))?;
         self.table_schemas.insert(name.to_string(), schema_names);
         Ok(())
     }
 
     /// Register a Parquet file as a named table.
-    pub fn register_parquet(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
-        self.rt.block_on(async {
-            self.ctx
-                .register_parquet(name, path, Default::default())
-                .await
-        })?;
+    pub async fn register_parquet(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
+        self.ctx
+            .register_parquet(name, path, Default::default())
+            .await?;
         // Extract schema from the registered table
-        let schema_names = self.rt.block_on(async {
-            let df = self.ctx.table(name).await?;
-            Ok::<Vec<String>, DataFusionError>(
-                df.schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}.{}", name, f.name().clone()))
-                    .collect(),
-            )
-        })?;
+        let df = self.ctx.table(name).await?;
+        let schema_names: Vec<String> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("{}.{}", name, f.name().clone()))
+            .collect();
         self.table_schemas.insert(name.to_string(), schema_names);
         Ok(())
     }
 
     /// Register a CSV file as a named table.
-    pub fn register_csv(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
-        self.rt
-            .block_on(async { self.ctx.register_csv(name, path, Default::default()).await })?;
-        let schema_names = self.rt.block_on(async {
-            let df = self.ctx.table(name).await?;
-            Ok::<Vec<String>, DataFusionError>(
-                df.schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}.{}", name, f.name().clone()))
-                    .collect(),
-            )
-        })?;
+    pub async fn register_csv(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
+        self.ctx
+            .register_csv(name, path, Default::default())
+            .await?;
+        let df = self.ctx.table(name).await?;
+        let schema_names: Vec<String> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("{}.{}", name, f.name().clone()))
+            .collect();
         self.table_schemas.insert(name.to_string(), schema_names);
         Ok(())
     }
@@ -204,7 +212,7 @@ impl DataModel {
     ///
     /// The measure is probed with an empty QueryContext to extract output columns,
     /// classify aggregate vs group-by columns, and record allow/exclude call metadata.
-    pub fn register_measure(
+    pub async fn register_measure(
         &mut self,
         name: &str,
         measure_fn: MeasureFn,
@@ -229,7 +237,7 @@ impl DataModel {
         let mut output_cols = Vec::new();
         let mut aggregate_cols = Vec::new();
 
-        if let Ok(df) = measure_fn(&probe_qc, self) {
+        if let Ok(df) = measure_fn(&probe_qc, self).await {
             output_cols = df
                 .schema()
                 .fields()
@@ -262,8 +270,8 @@ impl DataModel {
     /// Eagerly pre-joins all reachable tables via the JoinGraph so that
     /// cross-table column references work in the DataFrame API (which validates
     /// schemas at expression-building time, before the optimizer runs).
-    pub fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
-        let mut inner = self.rt.block_on(self.ctx.table(name))?;
+    pub async fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
+        let mut inner = self.ctx.table(name).await?;
 
         if let Some(ref join_graph) = self.join_graph {
             let mut joined_tables: HashSet<String> = HashSet::new();
@@ -281,7 +289,7 @@ impl DataModel {
                     if joined_tables.contains(&step.right) {
                         continue;
                     }
-                    let right_df = self.rt.block_on(self.ctx.table(&step.right))?;
+                    let right_df = self.ctx.table(&step.right).await?;
                     let left_on_qualified: Vec<String> = step.left_on.iter().map(|s| format!("{}.{}", step.left, s)).collect();
                     let right_on_qualified: Vec<String> = step.right_on.iter().map(|s| format!("{}.{}", step.right, s)).collect();
                     let left_on: Vec<&str> = left_on_qualified.iter().map(|s| s.as_str()).collect();
@@ -357,7 +365,7 @@ impl DataModel {
 
     /// Validate the QueryContext, register optimizer rules, and build a
     /// DataFrame for each requested measure (without collecting).
-    fn prepare_measure_dfs(
+    async fn prepare_measure_dfs(
         &self,
         qc: &QueryContext,
     ) -> Result<Vec<(String, DataFrame)>, DataFusionError> {
@@ -377,9 +385,7 @@ impl DataModel {
             // proper TableScan nodes with correct source and schema.
             let mut table_sources: HashMap<String, Arc<dyn TableSource>> = HashMap::new();
             for pa in &self.pre_agg_objects {
-                let provider = self.rt.block_on(async {
-                    self.ctx.table_provider(&pa.name).await
-                })?;
+                let provider = self.ctx.table_provider(&pa.name).await?;
                 table_sources.insert(
                     pa.name.clone(),
                     Arc::new(DefaultTableSource::new(provider)),
@@ -401,7 +407,7 @@ impl DataModel {
             let measure_fn = self.measures.get(measure_name).ok_or_else(|| {
                 DataFusionError::Plan(format!("Unknown measure: '{}'", measure_name))
             })?;
-            let df = measure_fn(qc, self)?;
+            let df = measure_fn(qc, self).await?;
             measure_dfs.push((measure_name.clone(), df));
         }
 
@@ -419,13 +425,13 @@ impl DataModel {
     /// 3. Calls each measure function to produce DataFrames
     /// 4. Combines measures (joins, havings, sorts, limit/offset)
     /// 5. Collects and returns results
-    pub fn collect(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let measure_dfs = self.prepare_measure_dfs(qc)?;
+    pub async fn collect(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let measure_dfs = self.prepare_measure_dfs(qc).await?;
         let borrowed: Vec<(&str, DataFrame)> = measure_dfs
             .iter()
             .map(|(n, df)| (n.as_str(), df.clone()))
             .collect();
-        combine_measures::combine_measure_results(&self.rt, borrowed, qc)
+        combine_measures::combine_measure_results(borrowed, qc).await
     }
 
     /// Return an explain DataFrame for the query plan without executing it.
@@ -433,13 +439,13 @@ impl DataModel {
     /// Works like `collect()` but calls DataFusion's `explain()` instead of
     /// collecting results. Accepts the same `verbose` and `analyze` flags
     /// as `DataFrame::explain()`.
-    pub fn explain(
+    pub async fn explain(
         &self,
         qc: &QueryContext,
         verbose: bool,
         analyze: bool,
     ) -> Result<DataFrame, DataFusionError> {
-        let measure_dfs = self.prepare_measure_dfs(qc)?;
+        let measure_dfs = self.prepare_measure_dfs(qc).await?;
         let borrowed: Vec<(&str, DataFrame)> = measure_dfs
             .iter()
             .map(|(n, df)| (n.as_str(), df.clone()))
@@ -480,19 +486,20 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn test_basic_query_no_groups() {
-        let mut dm = DataModel::new().unwrap();
+    #[tokio::test]
+    async fn test_basic_query_no_groups() {
+        let mut dm = DataModel::new();
         dm.register_record_batch("orders", make_orders_batch())
             .unwrap();
 
         dm.register_measure(
             "revenue",
-            Arc::new(|_qc, dm| {
-                dm.table("orders")?
+            Arc::new(|_qc, dm| Box::pin(async move {
+                dm.table("orders").await?
                     .aggregate(vec![], vec![sum(col("amount")).alias("revenue")])
-            }),
+            })),
         )
+        .await
         .unwrap();
 
         let qc = QueryContext::new(
@@ -507,7 +514,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
         let col = result[0]
@@ -519,15 +526,15 @@ mod tests {
         assert_eq!(col.value(0), 1000);
     }
 
-    #[test]
-    fn test_query_with_groups() {
-        let mut dm = DataModel::new().unwrap();
+    #[tokio::test]
+    async fn test_query_with_groups() {
+        let mut dm = DataModel::new();
         dm.register_record_batch("orders", make_orders_batch())
             .unwrap();
 
         dm.register_measure(
             "revenue",
-            Arc::new(|qc, dm| {
+            Arc::new(|qc, dm| Box::pin(async move {
                 let group_exprs = dm
                     .allow(
                         &["*".into()],
@@ -535,10 +542,11 @@ mod tests {
                         None,
                     )?
                     .into_exprs();
-                dm.table("orders")?
+                dm.table("orders").await?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-            }),
+            })),
         )
+        .await
         .unwrap();
 
         let qc = QueryContext::new(
@@ -553,20 +561,20 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
 
-    #[test]
-    fn test_query_with_having_and_sort() {
-        let mut dm = DataModel::new().unwrap();
+    #[tokio::test]
+    async fn test_query_with_having_and_sort() {
+        let mut dm = DataModel::new();
         dm.register_record_batch("orders", make_orders_batch())
             .unwrap();
 
         dm.register_measure(
             "revenue",
-            Arc::new(|qc, dm| {
+            Arc::new(|qc, dm| Box::pin(async move {
                 let group_exprs = dm
                     .allow(
                         &["*".into()],
@@ -574,10 +582,11 @@ mod tests {
                         None,
                     )?
                     .into_exprs();
-                dm.table("orders")?
+                dm.table("orders").await?
                     .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-            }),
+            })),
         )
+        .await
         .unwrap();
 
         let qc = QueryContext::new(
@@ -592,7 +601,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
         let col = result[0]
@@ -604,28 +613,30 @@ mod tests {
         assert_eq!(col.value(0), 550);
     }
 
-    #[test]
-    fn test_multi_measure() {
-        let mut dm = DataModel::new().unwrap();
+    #[tokio::test]
+    async fn test_multi_measure() {
+        let mut dm = DataModel::new();
         dm.register_record_batch("orders", make_orders_batch())
             .unwrap();
 
         dm.register_measure(
             "revenue",
-            Arc::new(|_qc, dm| {
-                dm.table("orders")?
+            Arc::new(|_qc, dm| Box::pin(async move {
+                dm.table("orders").await?
                     .aggregate(vec![], vec![sum(col("amount")).alias("revenue")])
-            }),
+            })),
         )
+        .await
         .unwrap();
 
         dm.register_measure(
             "total_quantity",
-            Arc::new(|_qc, dm| {
-                dm.table("orders")?
+            Arc::new(|_qc, dm| Box::pin(async move {
+                dm.table("orders").await?
                     .aggregate(vec![], vec![sum(col("quantity")).alias("total_quantity")])
-            }),
+            })),
         )
+        .await
         .unwrap();
 
         let qc = QueryContext::new(
@@ -640,14 +651,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
 
-    #[test]
-    fn test_auto_join() {
-        let mut dm = DataModel::new().unwrap();
+    #[tokio::test]
+    async fn test_auto_join() {
+        let mut dm = DataModel::new();
 
         let players_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -690,7 +701,7 @@ mod tests {
 
         dm.register_measure(
             "total_score",
-            Arc::new(|qc, dm| {
+            Arc::new(|qc, dm| Box::pin(async move {
                 let group_exprs = dm
                     .allow(
                         &["*".into()],
@@ -698,10 +709,11 @@ mod tests {
                         None,
                     )?
                     .into_exprs();
-                dm.table("player_stats")?
+                dm.table("player_stats").await?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
-            }),
+            })),
         )
+        .await
         .unwrap();
 
         let qc = QueryContext::new(
@@ -716,17 +728,17 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
 
-    #[test]
-    fn test_unreferenced_join_eliminated() {
+    #[tokio::test]
+    async fn test_unreferenced_join_eliminated() {
         // Setup: 3 tables, but the query only references player_stats and players.
         // "teams" is joined into the graph but never referenced in the query.
         // The EliminateUnusedJoins optimizer rule should remove the teams join.
-        let mut dm = DataModel::new().unwrap();
+        let mut dm = DataModel::new();
 
         let players = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -794,7 +806,7 @@ mod tests {
         // but NOT teams
         dm.register_measure(
             "total_score",
-            Arc::new(|qc, dm| {
+            Arc::new(|qc, dm| Box::pin(async move {
                 let group_exprs = dm
                     .allow(
                         &["*".into()],
@@ -802,10 +814,11 @@ mod tests {
                         None,
                     )?
                     .into_exprs();
-                dm.table("player_stats")?
+                dm.table("player_stats").await?
                     .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
-            }),
+            })),
         )
+        .await
         .unwrap();
 
         // Query through DataModel::collect() which registers optimizer rules
@@ -821,7 +834,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
 
         // Verify correct results: Alice=40, Bob=20
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
@@ -829,7 +842,7 @@ mod tests {
 
         // Also verify the plan does NOT contain "teams" by building a DF
         // with the optimizer registered (it was registered by collect() above)
-        let df = dm.table("player_stats").unwrap();
+        let df = dm.table("player_stats").await.unwrap();
         let group_exprs = vec![col("players.name")];
         let agg_df = df
             .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
@@ -858,7 +871,7 @@ mod tests {
 
     /// Build a DataModel with orders table + a pre-agg parquet registered.
     /// Returns (DataModel, TempDir) — keep TempDir alive for the test duration.
-    fn setup_pre_agg_dm(
+    async fn setup_pre_agg_dm(
         preagg_batch: RecordBatch,
         preagg_name: &str,
         pre_agg: PreAggregation,
@@ -867,10 +880,11 @@ mod tests {
         let preagg_path = tmp_dir.path().join(format!("{}.parquet", preagg_name));
         write_batch_to_parquet(&preagg_batch, &preagg_path);
 
-        let mut dm = DataModel::new().unwrap();
+        let mut dm = DataModel::new();
         dm.register_record_batch("orders", make_orders_batch())
             .unwrap();
         dm.register_parquet(preagg_name, preagg_path.to_str().unwrap())
+            .await
             .unwrap();
         dm.set_pre_aggregations(vec![pre_agg]);
 
@@ -904,26 +918,27 @@ mod tests {
         pa
     }
 
-    #[test]
-    fn test_pre_agg_sum_from_parquet() {
+    /// Helper to register the standard revenue measure with filter and group support.
+    fn revenue_measure() -> MeasureFn {
+        Arc::new(|qc, dm| Box::pin(async move {
+            let filter_expr =
+                dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
+            let group_exprs =
+                dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
+            dm.table("orders").await?
+                .filter(filter_expr)?
+                .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
+        }))
+    }
+
+    #[tokio::test]
+    async fn test_pre_agg_sum_from_parquet() {
         let preagg_batch = make_sum_preagg_batch();
         let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
         let (mut dm, _tmp) =
-            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa);
+            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa).await;
 
-        dm.register_measure(
-            "revenue",
-            Arc::new(|qc, dm| {
-                let filter_expr =
-                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
-                let group_exprs =
-                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
-                dm.table("orders")?
-                    .filter(filter_expr)?
-                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-            }),
-        )
-        .unwrap();
+        dm.register_measure("revenue", revenue_measure()).await.unwrap();
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
@@ -938,8 +953,8 @@ mod tests {
         .unwrap();
 
         // Verify explain references pre-agg table
-        let explain_df = dm.explain(&qc, false, false).unwrap();
-        let explain_batches = dm.rt.block_on(async { explain_df.collect().await }).unwrap();
+        let explain_df = dm.explain(&qc, false, false).await.unwrap();
+        let explain_batches = explain_df.collect().await.unwrap();
         let explain_str = format!("{:?}", explain_batches);
         assert!(
             explain_str.contains("regional_preagg"),
@@ -951,23 +966,11 @@ mod tests {
         let preagg_batch = make_sum_preagg_batch();
         let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
         let (mut dm2, _tmp2) =
-            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa);
+            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa).await;
 
-        dm2.register_measure(
-            "revenue",
-            Arc::new(|qc, dm| {
-                let filter_expr =
-                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
-                let group_exprs =
-                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
-                dm.table("orders")?
-                    .filter(filter_expr)?
-                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-            }),
-        )
-        .unwrap();
+        dm2.register_measure("revenue", revenue_measure()).await.unwrap();
 
-        let result = dm2.collect(&qc).unwrap();
+        let result = dm2.collect(&qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2, "Should have 2 rows (EU and US)");
 
@@ -992,26 +995,14 @@ mod tests {
         assert_eq!(revenue_col.value(1), 550);
     }
 
-    #[test]
-    fn test_pre_agg_with_filter() {
+    #[tokio::test]
+    async fn test_pre_agg_with_filter() {
         let preagg_batch = make_sum_preagg_batch();
         let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
         let (mut dm, _tmp) =
-            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa);
+            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa).await;
 
-        dm.register_measure(
-            "revenue",
-            Arc::new(|qc, dm| {
-                let filter_expr =
-                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
-                let group_exprs =
-                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
-                dm.table("orders")?
-                    .filter(filter_expr)?
-                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-            }),
-        )
-        .unwrap();
+        dm.register_measure("revenue", revenue_measure()).await.unwrap();
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
@@ -1025,7 +1016,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1, "Should have 1 row (US only)");
 
@@ -1039,26 +1030,14 @@ mod tests {
         assert_eq!(revenue_col.value(0), 550);
     }
 
-    #[test]
-    fn test_pre_agg_disabled_falls_back() {
+    #[tokio::test]
+    async fn test_pre_agg_disabled_falls_back() {
         let preagg_batch = make_sum_preagg_batch();
         let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
         let (mut dm, _tmp) =
-            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa);
+            setup_pre_agg_dm(preagg_batch, "regional_preagg", pa).await;
 
-        dm.register_measure(
-            "revenue",
-            Arc::new(|qc, dm| {
-                let filter_expr =
-                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
-                let group_exprs =
-                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
-                dm.table("orders")?
-                    .filter(filter_expr)?
-                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-            }),
-        )
-        .unwrap();
+        dm.register_measure("revenue", revenue_measure()).await.unwrap();
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
@@ -1073,8 +1052,8 @@ mod tests {
         .unwrap();
 
         // Verify explain does NOT reference pre-agg table
-        let explain_df = dm.explain(&qc, false, false).unwrap();
-        let explain_batches = dm.rt.block_on(async { explain_df.collect().await }).unwrap();
+        let explain_df = dm.explain(&qc, false, false).await.unwrap();
+        let explain_batches = explain_df.collect().await.unwrap();
         let explain_str = format!("{:?}", explain_batches);
         assert!(
             !explain_str.contains("regional_preagg"),
@@ -1083,8 +1062,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_pre_agg_no_coverage_falls_back() {
+    #[tokio::test]
+    async fn test_pre_agg_no_coverage_falls_back() {
         // Pre-agg only covers "region", but query groups by "category" (not covered)
         let schema = Arc::new(Schema::new(vec![
             Field::new("region", DataType::Utf8, false),
@@ -1106,29 +1085,18 @@ mod tests {
         let preagg_batch = make_sum_preagg_batch();
         write_batch_to_parquet(&preagg_batch, &preagg_path);
 
-        let mut dm = DataModel::new().unwrap();
+        let mut dm = DataModel::new();
         dm.register_record_batch("orders", orders_with_category)
             .unwrap();
         dm.register_parquet("regional_preagg", preagg_path.to_str().unwrap())
+            .await
             .unwrap();
 
         let mut pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
         pa.row_count = 2;
         dm.set_pre_aggregations(vec![pa]);
 
-        dm.register_measure(
-            "revenue",
-            Arc::new(|qc, dm| {
-                let filter_expr =
-                    dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
-                let group_exprs =
-                    dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
-                dm.table("orders")?
-                    .filter(filter_expr)?
-                    .aggregate(group_exprs, vec![sum(col("amount")).alias("revenue")])
-            }),
-        )
-        .unwrap();
+        dm.register_measure("revenue", revenue_measure()).await.unwrap();
 
         // Group by category — pre-agg doesn't cover this
         let qc = QueryContext::new(
@@ -1143,7 +1111,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2, "Should have 2 rows (A and B)");
 
@@ -1166,8 +1134,8 @@ mod tests {
         assert_eq!(revenue_col.value(1), 200);
     }
 
-    #[test]
-    fn test_pre_agg_count_rewrite() {
+    #[tokio::test]
+    async fn test_pre_agg_count_rewrite() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("region", DataType::Utf8, false),
             Field::new("amount-count", DataType::Int64, false),
@@ -1185,10 +1153,11 @@ mod tests {
         let preagg_path = tmp_dir.path().join("count_preagg.parquet");
         write_batch_to_parquet(&preagg_batch, &preagg_path);
 
-        let mut dm = DataModel::new().unwrap();
+        let mut dm = DataModel::new();
         dm.register_record_batch("orders", make_orders_batch())
             .unwrap();
         dm.register_parquet("count_preagg", preagg_path.to_str().unwrap())
+            .await
             .unwrap();
 
         let mut pa = PreAggregation::new(
@@ -1203,16 +1172,17 @@ mod tests {
 
         dm.register_measure(
             "order_count",
-            Arc::new(|qc, dm| {
+            Arc::new(|qc, dm| Box::pin(async move {
                 let filter_expr =
                     dm.allow(&["*".into()], FilterTree(&qc.filters), None)?.into_filter_expr();
                 let group_exprs =
                     dm.allow(&["*".into()], Columns(&qc.groups), None)?.into_exprs();
-                dm.table("orders")?
+                dm.table("orders").await?
                     .filter(filter_expr)?
                     .aggregate(group_exprs, vec![count(col("amount")).alias("order_count")])
-            }),
+            })),
         )
+        .await
         .unwrap();
 
         let qc = QueryContext::new(
@@ -1227,7 +1197,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dm.collect(&qc).unwrap();
+        let result = dm.collect(&qc).await.unwrap();
         let batch = &result[0];
         let count_col = batch
             .column_by_name("order_count")

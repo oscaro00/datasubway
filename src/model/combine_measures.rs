@@ -7,7 +7,6 @@ use arrow::array::RecordBatch;
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::SortExpr;
 use datafusion::prelude::*;
-use tokio::runtime::Runtime;
 
 use crate::model::filter_tree::filter_tree_to_expr;
 use crate::model::query_context::QueryContext;
@@ -97,13 +96,12 @@ pub fn combine_measure_dfs(
 }
 
 /// Combine multiple measure DataFrames and collect into RecordBatches.
-pub fn combine_measure_results(
-    rt: &Runtime,
+pub async fn combine_measure_results(
     measure_dfs: Vec<(&str, DataFrame)>,
     qc: &QueryContext,
 ) -> Result<Vec<RecordBatch>, DataFusionError> {
     let df = combine_measure_dfs(measure_dfs, qc)?;
-    rt.block_on(df.collect())
+    df.collect().await
 }
 
 /// Find group columns common to both left and right column lists.
@@ -148,14 +146,12 @@ mod tests {
     use std::sync::Arc;
 
     /// Helper: register a RecordBatch as a table and return a DataFrame.
-    fn batch_to_df(rt: &Runtime, ctx: &SessionContext, name: &str, batch: RecordBatch) -> DataFrame {
+    async fn batch_to_df(ctx: &SessionContext, name: &str, batch: RecordBatch) -> DataFrame {
         let schema = batch.schema();
         let mem_table =
             datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-        rt.block_on(async {
-            ctx.register_table(name, Arc::new(mem_table)).unwrap();
-            ctx.table(name).await.unwrap()
-        })
+        ctx.register_table(name, Arc::new(mem_table)).unwrap();
+        ctx.table(name).await.unwrap()
     }
 
     #[test]
@@ -185,16 +181,15 @@ mod tests {
         assert!(common.is_empty());
     }
 
-    #[test]
-    fn test_combine_single_measure() {
-        let rt = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_combine_single_measure() {
         let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("revenue", DataType::Int64, false)])),
             vec![Arc::new(arrow::array::Int64Array::from(vec![1000]))],
         )
         .unwrap();
-        let df = batch_to_df(&rt, &ctx, "m0", batch);
+        let df = batch_to_df(&ctx, "m0", batch).await;
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
@@ -202,14 +197,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = combine_measure_results(&rt, vec![("revenue", df)], &qc).unwrap();
+        let result = combine_measure_results(vec![("revenue", df)], &qc).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
     }
 
-    #[test]
-    fn test_combine_with_having() {
-        let rt = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_combine_with_having() {
         let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -222,7 +216,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let df = batch_to_df(&rt, &ctx, "m0", batch);
+        let df = batch_to_df(&ctx, "m0", batch).await;
 
         let havings = json!({"AND": [["revenue", ">", 500]]});
         let qc = QueryContext::new(
@@ -234,14 +228,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = combine_measure_results(&rt, vec![("revenue", df)], &qc).unwrap();
+        let result = combine_measure_results(vec![("revenue", df)], &qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
 
-    #[test]
-    fn test_combine_with_sort() {
-        let rt = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_combine_with_sort() {
         let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -254,7 +247,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let df = batch_to_df(&rt, &ctx, "m0", batch);
+        let df = batch_to_df(&ctx, "m0", batch).await;
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
@@ -266,7 +259,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = combine_measure_results(&rt, vec![("revenue", df)], &qc).unwrap();
+        let result = combine_measure_results(vec![("revenue", df)], &qc).await.unwrap();
         assert_eq!(result.len(), 1);
         let col = result[0]
             .column_by_name("revenue")
@@ -278,9 +271,8 @@ mod tests {
         assert_eq!(col.value(1), 550);
     }
 
-    #[test]
-    fn test_combine_with_limit_offset() {
-        let rt = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_combine_with_limit_offset() {
         let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -293,7 +285,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let df = batch_to_df(&rt, &ctx, "m0", batch);
+        let df = batch_to_df(&ctx, "m0", batch).await;
 
         let qc = QueryContext::new(
             vec!["revenue".into()],
@@ -307,7 +299,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = combine_measure_results(&rt, vec![("revenue", df)], &qc).unwrap();
+        let result = combine_measure_results(vec![("revenue", df)], &qc).await.unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
         let col = result[0]
@@ -319,9 +311,8 @@ mod tests {
         assert_eq!(col.value(0), 450);
     }
 
-    #[test]
-    fn test_combine_multi_measure_no_groups() {
-        let rt = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_combine_multi_measure_no_groups() {
         let ctx = SessionContext::new();
 
         let batch1 = RecordBatch::try_new(
@@ -335,8 +326,8 @@ mod tests {
         )
         .unwrap();
 
-        let df1 = batch_to_df(&rt, &ctx, "m0", batch1);
-        let df2 = batch_to_df(&rt, &ctx, "m1", batch2);
+        let df1 = batch_to_df(&ctx, "m0", batch1).await;
+        let df2 = batch_to_df(&ctx, "m1", batch2).await;
 
         let qc = QueryContext::new(
             vec!["revenue".into(), "total_quantity".into()],
@@ -345,18 +336,17 @@ mod tests {
         .unwrap();
 
         let result = combine_measure_results(
-            &rt,
             vec![("revenue", df1), ("total_quantity", df2)],
             &qc,
         )
+        .await
         .unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
 
-    #[test]
-    fn test_combine_multi_measure_with_groups() {
-        let rt = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_combine_multi_measure_with_groups() {
         let ctx = SessionContext::new();
 
         let batch1 = RecordBatch::try_new(
@@ -382,8 +372,8 @@ mod tests {
         )
         .unwrap();
 
-        let df1 = batch_to_df(&rt, &ctx, "m0", batch1);
-        let df2 = batch_to_df(&rt, &ctx, "m1", batch2);
+        let df1 = batch_to_df(&ctx, "m0", batch1).await;
+        let df2 = batch_to_df(&ctx, "m1", batch2).await;
 
         let qc = QueryContext::new(
             vec!["revenue".into(), "total_quantity".into()],
@@ -394,10 +384,10 @@ mod tests {
         .unwrap();
 
         let result = combine_measure_results(
-            &rt,
             vec![("revenue", df1), ("total_quantity", df2)],
             &qc,
         )
+        .await
         .unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
