@@ -5,6 +5,11 @@
 //! {"AND": [["col", "op", value], {"OR": [...]}]}
 //! ```
 //!
+//! Values can be literals (strings, numbers, booleans, null) or column references:
+//! ```json
+//! ["col1", "<=", {"column": "col2"}]
+//! ```
+//!
 //! Supported operators: =, !=, >, >=, <, <=, in, not in
 
 use datafusion::common::DataFusionError;
@@ -78,18 +83,18 @@ fn condition_to_expr(condition: &serde_json::Value) -> Result<Expr, DataFusionEr
             let column = col(col_name);
 
             match op {
-                "=" => Ok(column.eq(json_to_lit(value)?)),
-                "!=" => Ok(column.not_eq(json_to_lit(value)?)),
-                ">" => Ok(column.gt(json_to_lit(value)?)),
-                ">=" => Ok(column.gt_eq(json_to_lit(value)?)),
-                "<" => Ok(column.lt(json_to_lit(value)?)),
-                "<=" => Ok(column.lt_eq(json_to_lit(value)?)),
+                "=" => Ok(column.eq(json_to_expr(value)?)),
+                "!=" => Ok(column.not_eq(json_to_expr(value)?)),
+                ">" => Ok(column.gt(json_to_expr(value)?)),
+                ">=" => Ok(column.gt_eq(json_to_expr(value)?)),
+                "<" => Ok(column.lt(json_to_expr(value)?)),
+                "<=" => Ok(column.lt_eq(json_to_expr(value)?)),
                 "in" => {
-                    let list = json_to_lit_list(value)?;
+                    let list = json_to_expr_list(value)?;
                     Ok(column.in_list(list, false))
                 }
                 "not in" => {
-                    let list = json_to_lit_list(value)?;
+                    let list = json_to_expr_list(value)?;
                     Ok(column.in_list(list, true))
                 }
                 _ => Err(DataFusionError::Plan(format!(
@@ -104,9 +109,25 @@ fn condition_to_expr(condition: &serde_json::Value) -> Result<Expr, DataFusionEr
     }
 }
 
-/// Convert a JSON value to a DataFusion literal expression.
-fn json_to_lit(value: &serde_json::Value) -> Result<Expr, DataFusionError> {
+/// Convert a JSON value to a DataFusion expression (literal or column reference).
+///
+/// Column references use the tagged object format: `{"column": "col_name"}`.
+/// All other values are treated as literals.
+fn json_to_expr(value: &serde_json::Value) -> Result<Expr, DataFusionError> {
     match value {
+        serde_json::Value::Object(map) => {
+            if let Some(col_name) = map.get("column") {
+                let col_name = col_name.as_str().ok_or_else(|| {
+                    DataFusionError::Plan("Column reference name must be a string".into())
+                })?;
+                Ok(col(col_name))
+            } else {
+                Err(DataFusionError::Plan(format!(
+                    "Unsupported object in filter value: {:?}. Use {{\"column\": \"name\"}} for column references",
+                    map
+                )))
+            }
+        }
         serde_json::Value::String(s) => Ok(lit(s.as_str())),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -129,12 +150,12 @@ fn json_to_lit(value: &serde_json::Value) -> Result<Expr, DataFusionError> {
     }
 }
 
-/// Convert a JSON array to a list of DataFusion literal expressions (for in/not in).
-fn json_to_lit_list(value: &serde_json::Value) -> Result<Vec<Expr>, DataFusionError> {
+/// Convert a JSON array to a list of DataFusion expressions (for in/not in).
+fn json_to_expr_list(value: &serde_json::Value) -> Result<Vec<Expr>, DataFusionError> {
     let arr = value
         .as_array()
         .ok_or_else(|| DataFusionError::Plan("'in'/'not in' value must be an array".into()))?;
-    arr.iter().map(json_to_lit).collect()
+    arr.iter().map(json_to_expr).collect()
 }
 
 #[cfg(test)]
@@ -216,6 +237,34 @@ mod tests {
         let tree = json!({});
         let expr = filter_tree_to_expr(&tree).unwrap();
         assert_eq!(format!("{}", expr), "Boolean(true)");
+    }
+
+    #[test]
+    fn test_filter_tree_column_to_column() {
+        let tree = json!({
+            "AND": [
+                ["col1", "<=", {"column": "col2"}]
+            ]
+        });
+        let expr = filter_tree_to_expr(&tree).unwrap();
+        let display = format!("{}", expr);
+        assert!(display.contains("col1"), "Expected col1 in: {}", display);
+        assert!(display.contains("col2"), "Expected col2 in: {}", display);
+    }
+
+    #[test]
+    fn test_filter_tree_mixed_literal_and_column_ref() {
+        let tree = json!({
+            "AND": [
+                ["revenue", ">", 500],
+                ["col1", "=", {"column": "col2"}]
+            ]
+        });
+        let expr = filter_tree_to_expr(&tree).unwrap();
+        let display = format!("{}", expr);
+        assert!(display.contains("revenue"));
+        assert!(display.contains("col1"));
+        assert!(display.contains("col2"));
     }
 
     #[test]

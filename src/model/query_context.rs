@@ -158,6 +158,14 @@ fn extract_columns_from_filter_tree(value: &serde_json::Value) -> Vec<String> {
                             columns.push(col.to_string());
                         }
                     }
+                    // Check for column reference on the right-hand side: {"column": "name"}
+                    if tuple.len() >= 3 {
+                        if let serde_json::Value::Object(map) = &tuple[2] {
+                            if let Some(serde_json::Value::String(col)) = map.get("column") {
+                                columns.push(col.clone());
+                            }
+                        }
+                    }
                 } else {
                     columns.extend(extract_columns_from_filter_tree(item));
                 }
@@ -396,5 +404,28 @@ mod tests {
         let cols = qc.filter_columns();
         assert!(cols.contains(&"orders.region".to_string()));
         assert!(cols.contains(&"orders.date".to_string()));
+    }
+
+    #[test]
+    fn test_filter_column_extraction_with_column_ref() {
+        let filters = json!({
+            "AND": [
+                ["orders.amount", "<=", {"column": "orders.limit"}]
+            ]
+        });
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            Some(filters),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let cols = qc.filter_columns();
+        assert!(cols.contains(&"orders.amount".to_string()));
+        assert!(cols.contains(&"orders.limit".to_string()));
     }
 }
