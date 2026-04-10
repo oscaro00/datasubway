@@ -136,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pa.row_count = 2;
 
     dm.set_pre_aggregations(vec![pa]);
+    dm.add_custom_optimizers().await?;
 
     // Query revenue grouped by region — the optimizer should use the pre-agg
     let qc_preagg = QueryContext::new(

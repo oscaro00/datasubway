@@ -4,6 +4,7 @@
 //! DataFusion DataFrames using `allow()`/`exclude()` from `column_context`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
@@ -103,6 +104,14 @@ fn extract_expr_output_name(expr: &Expr) -> Option<String> {
 /// Manages data sources, joins, measures, pre-aggregations, and query execution.
 pub struct DataModel {
     ctx: SessionContext,
+    /// Separate context with the pre-aggregation optimizer rule registered.
+    /// Created by `add_custom_optimizers()` when pre-agg objects are present.
+    /// Shares the same catalog (table registrations) as `ctx` via Arc.
+    ctx_pre_agg: Option<SessionContext>,
+    /// Set to `true` by `prepare_measure_dfs` while building DataFrames for a
+    /// query that should use pre-aggregations. `active_ctx()` checks this flag
+    /// to return the appropriate SessionContext.
+    pre_agg_active: AtomicBool,
     join_graph: Option<JoinGraph>,
     table_schemas: HashMap<String, Vec<String>>,
     measures: HashMap<String, MeasureFn>,
@@ -123,6 +132,8 @@ impl DataModel {
         );
         DataModel {
             ctx: SessionContext::new_with_config(config),
+            ctx_pre_agg: None,
+            pre_agg_active: AtomicBool::new(false),
             join_graph: None,
             table_schemas: HashMap::new(),
             measures: HashMap::new(),
@@ -139,6 +150,8 @@ impl DataModel {
     pub fn with_context(ctx: SessionContext) -> Self {
         DataModel {
             ctx,
+            ctx_pre_agg: None,
+            pre_agg_active: AtomicBool::new(false),
             join_graph: None,
             table_schemas: HashMap::new(),
             measures: HashMap::new(),
@@ -273,13 +286,27 @@ impl DataModel {
         Ok(())
     }
 
+    /// Return the active SessionContext for the current query.
+    ///
+    /// When `pre_agg_active` is set (by `prepare_measure_dfs` for queries
+    /// with `use_pre_agg=true`), returns `ctx_pre_agg` so that DataFrames
+    /// are optimized with the pre-aggregation rule. Otherwise returns `ctx`.
+    fn active_ctx(&self) -> &SessionContext {
+        if self.pre_agg_active.load(Ordering::Relaxed) {
+            self.ctx_pre_agg.as_ref().unwrap_or(&self.ctx)
+        } else {
+            &self.ctx
+        }
+    }
+
     /// Get a DataFusion DataFrame for a registered table.
     ///
     /// Eagerly pre-joins all reachable tables via the JoinGraph so that
     /// cross-table column references work in the DataFrame API (which validates
     /// schemas at expression-building time, before the optimizer runs).
     pub async fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
-        let mut inner = self.ctx.table(name).await?;
+        let ctx = self.active_ctx();
+        let mut inner = ctx.table(name).await?;
 
         if let Some(ref join_graph) = self.join_graph {
             let mut joined_tables: HashSet<String> = HashSet::new();
@@ -297,7 +324,7 @@ impl DataModel {
                     if joined_tables.contains(&step.right) {
                         continue;
                     }
-                    let right_df = self.ctx.table(&step.right).await?;
+                    let right_df = ctx.table(&step.right).await?;
                     let left_on_qualified: Vec<String> = step
                         .left_on
                         .iter()
@@ -380,8 +407,40 @@ impl DataModel {
         column_context::exclude(patterns, input, columns)
     }
 
-    /// Validate the QueryContext, register optimizer rules, and build a
-    /// DataFrame for each requested measure (without collecting).
+    /// Register custom optimizer rules on the SessionContext.
+    ///
+    /// Call this once after all tables, joins, and pre-aggregations have been
+    /// configured. The rules are added to the session and will apply to every
+    /// subsequent query.
+    pub async fn add_custom_optimizers(&mut self) -> Result<(), DataFusionError> {
+        // Add the join-elimination rule to the base context (always active).
+        if let Some(ref jg) = self.join_graph {
+            let elim_rule = EliminateUnusedJoins::new(jg.clone());
+            self.ctx.add_optimizer_rule(Arc::new(elim_rule));
+        }
+
+        // Build a separate context for pre-aggregation queries.
+        // It shares the same catalog (table registrations) as `ctx` via Arc,
+        // but carries the PreAggSubstitution optimizer rule.
+        if !self.pre_agg_objects.is_empty() {
+            let mut table_sources: HashMap<String, Arc<dyn TableSource>> = HashMap::new();
+            for pa in &self.pre_agg_objects {
+                let provider = self.ctx.table_provider(&pa.name).await?;
+                table_sources.insert(pa.name.clone(), Arc::new(DefaultTableSource::new(provider)));
+            }
+            let rule = PreAggSubstitution::new(self.pre_agg_objects.clone(), table_sources);
+
+            // Snapshot the current state (inherits join-elimination rule + catalog)
+            let ctx_pre_agg = SessionContext::new_with_state(self.ctx.state());
+            ctx_pre_agg.add_optimizer_rule(Arc::new(rule));
+            self.ctx_pre_agg = Some(ctx_pre_agg);
+        }
+
+        Ok(())
+    }
+
+    /// Validate the QueryContext and build a DataFrame for each requested
+    /// measure (without collecting).
     async fn prepare_measure_dfs(
         &self,
         qc: &QueryContext,
@@ -393,22 +452,9 @@ impl DataModel {
         qc.validate(&measure_metadata, &all_cols)
             .map_err(|e| DataFusionError::Plan(e))?;
 
-        // Register optimizer rules if applicable
-        if !self.pre_agg_objects.is_empty() && qc.use_pre_agg {
-            // Look up table sources for each pre-agg so the optimizer can build
-            // proper TableScan nodes with correct source and schema.
-            let mut table_sources: HashMap<String, Arc<dyn TableSource>> = HashMap::new();
-            for pa in &self.pre_agg_objects {
-                let provider = self.ctx.table_provider(&pa.name).await?;
-                table_sources.insert(pa.name.clone(), Arc::new(DefaultTableSource::new(provider)));
-            }
-            let rule = PreAggSubstitution::new(self.pre_agg_objects.clone(), table_sources);
-            self.ctx.add_optimizer_rule(Arc::new(rule));
-        }
-        if let Some(ref jg) = self.join_graph {
-            let elim_rule = EliminateUnusedJoins::new(jg.clone());
-            self.ctx.add_optimizer_rule(Arc::new(elim_rule));
-        }
+        // Select the pre-agg context for this query when applicable.
+        let use_pre_agg = qc.use_pre_agg && self.ctx_pre_agg.is_some();
+        self.pre_agg_active.store(use_pre_agg, Ordering::Relaxed);
 
         // Build each measure DataFrame (no collect)
         let mut measure_dfs: Vec<(String, DataFrame)> = Vec::new();
@@ -420,6 +466,9 @@ impl DataModel {
             measure_dfs.push((measure_name.clone(), df));
         }
 
+        // Reset to base context.
+        self.pre_agg_active.store(false, Ordering::Relaxed);
+
         if measure_dfs.is_empty() {
             return Err(DataFusionError::Plan("No measure results produced".into()));
         }
@@ -430,10 +479,9 @@ impl DataModel {
     /// Collect query results as RecordBatches.
     ///
     /// 1. Validates the QueryContext
-    /// 2. Registers optimizer rules
-    /// 3. Calls each measure function to produce DataFrames
-    /// 4. Combines measures (joins, havings, sorts, limit/offset)
-    /// 5. Collects and returns results
+    /// 2. Calls each measure function to produce DataFrames
+    /// 3. Combines measures (joins, havings, sorts, limit/offset)
+    /// 4. Collects and returns results
     pub async fn collect(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
         let measure_dfs = self.prepare_measure_dfs(qc).await?;
         let borrowed: Vec<(&str, DataFrame)> = measure_dfs
@@ -829,6 +877,8 @@ mod tests {
         ])
         .unwrap();
 
+        dm.add_custom_optimizers().await.unwrap();
+
         // Register a measure that references player_stats.score and players.name
         // but NOT teams
         dm.register_measure(
@@ -851,7 +901,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Query through DataModel::collect() which registers optimizer rules
+        // Query through DataModel::collect()
         let qc = QueryContext::new(
             vec!["total_score".into()],
             None,
@@ -870,8 +920,7 @@ mod tests {
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2, "Should have 2 rows (Alice and Bob)");
 
-        // Also verify the plan does NOT contain "teams" by building a DF
-        // with the optimizer registered (it was registered by collect() above)
+        // Also verify the plan does NOT contain "teams"
         let df = dm.table("player_stats").await.unwrap();
         let group_exprs = vec![col("players.name")];
         let agg_df = df
@@ -916,6 +965,7 @@ mod tests {
             .await
             .unwrap();
         dm.set_pre_aggregations(vec![pre_agg]);
+        dm.add_custom_optimizers().await.unwrap();
 
         (dm, tmp_dir)
     }
@@ -1133,6 +1183,7 @@ mod tests {
         let mut pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
         pa.row_count = 2;
         dm.set_pre_aggregations(vec![pa]);
+        dm.add_custom_optimizers().await.unwrap();
 
         dm.register_measure("revenue", revenue_measure())
             .await
@@ -1209,6 +1260,7 @@ mod tests {
         .unwrap();
         pa.row_count = 2;
         dm.set_pre_aggregations(vec![pa]);
+        dm.add_custom_optimizers().await.unwrap();
 
         dm.register_measure(
             "order_count",

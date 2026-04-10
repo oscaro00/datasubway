@@ -248,8 +248,6 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
-- Is the auto join rule necessary if all possible tables are immediately joined to create a valid schema, then eliminate joins rule removes unnecessary tables?
-  - I'm not sure if table() in data_model calls common functions with the auto join rule or not
 - Parameter to only look at pre aggregations within a certain time frame
 
 
