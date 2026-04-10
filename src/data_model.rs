@@ -17,6 +17,7 @@ use futures::future::BoxFuture;
 
 use crate::model::column_context;
 use crate::model::combine_measures;
+use crate::model::data_sources;
 use crate::model::joins::{Join, JoinGraph, JoinHow};
 use crate::model::pre_agg::PreAggregation;
 use crate::model::query_context::{MeasureMetadata, QueryContext};
@@ -161,22 +162,13 @@ impl DataModel {
         }
     }
 
-    /// Register a RecordBatch as a named table.
+    /// Register a RecordBatch as an in-memory table.
     pub fn register_record_batch(
         &mut self,
         name: &str,
         batch: RecordBatch,
     ) -> Result<(), DataFusionError> {
-        let schema_names: Vec<String> = batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| format!("{}.{}", name, f.name()))
-            .collect();
-
-        let schema = batch.schema();
-        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])?;
-        self.ctx.register_table(name, Arc::new(mem_table))?;
+        let schema_names = data_sources::register_record_batch(&self.ctx, name, batch)?;
         self.table_schemas.insert(name.to_string(), schema_names);
         Ok(())
     }
@@ -187,33 +179,28 @@ impl DataModel {
         name: &str,
         path: &str,
     ) -> Result<(), DataFusionError> {
-        self.ctx
-            .register_parquet(name, path, Default::default())
-            .await?;
-        // Extract schema from the registered table
-        let df = self.ctx.table(name).await?;
-        let schema_names: Vec<String> = df
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| format!("{}.{}", name, f.name().clone()))
-            .collect();
+        let schema_names = data_sources::register_parquet(&self.ctx, name, path).await?;
         self.table_schemas.insert(name.to_string(), schema_names);
         Ok(())
     }
 
     /// Register a CSV file as a named table.
     pub async fn register_csv(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
-        self.ctx
-            .register_csv(name, path, Default::default())
-            .await?;
-        let df = self.ctx.table(name).await?;
-        let schema_names: Vec<String> = df
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| format!("{}.{}", name, f.name().clone()))
-            .collect();
+        let schema_names = data_sources::register_csv(&self.ctx, name, path).await?;
+        self.table_schemas.insert(name.to_string(), schema_names);
+        Ok(())
+    }
+
+    /// Register a newline-delimited JSON file as a named table.
+    pub async fn register_json(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
+        let schema_names = data_sources::register_json(&self.ctx, name, path).await?;
+        self.table_schemas.insert(name.to_string(), schema_names);
+        Ok(())
+    }
+
+    /// Register an Arrow IPC file as a named table.
+    pub async fn register_arrow(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
+        let schema_names = data_sources::register_arrow(&self.ctx, name, path).await?;
         self.table_schemas.insert(name.to_string(), schema_names);
         Ok(())
     }
