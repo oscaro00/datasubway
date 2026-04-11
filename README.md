@@ -248,9 +248,8 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
+
 - Parameter to only look at pre aggregations within a certain time frame
-
-
 - Logging (there is a datafusion OTEL rust crate)
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files

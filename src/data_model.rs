@@ -100,6 +100,26 @@ fn extract_expr_output_name(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Infer the base table from the first aggregation column name.
+///
+/// Uses the table prefix from the first aggregation key (e.g. "orders.amount" → "orders").
+/// The aggregation table is chosen as the base because join directions may not be
+/// bidirectional — the fact table that owns the measures is the natural entry point.
+fn infer_source_table(
+    aggregations: &HashMap<String, Vec<String>>,
+) -> Result<String, DataFusionError> {
+    for col_name in aggregations.keys() {
+        if col_name.contains('.') {
+            return Ok(col_name.split('.').next().unwrap().to_string());
+        }
+    }
+
+    Err(DataFusionError::Plan(
+        "Cannot infer source table: no qualified column names (expected table.column format)"
+            .into(),
+    ))
+}
+
 /// Standalone Rust semantic layer model backed by DataFusion.
 ///
 /// Manages data sources, joins, measures, pre-aggregations, and query execution.
@@ -118,6 +138,7 @@ pub struct DataModel {
     measures: HashMap<String, MeasureFn>,
     measure_metadata: HashMap<String, MeasureMetadata>,
     pre_agg_objects: Vec<PreAggregation>,
+    pre_agg_path: Option<String>,
     probe_recorder: Option<Arc<Mutex<Vec<AllowExcludeRecord>>>>,
 }
 
@@ -140,6 +161,7 @@ impl DataModel {
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
             pre_agg_objects: Vec::new(),
+            pre_agg_path: None,
             probe_recorder: None,
         }
     }
@@ -158,6 +180,7 @@ impl DataModel {
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
             pre_agg_objects: Vec::new(),
+            pre_agg_path: None,
             probe_recorder: None,
         }
     }
@@ -214,6 +237,136 @@ impl DataModel {
     /// Set pre-aggregation objects.
     pub fn set_pre_aggregations(&mut self, pre_aggs: Vec<PreAggregation>) {
         self.pre_agg_objects = pre_aggs;
+    }
+
+    /// Set the base directory for pre-aggregation parquet files.
+    pub fn set_pre_agg_path(&mut self, path: &str) {
+        self.pre_agg_path = Some(path.to_string());
+    }
+
+    /// Register pre-aggregation definitions without writing them.
+    pub fn register_pre_agg(&mut self, pre_aggs: Vec<PreAggregation>) {
+        self.pre_agg_objects.extend(pre_aggs);
+    }
+
+    /// Compute, write, and activate pre-aggregations.
+    ///
+    /// For each provided `PreAggregation`:
+    /// 1. Infers the source table from qualified column names
+    /// 2. Builds and executes the aggregation query
+    /// 3. Writes results to `{pre_agg_path}/{name}.parquet`
+    /// 4. Registers the parquet as a named table
+    /// 5. Rebuilds the pre-aggregation optimizer context
+    pub async fn write_pre_agg(
+        &mut self,
+        pre_aggs: Vec<PreAggregation>,
+    ) -> Result<(), DataFusionError> {
+        let base_path = self
+            .pre_agg_path
+            .as_ref()
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "pre_agg_path not set — call set_pre_agg_path() first".into(),
+                )
+            })?
+            .clone();
+
+        let base = std::path::Path::new(&base_path);
+        std::fs::create_dir_all(base).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to create pre-agg directory: {}", e))
+        })?;
+
+        for pa in pre_aggs {
+            // Infer source table from qualified column names
+            let source_table = infer_source_table(&pa.aggregations)?;
+
+            // Build the aggregation query
+            let df = self.table(&source_table).await?;
+
+            // Strip table prefix for parquet column names (optimizer uses unqualified names)
+            let strip_prefix = |s: &str| -> String {
+                s.split('.').last().unwrap_or(s).to_string()
+            };
+
+            let group_exprs: Vec<Expr> = pa
+                .group_by
+                .iter()
+                .map(|c| col(c.as_str()).alias(strip_prefix(c)))
+                .collect();
+
+            let mut agg_exprs: Vec<Expr> = Vec::new();
+            for (col_name, components) in &pa.aggregations {
+                let unqualified = strip_prefix(col_name);
+                for comp in components {
+                    let src_col = col(col_name.as_str());
+                    let agg_expr = match comp.as_str() {
+                        "sum" => datafusion_functions_aggregate::sum::sum(src_col),
+                        "count" => datafusion_functions_aggregate::count::count(src_col),
+                        "min" => datafusion_functions_aggregate::min_max::min(src_col),
+                        "max" => datafusion_functions_aggregate::min_max::max(src_col),
+                        "sumsq" => datafusion_functions_aggregate::sum::sum(
+                            src_col.clone() * src_col,
+                        ),
+                        other => {
+                            return Err(DataFusionError::Plan(format!(
+                                "Unsupported pre-agg component: {}",
+                                other
+                            )));
+                        }
+                    };
+                    let alias = PreAggregation::component_column(&unqualified, comp);
+                    agg_exprs.push(agg_expr.alias(&alias));
+                }
+            }
+
+            let result_df = df.aggregate(group_exprs, agg_exprs)?;
+            let batches = result_df.collect().await?;
+
+            // Write to parquet
+            let parquet_path = base.join(format!("{}.parquet", pa.name));
+            let mut total_rows: u64 = 0;
+            if let Some(batch) = batches.first() {
+                let schema = batch.schema();
+                let file = std::fs::File::create(&parquet_path).map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to create parquet file: {}", e))
+                })?;
+                let mut writer =
+                    parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None)?;
+                for b in &batches {
+                    writer.write(b)?;
+                    total_rows += b.num_rows() as u64;
+                }
+                writer.close()?;
+            }
+
+            // Build stored PreAggregation with unqualified column names
+            let stored_group_by: Vec<String> =
+                pa.group_by.iter().map(|c| strip_prefix(c)).collect();
+            let stored_aggs: HashMap<String, Vec<String>> = pa
+                .aggregations
+                .iter()
+                .map(|(k, v)| (strip_prefix(k), v.clone()))
+                .collect();
+
+            let stored_pa = PreAggregation {
+                name: pa.name.clone(),
+                group_by: stored_group_by,
+                aggregations: stored_aggs,
+                row_count: total_rows,
+                written_at: Some(format!("{:?}", std::time::SystemTime::now())),
+            };
+
+            // Register the parquet file as a table
+            self.register_parquet(&pa.name, parquet_path.to_str().unwrap())
+                .await?;
+
+            self.pre_agg_objects.push(stored_pa);
+        }
+
+        // Rebuild the pre-agg optimizer context
+        self.add_custom_optimizers().await?;
+
+        Ok(())
     }
 
     /// Register a measure function.
@@ -972,12 +1125,11 @@ mod tests {
         .unwrap()
     }
 
-    fn make_sum_pre_agg_object(preagg_name: &str, file_path: &str) -> PreAggregation {
+    fn make_sum_pre_agg_object(preagg_name: &str) -> PreAggregation {
         let mut pa = PreAggregation::new(
             preagg_name.into(),
             vec!["region".into()],
             HashMap::from([("amount".into(), vec!["sum".into()])]),
-            file_path.into(),
         )
         .unwrap();
         pa.row_count = 2;
@@ -1005,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn test_pre_agg_sum_from_parquet() {
         let preagg_batch = make_sum_preagg_batch();
-        let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let pa = make_sum_pre_agg_object("regional_preagg");
         let (mut dm, _tmp) = setup_pre_agg_dm(preagg_batch, "regional_preagg", pa).await;
 
         dm.register_measure("revenue", revenue_measure())
@@ -1036,7 +1188,7 @@ mod tests {
 
         // Need a fresh DataModel for collect (optimizer rules accumulate)
         let preagg_batch = make_sum_preagg_batch();
-        let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let pa = make_sum_pre_agg_object("regional_preagg");
         let (mut dm2, _tmp2) = setup_pre_agg_dm(preagg_batch, "regional_preagg", pa).await;
 
         dm2.register_measure("revenue", revenue_measure())
@@ -1071,7 +1223,7 @@ mod tests {
     #[tokio::test]
     async fn test_pre_agg_with_filter() {
         let preagg_batch = make_sum_preagg_batch();
-        let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let pa = make_sum_pre_agg_object("regional_preagg");
         let (mut dm, _tmp) = setup_pre_agg_dm(preagg_batch, "regional_preagg", pa).await;
 
         dm.register_measure("revenue", revenue_measure())
@@ -1107,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn test_pre_agg_disabled_falls_back() {
         let preagg_batch = make_sum_preagg_batch();
-        let pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let pa = make_sum_pre_agg_object("regional_preagg");
         let (mut dm, _tmp) = setup_pre_agg_dm(preagg_batch, "regional_preagg", pa).await;
 
         dm.register_measure("revenue", revenue_measure())
@@ -1167,7 +1319,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut pa = make_sum_pre_agg_object("regional_preagg", "regional_preagg.parquet");
+        let mut pa = make_sum_pre_agg_object("regional_preagg");
         pa.row_count = 2;
         dm.set_pre_aggregations(vec![pa]);
         dm.add_custom_optimizers().await.unwrap();
@@ -1242,7 +1394,6 @@ mod tests {
             "count_preagg".into(),
             vec!["region".into()],
             HashMap::from([("amount".into(), vec!["count".into()])]),
-            "count_preagg.parquet".into(),
         )
         .unwrap();
         pa.row_count = 2;

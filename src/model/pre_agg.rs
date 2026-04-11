@@ -36,7 +36,6 @@ pub struct PreAggregation {
     pub group_by: Vec<String>,
     /// col_name -> list of component suffixes stored (e.g. "orders.amount" -> ["sum", "count"])
     pub aggregations: HashMap<String, Vec<String>>,
-    pub file_path: String,
     pub row_count: u64,
     pub written_at: Option<String>,
 }
@@ -47,7 +46,6 @@ impl PreAggregation {
         name: String,
         group_by: Vec<String>,
         raw_aggregations: HashMap<String, Vec<String>>,
-        file_path: String,
     ) -> Result<Self, String> {
         if group_by.is_empty() {
             return Err("group_by must not be empty".into());
@@ -73,7 +71,6 @@ impl PreAggregation {
             name,
             group_by,
             aggregations,
-            file_path,
             row_count: 0,
             written_at: None,
         })
@@ -156,7 +153,6 @@ mod tests {
                 ("orders.amount".into(), vec!["sum".into(), "mean".into()]),
                 ("orders.quantity".into(), vec!["sum".into()]),
             ]),
-            "_pre_aggregations/daily_revenue.parquet".into(),
         )
         .unwrap()
     }
@@ -255,7 +251,6 @@ mod tests {
             "monthly_revenue".into(),
             vec!["orders.date".into(), "orders.region".into()],
             HashMap::from([("orders.amount".into(), vec!["sum".into()])]),
-            "_pre_aggregations/monthly_revenue.parquet".into(),
         )
         .unwrap();
         pa2.row_count = 100; // smaller

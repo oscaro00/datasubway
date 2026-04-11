@@ -98,45 +98,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Pre-Aggregation Demo ===\n");
 
-    // Build a pre-aggregated RecordBatch with component columns.
-    // This represents a pre-computed "revenue by region" summary.
-    let preagg_batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount-sum", DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(StringArray::from(vec!["EU", "US"])),
-            Arc::new(Int64Array::from(vec![450, 550])), // pre-computed sums
-        ],
-    )?;
-
-    // Write to a temp parquet file
+    // 1. Set the output directory for pre-agg parquet files
     let tmp_dir = std::env::temp_dir().join("datasubway_demo");
-    std::fs::create_dir_all(&tmp_dir)?;
-    let preagg_path = tmp_dir.join("regional_revenue.parquet");
-    {
-        let file = std::fs::File::create(&preagg_path)?;
-        let mut writer = parquet::arrow::ArrowWriter::try_new(file, preagg_batch.schema(), None)?;
-        writer.write(&preagg_batch)?;
-        writer.close()?;
-    }
+    dm.set_pre_agg_path(tmp_dir.to_str().unwrap());
 
-    // Register the pre-agg parquet and set up the PreAggregation metadata
-    dm.register_parquet("regional_revenue_preagg", preagg_path.to_str().unwrap())
-        .await?;
-
-    let mut pa = PreAggregation::new(
+    // 2. Define the pre-aggregation
+    let pa = PreAggregation::new(
         "regional_revenue_preagg".into(),
-        vec!["region".into()],
-        HashMap::from([("amount".into(), vec!["sum".into()])]),
-        preagg_path.to_str().unwrap().into(),
+        vec!["orders.region".into()],
+        HashMap::from([("orders.amount".into(), vec!["sum".into()])]),
     )
     .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-    pa.row_count = 2;
 
-    dm.set_pre_aggregations(vec![pa]);
-    dm.add_custom_optimizers().await?;
+    // 3. Write it — computes the aggregation, writes parquet, registers optimizers
+    dm.write_pre_agg(vec![pa]).await?;
 
     // Query revenue grouped by region — the optimizer should use the pre-agg
     let qc_preagg = QueryContext::new(

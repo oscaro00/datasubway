@@ -397,7 +397,6 @@ mod tests {
             "regional_revenue".into(),
             vec!["region".into()],
             HashMap::from([("amount".into(), vec!["sum".into()])]),
-            "_preagg/regional_revenue.parquet".into(),
         )
         .unwrap();
         pa.row_count = 2;
@@ -499,7 +498,6 @@ mod tests {
             "wrong_preagg".into(),
             vec!["date".into()],
             HashMap::from([("quantity".into(), vec!["sum".into()])]),
-            "_preagg/wrong.parquet".into(),
         )
         .unwrap();
 
