@@ -122,9 +122,17 @@ impl PreAggregation {
         true
     }
 
-    /// Column name for a stored component, e.g. "orders.amount-sum"
+    /// Bare column name for a stored component, e.g. "amount-sum".
+    /// Strips the table qualifier from the column name before appending the component.
     pub fn component_column(col: &str, component: &str) -> String {
-        format!("{}-{}", col, component)
+        let bare = col.rsplit('.').next().unwrap_or(col);
+        format!("{}-{}", bare, component)
+    }
+
+    /// Extract the source table name from the qualified group-by columns.
+    /// Returns the table qualifier of the first group-by column (e.g. "orders").
+    pub fn source_table(&self) -> Option<&str> {
+        self.group_by.first()?.split('.').next()
     }
 }
 
@@ -270,7 +278,7 @@ mod tests {
     fn test_component_column_naming() {
         assert_eq!(
             PreAggregation::component_column("orders.amount", "sum"),
-            "orders.amount-sum"
+            "amount-sum"
         );
     }
 }

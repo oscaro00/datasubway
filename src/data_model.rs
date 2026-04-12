@@ -126,7 +126,7 @@ fn infer_source_table(
 pub struct DataModel {
     ctx: SessionContext,
     /// Separate context with the pre-aggregation optimizer rule registered.
-    /// Created by `add_custom_optimizers()` when pre-agg objects are present.
+    /// Created by `build_pre_agg_optimizer()` when pre-agg objects are present.
     /// Shares the same catalog (table registrations) as `ctx` via Arc.
     ctx_pre_agg: Option<SessionContext>,
     /// Set to `true` by `prepare_measure_dfs` while building DataFrames for a
@@ -231,6 +231,8 @@ impl DataModel {
     /// Set the join graph from a list of Join specifications.
     pub fn set_joins(&mut self, joins: &[Join]) -> Result<(), String> {
         self.join_graph = Some(JoinGraph::new(joins)?);
+        let elim_rule = EliminateUnusedJoins::new(self.join_graph.as_ref().unwrap().clone());
+        self.ctx.add_optimizer_rule(Arc::new(elim_rule));
         Ok(())
     }
 
@@ -283,20 +285,19 @@ impl DataModel {
             // Build the aggregation query
             let df = self.table(&source_table).await?;
 
-            // Strip table prefix for parquet column names (optimizer uses unqualified names)
-            let strip_prefix = |s: &str| -> String {
-                s.split('.').last().unwrap_or(s).to_string()
-            };
-
+            // Use bare column names in parquet — DataFusion's col() resolves
+            // "orders.region" to Column { relation: Some("orders"), name: "region" },
+            // and the Arrow output field name is just "region".
+            // The optimizer wraps the pre-agg scan in a SubqueryAlias to restore
+            // the original table qualifier.
             let group_exprs: Vec<Expr> = pa
                 .group_by
                 .iter()
-                .map(|c| col(c.as_str()).alias(strip_prefix(c)))
+                .map(|c| col(c.as_str()))
                 .collect();
 
             let mut agg_exprs: Vec<Expr> = Vec::new();
             for (col_name, components) in &pa.aggregations {
-                let unqualified = strip_prefix(col_name);
                 for comp in components {
                     let src_col = col(col_name.as_str());
                     let agg_expr = match comp.as_str() {
@@ -314,7 +315,7 @@ impl DataModel {
                             )));
                         }
                     };
-                    let alias = PreAggregation::component_column(&unqualified, comp);
+                    let alias = PreAggregation::component_column(col_name, comp);
                     agg_exprs.push(agg_expr.alias(&alias));
                 }
             }
@@ -339,19 +340,11 @@ impl DataModel {
                 writer.close()?;
             }
 
-            // Build stored PreAggregation with unqualified column names
-            let stored_group_by: Vec<String> =
-                pa.group_by.iter().map(|c| strip_prefix(c)).collect();
-            let stored_aggs: HashMap<String, Vec<String>> = pa
-                .aggregations
-                .iter()
-                .map(|(k, v)| (strip_prefix(k), v.clone()))
-                .collect();
-
+            // Store PreAggregation with qualified column names
             let stored_pa = PreAggregation {
                 name: pa.name.clone(),
-                group_by: stored_group_by,
-                aggregations: stored_aggs,
+                group_by: pa.group_by.clone(),
+                aggregations: pa.aggregations.clone(),
                 row_count: total_rows,
                 written_at: Some(format!("{:?}", std::time::SystemTime::now())),
             };
@@ -364,7 +357,7 @@ impl DataModel {
         }
 
         // Rebuild the pre-agg optimizer context
-        self.add_custom_optimizers().await?;
+        self.build_pre_agg_optimizer().await?;
 
         Ok(())
     }
@@ -547,21 +540,13 @@ impl DataModel {
         column_context::exclude(patterns, input, columns)
     }
 
-    /// Register custom optimizer rules on the SessionContext.
+    /// Build (or rebuild) the pre-aggregation optimizer context.
     ///
-    /// Call this once after all tables, joins, and pre-aggregations have been
-    /// configured. The rules are added to the session and will apply to every
-    /// subsequent query.
-    pub async fn add_custom_optimizers(&mut self) -> Result<(), DataFusionError> {
-        // Add the join-elimination rule to the base context (always active).
-        if let Some(ref jg) = self.join_graph {
-            let elim_rule = EliminateUnusedJoins::new(jg.clone());
-            self.ctx.add_optimizer_rule(Arc::new(elim_rule));
-        }
-
-        // Build a separate context for pre-aggregation queries.
-        // It shares the same catalog (table registrations) as `ctx` via Arc,
-        // but carries the PreAggSubstitution optimizer rule.
+    /// Creates `ctx_pre_agg` — a SessionContext that snapshots the current
+    /// `ctx` state (inheriting join-elimination and catalog) and adds the
+    /// `PreAggSubstitution` rule. Call after pre-aggregation objects and their
+    /// backing parquet tables have been registered.
+    pub async fn build_pre_agg_optimizer(&mut self) -> Result<(), DataFusionError> {
         if !self.pre_agg_objects.is_empty() {
             let mut table_sources: HashMap<String, Arc<dyn TableSource>> = HashMap::new();
             for pa in &self.pre_agg_objects {
@@ -570,7 +555,6 @@ impl DataModel {
             }
             let rule = PreAggSubstitution::new(self.pre_agg_objects.clone(), table_sources);
 
-            // Snapshot the current state (inherits join-elimination rule + catalog)
             let ctx_pre_agg = SessionContext::new_with_state(self.ctx.state());
             ctx_pre_agg.add_optimizer_rule(Arc::new(rule));
             self.ctx_pre_agg = Some(ctx_pre_agg);
@@ -1017,8 +1001,6 @@ mod tests {
         ])
         .unwrap();
 
-        dm.add_custom_optimizers().await.unwrap();
-
         // Register a measure that references player_stats.score and players.name
         // but NOT teams
         dm.register_measure(
@@ -1105,7 +1087,7 @@ mod tests {
             .await
             .unwrap();
         dm.set_pre_aggregations(vec![pre_agg]);
-        dm.add_custom_optimizers().await.unwrap();
+        dm.build_pre_agg_optimizer().await.unwrap();
 
         (dm, tmp_dir)
     }
@@ -1128,8 +1110,8 @@ mod tests {
     fn make_sum_pre_agg_object(preagg_name: &str) -> PreAggregation {
         let mut pa = PreAggregation::new(
             preagg_name.into(),
-            vec!["region".into()],
-            HashMap::from([("amount".into(), vec!["sum".into()])]),
+            vec!["orders.region".into()],
+            HashMap::from([("orders.amount".into(), vec!["sum".into()])]),
         )
         .unwrap();
         pa.row_count = 2;
@@ -1322,7 +1304,7 @@ mod tests {
         let mut pa = make_sum_pre_agg_object("regional_preagg");
         pa.row_count = 2;
         dm.set_pre_aggregations(vec![pa]);
-        dm.add_custom_optimizers().await.unwrap();
+        dm.build_pre_agg_optimizer().await.unwrap();
 
         dm.register_measure("revenue", revenue_measure())
             .await
@@ -1392,13 +1374,13 @@ mod tests {
 
         let mut pa = PreAggregation::new(
             "count_preagg".into(),
-            vec!["region".into()],
-            HashMap::from([("amount".into(), vec!["count".into()])]),
+            vec!["orders.region".into()],
+            HashMap::from([("orders.amount".into(), vec!["count".into()])]),
         )
         .unwrap();
         pa.row_count = 2;
         dm.set_pre_aggregations(vec![pa]);
-        dm.add_custom_optimizers().await.unwrap();
+        dm.build_pre_agg_optimizer().await.unwrap();
 
         dm.register_measure(
             "order_count",

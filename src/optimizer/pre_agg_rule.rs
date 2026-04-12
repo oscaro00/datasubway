@@ -1,5 +1,5 @@
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::{Column, Result as DFResult};
+use datafusion_common::{Column, Result as DFResult, TableReference};
 use datafusion_expr::expr::AggregateFunction;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
 use datafusion_functions_aggregate::min_max::{max, min};
@@ -10,66 +10,152 @@ use std::sync::Arc;
 
 use crate::model::pre_agg::{agg_needed_components, find_best_pre_agg, PreAggregation};
 
-// ── Aggregate expression rewriting ──────────────────────────────────────────
+// ── Expression rewriting ──────────────────────────────────────────────────────
+
+/// Rewrite qualified column references so their qualifier matches the
+/// SubqueryAlias on the pre-agg scan.  Columns from *any* original table
+/// (e.g. `player_stats.goals`) are re-qualified to the single source table
+/// (`players.goals`) because the SubqueryAlias flattens all parquet columns
+/// under one qualifier.
+fn rewrite_qualifier(expr: &Expr, source_table: &str) -> Expr {
+    match expr {
+        Expr::Column(col) if col.relation.is_some() => Expr::Column(Column::new(
+            Some(TableReference::bare(source_table)),
+            &col.name,
+        )),
+        Expr::BinaryExpr(binary) => Expr::BinaryExpr(datafusion_expr::expr::BinaryExpr::new(
+            Box::new(rewrite_qualifier(&binary.left, source_table)),
+            binary.op,
+            Box::new(rewrite_qualifier(&binary.right, source_table)),
+        )),
+        Expr::Alias(alias) => rewrite_qualifier(&alias.expr, source_table).alias(&alias.name),
+        Expr::Not(inner) => Expr::Not(Box::new(rewrite_qualifier(inner, source_table))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(rewrite_qualifier(inner, source_table))),
+        Expr::IsNotNull(inner) => {
+            Expr::IsNotNull(Box::new(rewrite_qualifier(inner, source_table)))
+        }
+        Expr::InList(in_list) => {
+            let rewritten_expr = Box::new(rewrite_qualifier(&in_list.expr, source_table));
+            let rewritten_list = in_list
+                .list
+                .iter()
+                .map(|e| rewrite_qualifier(e, source_table))
+                .collect();
+            Expr::InList(datafusion_expr::expr::InList::new(
+                rewritten_expr,
+                rewritten_list,
+                in_list.negated,
+            ))
+        }
+        Expr::Cast(cast) => Expr::Cast(datafusion_expr::expr::Cast::new(
+            Box::new(rewrite_qualifier(&cast.expr, source_table)),
+            cast.data_type.clone(),
+        )),
+        Expr::TryCast(cast) => Expr::TryCast(datafusion_expr::expr::TryCast::new(
+            Box::new(rewrite_qualifier(&cast.expr, source_table)),
+            cast.data_type.clone(),
+        )),
+        Expr::AggregateFunction(agg) => {
+            let new_args: Vec<Expr> = agg
+                .params
+                .args
+                .iter()
+                .map(|a| rewrite_qualifier(a, source_table))
+                .collect();
+            let mut new_params = agg.params.clone();
+            new_params.args = new_args;
+            Expr::AggregateFunction(AggregateFunction {
+                func: agg.func.clone(),
+                params: new_params,
+            })
+        }
+        _ => expr.clone(),
+    }
+}
 
 /// Rewrite an aggregate expression to use pre-agg component columns.
 ///
-/// For example:
-///   sum(orders.amount) → sum(orders.amount-sum)
-///   avg(orders.amount) → sum(orders.amount-sum) / sum(orders.amount-count)
-///   count(orders.amount) → sum(orders.amount-count)
-///   min(orders.amount) → min(orders.amount-min)
-///   max(orders.amount) → max(orders.amount-max)
-fn rewrite_agg_expr(expr: &Expr) -> Option<Expr> {
+/// The column qualifier is set to `source_table` (matching the SubqueryAlias)
+/// and the column name is changed to the bare component name.
+///
+/// Examples (source_table = "players"):
+///   sum(player_stats.goals) → sum(players."goals-sum")
+///   count(player_stats.goals) → sum(players."goals-count")
+///   avg(player_stats.goals) → sum(players."goals-sum") / sum(players."goals-count")
+fn rewrite_agg_expr(expr: &Expr, source_table: &str) -> Option<Expr> {
     match expr {
-        Expr::AggregateFunction(agg) => rewrite_aggregate_function(agg),
+        Expr::AggregateFunction(agg) => rewrite_aggregate_function(agg, source_table),
         Expr::Alias(alias) => {
-            let rewritten = rewrite_agg_expr(&alias.expr)?;
+            let rewritten = rewrite_agg_expr(&alias.expr, source_table)?;
             Some(rewritten.alias(&alias.name))
         }
         _ => None,
     }
 }
 
-fn agg_rewrite_col_expr(name: &str) -> Expr {
-    Expr::Column(Column::from_name(name))
+/// Create a column expression for a pre-agg component, qualified to the source table.
+fn component_col_expr(original: &Column, component: &str, source_table: &str) -> Expr {
+    let component_name = PreAggregation::component_column(&original.name, component);
+    Expr::Column(Column::new(
+        Some(TableReference::bare(source_table)),
+        component_name,
+    ))
 }
 
-fn rewrite_aggregate_function(agg: &AggregateFunction) -> Option<Expr> {
-    let col_name = extract_agg_column_name(&agg.params.args[0])?;
+fn rewrite_aggregate_function(agg: &AggregateFunction, source_table: &str) -> Option<Expr> {
+    let col = extract_agg_column(&agg.params.args[0])?;
     let func_name = agg.func.name();
 
     match func_name {
-        "sum" => {
-            let comp_col = PreAggregation::component_column(&col_name, "sum");
-            Some(sum(agg_rewrite_col_expr(&comp_col)))
-        }
-        "count" => {
-            let comp_col = PreAggregation::component_column(&col_name, "count");
-            Some(sum(agg_rewrite_col_expr(&comp_col)))
-        }
-        "min" => {
-            let comp_col = PreAggregation::component_column(&col_name, "min");
-            Some(min(agg_rewrite_col_expr(&comp_col)))
-        }
-        "max" => {
-            let comp_col = PreAggregation::component_column(&col_name, "max");
-            Some(max(agg_rewrite_col_expr(&comp_col)))
-        }
-        "avg" => {
-            let sum_col = PreAggregation::component_column(&col_name, "sum");
-            let count_col = PreAggregation::component_column(&col_name, "count");
-            Some(sum(agg_rewrite_col_expr(&sum_col)) / sum(agg_rewrite_col_expr(&count_col)))
-        }
+        "sum" => Some(sum(component_col_expr(col, "sum", source_table))),
+        "count" => Some(sum(component_col_expr(col, "count", source_table))),
+        "min" => Some(min(component_col_expr(col, "min", source_table))),
+        "max" => Some(max(component_col_expr(col, "max", source_table))),
+        "avg" => Some(
+            sum(component_col_expr(col, "sum", source_table))
+                / sum(component_col_expr(col, "count", source_table)),
+        ),
         _ => None,
     }
 }
 
-fn extract_agg_column_name(expr: &Expr) -> Option<String> {
+/// Extract the Column struct from an aggregate function argument,
+/// seeing through Cast/TryCast wrappers that DataFusion's type coercion
+/// optimizer pass may insert before our rule runs.
+fn extract_agg_column(expr: &Expr) -> Option<&Column> {
     match expr {
-        Expr::Column(col) => Some(col.name.clone()),
+        Expr::Column(col) => Some(col),
+        Expr::Cast(cast) => extract_agg_column(&cast.expr),
+        Expr::TryCast(cast) => extract_agg_column(&cast.expr),
         _ => None,
     }
+}
+
+/// Return the fully qualified column name (e.g. "players.player_name")
+/// or just the bare name if no relation qualifier is present.
+/// Used for plan requirement matching (not expression rewriting).
+fn qualified_col_name(col: &Column) -> String {
+    match &col.relation {
+        Some(r) => format!("{}.{}", r, col.name),
+        None => col.name.clone(),
+    }
+}
+
+/// Collect filters that DataFusion's FilterPushdown pass pushed into TableScan nodes.
+/// These must be preserved when replacing the scan/join with a pre-agg table.
+fn collect_scan_filters(plan: &LogicalPlan) -> Vec<Expr> {
+    let mut filters = Vec::new();
+    match plan {
+        LogicalPlan::TableScan(scan) => {
+            filters.extend(scan.filters.clone());
+        }
+        _ => {
+            for child in plan.inputs() {
+                filters.extend(collect_scan_filters(child));
+            }
+        }
+    }
+    filters
 }
 
 /// OptimizerRule that substitutes raw table scans with pre-aggregated tables
@@ -148,7 +234,7 @@ impl PreAggSubstitution {
 
     fn extract_col_name(expr: &Expr) -> Option<String> {
         match expr {
-            Expr::Column(col) => Some(col.name.clone()),
+            Expr::Column(col) => Some(qualified_col_name(col)),
             Expr::Alias(alias) => Self::extract_col_name(&alias.expr),
             _ => None,
         }
@@ -180,7 +266,7 @@ impl PreAggSubstitution {
     fn extract_filter_columns(expr: &Expr, filter_cols: &mut Vec<String>) {
         match expr {
             Expr::Column(col) => {
-                filter_cols.push(col.name.clone());
+                filter_cols.push(qualified_col_name(col));
             }
             Expr::BinaryExpr(binary) => {
                 Self::extract_filter_columns(&binary.left, filter_cols);
@@ -201,95 +287,119 @@ impl PreAggSubstitution {
 
     /// Rewrite the plan to use a pre-aggregated table.
     ///
-    /// The key insight: we alias the pre-agg scan with the original table name
-    /// (via `SubqueryAlias`) so that existing column qualifiers (e.g. `orders.region`)
-    /// continue to resolve correctly. Only aggregate expressions need rewriting
-    /// (to reference component columns like `amount-sum`).
+    /// The pre-agg scan is wrapped in a SubqueryAlias matching the source table.
+    /// All qualified column references are re-qualified to the source table so
+    /// they resolve against the SubqueryAlias. Aggregate expressions are also
+    /// changed to reference component columns.
     fn rewrite_plan_with_pre_agg(
         &self,
         plan: LogicalPlan,
         pre_agg: &PreAggregation,
+        source_table: &str,
     ) -> DFResult<LogicalPlan> {
         match plan {
             LogicalPlan::Aggregate(agg) => {
-                // Rewrite aggregate expressions to use pre-agg component columns
+                // Rewrite aggregate expressions to reference component columns,
+                // and re-qualify group-by expressions to the source table.
                 let rewritten_aggs: Vec<Expr> = agg
                     .aggr_expr
                     .iter()
-                    .map(|expr| rewrite_agg_expr(expr).unwrap_or_else(|| expr.clone()))
+                    .map(|expr| {
+                        rewrite_agg_expr(expr, source_table)
+                            .unwrap_or_else(|| rewrite_qualifier(expr, source_table))
+                    })
                     .collect();
 
-                // Group-by expressions stay the same — the SubqueryAlias on the
-                // pre-agg scan preserves the original table qualifier.
-                let group_exprs = agg.group_expr.clone();
+                let group_exprs: Vec<Expr> = agg
+                    .group_expr
+                    .iter()
+                    .map(|expr| rewrite_qualifier(expr, source_table))
+                    .collect();
 
-                let new_input = self.rewrite_plan_with_pre_agg((*agg.input).clone(), pre_agg)?;
+                let new_input =
+                    self.rewrite_plan_with_pre_agg((*agg.input).clone(), pre_agg, source_table)?;
 
                 LogicalPlanBuilder::from(new_input)
                     .aggregate(group_exprs, rewritten_aggs)?
                     .build()
             }
             LogicalPlan::Filter(filter) => {
-                let new_input = self.rewrite_plan_with_pre_agg((*filter.input).clone(), pre_agg)?;
+                let new_input =
+                    self.rewrite_plan_with_pre_agg((*filter.input).clone(), pre_agg, source_table)?;
+                let rewritten_pred = rewrite_qualifier(&filter.predicate, source_table);
                 LogicalPlanBuilder::from(new_input)
-                    .filter(filter.predicate.clone())?
+                    .filter(rewritten_pred)?
                     .build()
             }
             LogicalPlan::Projection(proj) => {
                 // Skip intermediate projections — they reference original table columns
                 // that don't exist in the pre-agg table. The parent Aggregate node
                 // already specifies which columns it needs.
-                self.rewrite_plan_with_pre_agg((*proj.input).clone(), pre_agg)
+                self.rewrite_plan_with_pre_agg((*proj.input).clone(), pre_agg, source_table)
             }
-            LogicalPlan::TableScan(ref scan) => {
-                self.build_pre_agg_scan(pre_agg, scan.table_name.table())
+            LogicalPlan::TableScan(_) | LogicalPlan::Join(_) => {
+                // Collect any filters that DataFusion's FilterPushdown pass
+                // pushed into the TableScan nodes. These would be lost when
+                // we replace the scan/join with the pre-agg table.
+                let scan_filters = collect_scan_filters(&plan);
+                let pre_agg_scan = self.build_pre_agg_scan(pre_agg)?;
+
+                if scan_filters.is_empty() {
+                    Ok(pre_agg_scan)
+                } else {
+                    let combined = scan_filters
+                        .into_iter()
+                        .map(|f| rewrite_qualifier(&f, source_table))
+                        .reduce(|a, b| a.and(b))
+                        .unwrap();
+                    LogicalPlanBuilder::from(pre_agg_scan)
+                        .filter(combined)?
+                        .build()
+                }
             }
-            LogicalPlan::Join(_) => {
-                // For joins, find the first table name and use that as the alias
-                let original_name =
-                    Self::find_first_table_name(&plan).unwrap_or_else(|| pre_agg.name.clone());
-                self.build_pre_agg_scan(pre_agg, &original_name)
-            }
-            // For other nodes (Sort, Limit, etc.), recurse into children.
-            // Expressions keep their original qualifiers since the SubqueryAlias
-            // ensures they still resolve.
+            // For other nodes (Sort, Limit, etc.), recurse into children
+            // and re-qualify column references.
             other => {
                 let new_inputs: Vec<LogicalPlan> = other
                     .inputs()
                     .into_iter()
-                    .map(|input| self.rewrite_plan_with_pre_agg(input.clone(), pre_agg))
+                    .map(|input| {
+                        self.rewrite_plan_with_pre_agg(input.clone(), pre_agg, source_table)
+                    })
                     .collect::<DFResult<Vec<_>>>()?;
-                other.with_new_exprs(other.expressions(), new_inputs)
+                let rewritten_exprs: Vec<Expr> = other
+                    .expressions()
+                    .into_iter()
+                    .map(|expr| rewrite_qualifier(&expr, source_table))
+                    .collect();
+                other.with_new_exprs(rewritten_exprs, new_inputs)
             }
         }
     }
 
-    /// Build a pre-agg scan aliased with the original table name so that
-    /// existing column qualifiers (e.g. `orders.region`) remain valid.
-    fn build_pre_agg_scan(
-        &self,
-        pre_agg: &PreAggregation,
-        original_table_name: &str,
-    ) -> DFResult<LogicalPlan> {
+    /// Build a scan of the pre-agg table wrapped in a SubqueryAlias.
+    ///
+    /// The parquet stores columns with bare names (e.g. "player_name", "goals-sum").
+    /// The SubqueryAlias re-qualifies them with the source table name
+    /// (e.g. players.player_name, players."goals-sum") so that rewritten column
+    /// references resolve correctly.
+    fn build_pre_agg_scan(&self, pre_agg: &PreAggregation) -> DFResult<LogicalPlan> {
         let source = self.table_sources.get(&pre_agg.name).ok_or_else(|| {
             datafusion_common::DataFusionError::Plan(format!(
                 "Pre-agg table source not found for '{}'",
                 pre_agg.name
             ))
         })?;
-        LogicalPlanBuilder::scan(&pre_agg.name, Arc::clone(source), None)?
-            .alias(original_table_name)?
-            .build()
-    }
 
-    fn find_first_table_name(plan: &LogicalPlan) -> Option<String> {
-        match plan {
-            LogicalPlan::TableScan(scan) => Some(scan.table_name.table().to_string()),
-            other => other
-                .inputs()
-                .into_iter()
-                .find_map(Self::find_first_table_name),
-        }
+        let source_table = pre_agg.source_table().ok_or_else(|| {
+            datafusion_common::DataFusionError::Plan(format!(
+                "Cannot infer source table from pre-agg '{}': no qualified group-by columns",
+                pre_agg.name
+            ))
+        })?;
+
+        let scan = LogicalPlanBuilder::scan(&pre_agg.name, Arc::clone(source), None)?.build()?;
+        LogicalPlanBuilder::from(scan).alias(source_table)?.build()
     }
 }
 
@@ -329,7 +439,13 @@ impl OptimizerRule for PreAggSubstitution {
 
         match best {
             Some(pa) => {
-                let rewritten = self.rewrite_plan_with_pre_agg(plan, pa)?;
+                let source_table = pa.source_table().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Plan(format!(
+                        "Cannot infer source table from pre-agg '{}'",
+                        pa.name
+                    ))
+                })?;
+                let rewritten = self.rewrite_plan_with_pre_agg(plan, pa, source_table)?;
                 Ok(Transformed::yes(rewritten))
             }
             None => Ok(Transformed::no(plan)),
@@ -371,7 +487,7 @@ mod tests {
                 .unwrap();
         ctx.register_table("orders", Arc::new(mem_table)).unwrap();
 
-        // Register a pre-agg table with component columns
+        // Register a pre-agg table with bare column names (matching parquet convention)
         let preagg_schema = Arc::new(Schema::new(vec![
             Field::new("region", DataType::Utf8, false),
             Field::new("amount-sum", DataType::Int64, false),
@@ -395,8 +511,8 @@ mod tests {
     fn make_pre_agg() -> PreAggregation {
         let mut pa = PreAggregation::new(
             "regional_revenue".into(),
-            vec!["region".into()],
-            HashMap::from([("amount".into(), vec!["sum".into()])]),
+            vec!["orders.region".into()],
+            HashMap::from([("orders.amount".into(), vec!["sum".into()])]),
         )
         .unwrap();
         pa.row_count = 2;
@@ -416,14 +532,14 @@ mod tests {
         let (group_by, agg_components, filter_cols) =
             PreAggSubstitution::collect_plan_requirements(&plan);
 
-        assert_eq!(group_by, vec!["region"]);
+        assert_eq!(group_by, vec!["orders.region"]);
         assert!(
-            agg_components.contains_key("amount"),
-            "Should extract 'amount' as agg column, got: {:?}",
+            agg_components.contains_key("orders.amount"),
+            "Should extract 'orders.amount' as agg column, got: {:?}",
             agg_components
         );
         assert!(
-            agg_components["amount"].contains("sum"),
+            agg_components["orders.amount"].contains("sum"),
             "Should extract 'sum' component"
         );
         assert!(filter_cols.is_empty());
@@ -474,8 +590,8 @@ mod tests {
         let (group_by, agg_components, filter_cols) =
             PreAggSubstitution::collect_plan_requirements(&plan);
 
-        assert_eq!(group_by, vec!["region"]);
-        assert!(filter_cols.contains(&"region".to_string()));
+        assert_eq!(group_by, vec!["orders.region"]);
+        assert!(filter_cols.contains(&"orders.region".to_string()));
         assert!(
             pre_agg.covers(&group_by, &agg_components, &filter_cols),
             "Pre-agg should cover filtered plan: filter_cols={:?}",
@@ -545,8 +661,8 @@ mod tests {
             PreAggSubstitution::collect_plan_requirements(&plan);
 
         assert!(
-            filter_cols.contains(&"amount".to_string()),
-            "Should extract 'amount' as a filter column"
+            filter_cols.contains(&"orders.amount".to_string()),
+            "Should extract 'orders.amount' as a filter column"
         );
         assert!(
             !pre_agg.covers(&group_by, &agg_components, &filter_cols),
@@ -556,50 +672,55 @@ mod tests {
 
     // ── agg rewrite tests ───────────────────────────────────────────────
 
+    /// Helper: create a qualified column expression for test inputs.
+    fn test_col(table: &str, name: &str) -> Expr {
+        Expr::Column(Column::new(Some(TableReference::bare(table)), name))
+    }
+
     #[test]
     fn test_rewrite_sum() {
-        let expr = sum(agg_rewrite_col_expr("orders.amount"));
-        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let expr = sum(test_col("orders", "amount"));
+        let rewritten = rewrite_agg_expr(&expr, "orders").unwrap();
         let s = format!("{}", rewritten);
-        assert!(s.contains("orders.amount-sum"), "Got: {}", s);
+        assert!(s.contains("amount-sum"), "Got: {}", s);
     }
 
     #[test]
     fn test_rewrite_count() {
-        let expr = count(agg_rewrite_col_expr("orders.amount"));
-        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let expr = count(test_col("orders", "amount"));
+        let rewritten = rewrite_agg_expr(&expr, "orders").unwrap();
         let s = format!("{}", rewritten);
-        assert!(s.contains("orders.amount-count"), "Got: {}", s);
+        assert!(s.contains("amount-count"), "Got: {}", s);
     }
 
     #[test]
     fn test_rewrite_avg() {
-        let expr = avg(agg_rewrite_col_expr("orders.amount"));
-        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let expr = avg(test_col("orders", "amount"));
+        let rewritten = rewrite_agg_expr(&expr, "orders").unwrap();
         let s = format!("{}", rewritten);
-        assert!(s.contains("orders.amount-sum"), "Got: {}", s);
-        assert!(s.contains("orders.amount-count"), "Got: {}", s);
+        assert!(s.contains("amount-sum"), "Got: {}", s);
+        assert!(s.contains("amount-count"), "Got: {}", s);
     }
 
     #[test]
     fn test_rewrite_min() {
-        let expr = min_fn(agg_rewrite_col_expr("orders.amount"));
-        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let expr = min_fn(test_col("orders", "amount"));
+        let rewritten = rewrite_agg_expr(&expr, "orders").unwrap();
         let s = format!("{}", rewritten);
-        assert!(s.contains("orders.amount-min"), "Got: {}", s);
+        assert!(s.contains("amount-min"), "Got: {}", s);
     }
 
     #[test]
     fn test_rewrite_max() {
-        let expr = max_fn(agg_rewrite_col_expr("orders.amount"));
-        let rewritten = rewrite_agg_expr(&expr).unwrap();
+        let expr = max_fn(test_col("orders", "amount"));
+        let rewritten = rewrite_agg_expr(&expr, "orders").unwrap();
         let s = format!("{}", rewritten);
-        assert!(s.contains("orders.amount-max"), "Got: {}", s);
+        assert!(s.contains("amount-max"), "Got: {}", s);
     }
 
     #[test]
     fn test_non_agg_returns_none() {
-        let expr = agg_rewrite_col_expr("orders.amount");
-        assert!(rewrite_agg_expr(&expr).is_none());
+        let expr = test_col("orders", "amount");
+        assert!(rewrite_agg_expr(&expr, "orders").is_none());
     }
 }
