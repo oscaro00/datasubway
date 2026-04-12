@@ -267,9 +267,7 @@ impl DataModel {
             .pre_agg_path
             .as_ref()
             .ok_or_else(|| {
-                DataFusionError::Plan(
-                    "pre_agg_path not set — call set_pre_agg_path() first".into(),
-                )
+                DataFusionError::Plan("pre_agg_path not set — call set_pre_agg_path() first".into())
             })?
             .clone();
 
@@ -290,11 +288,7 @@ impl DataModel {
             // and the Arrow output field name is just "region".
             // The optimizer wraps the pre-agg scan in a SubqueryAlias to restore
             // the original table qualifier.
-            let group_exprs: Vec<Expr> = pa
-                .group_by
-                .iter()
-                .map(|c| col(c.as_str()))
-                .collect();
+            let group_exprs: Vec<Expr> = pa.group_by.iter().map(|c| col(c.as_str())).collect();
 
             let mut agg_exprs: Vec<Expr> = Vec::new();
             for (col_name, components) in &pa.aggregations {
@@ -305,9 +299,9 @@ impl DataModel {
                         "count" => datafusion_functions_aggregate::count::count(src_col),
                         "min" => datafusion_functions_aggregate::min_max::min(src_col),
                         "max" => datafusion_functions_aggregate::min_max::max(src_col),
-                        "sumsq" => datafusion_functions_aggregate::sum::sum(
-                            src_col.clone() * src_col,
-                        ),
+                        "sumsq" => {
+                            datafusion_functions_aggregate::sum::sum(src_col.clone() * src_col)
+                        }
                         other => {
                             return Err(DataFusionError::Plan(format!(
                                 "Unsupported pre-agg component: {}",
@@ -331,8 +325,7 @@ impl DataModel {
                 let file = std::fs::File::create(&parquet_path).map_err(|e| {
                     DataFusionError::Execution(format!("Failed to create parquet file: {}", e))
                 })?;
-                let mut writer =
-                    parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None)?;
+                let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None)?;
                 for b in &batches {
                     writer.write(b)?;
                     total_rows += b.num_rows() as u64;

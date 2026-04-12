@@ -31,9 +31,7 @@ fn rewrite_qualifier(expr: &Expr, source_table: &str) -> Expr {
         Expr::Alias(alias) => rewrite_qualifier(&alias.expr, source_table).alias(&alias.name),
         Expr::Not(inner) => Expr::Not(Box::new(rewrite_qualifier(inner, source_table))),
         Expr::IsNull(inner) => Expr::IsNull(Box::new(rewrite_qualifier(inner, source_table))),
-        Expr::IsNotNull(inner) => {
-            Expr::IsNotNull(Box::new(rewrite_qualifier(inner, source_table)))
-        }
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(rewrite_qualifier(inner, source_table))),
         Expr::InList(in_list) => {
             let rewritten_expr = Box::new(rewrite_qualifier(&in_list.expr, source_table));
             let rewritten_list = in_list
