@@ -249,8 +249,48 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 ## TO DO
 
 
+- Fixing pre aggregation optimizer:
+  - Run "cargo test --test rl_test -- --nocapture" to see the current error
+  - The relation on all columns is being set to the base table (either the table of the first agg column or the table named in the table() call)
+  - This is the wrong approach because subsequent column references expect other table/relation names
+  - Solution options:
+    - Rename all later columns to the same base table (inefficent and probably error prone when joining many measures together)
+    - When reading a pre agg parquet file, update the relation of all columns to be the table it is coming from; maybe encode this in the physical parquet file when writing the file by saving columns as table_name.column_name, then change them to the right relation and column_name when reading them. When When reading a pre agg parquet file, use alias_qualified(Some("relation_name"), "column_name") to fix the relations for downstream operations
+  
+- Additional issue: change the order of logical plan optimizers, so join elimination and pre agg optimizations run early to avoid messing up optimizations like projection and filter pushdown
+  - This could simplify some of the pre agg rule logical plan optimizer
+
+- covers() is overcomplicated:
+  - It should take parameters for aggregate columns and non aggregate columns
+  - It doesn't consider methods like select, with_column, etc...
+  - Just walk the logical plan and extract all Columns which will either be in an aggregate function or not
+
+- Multi step measures probably don't work currently because how can table() calls be differentiated from joins?
+  - Can you extend a new logical plan node? This might be a better way to identify table calls
+
+- More comprehensive tests, so tests are not all passing when usage is not working
+
+- Look into datafusion-flight-sql-server for serving data or at least how to use flight to avoid serialization
+
+- Logging (there is a datafusion OTEL rust crate called datafusion-tracing)
+
+
+
+Two approaches:
+- Back to the Dataframe wrapper approach in rust (works for polars and datafusion, maybe can do both?)
+- Different logical plan optimizer approach than the current implementation
+  - Have a logical plan optimizer that run first to replace table scans with pre aggregations if necessary
+  - Walk the logical plan to find necessary columns
+
+
+ISSUE!: Imagine a measures like table('table_name').join(...)
+- I think both approaches have a hard time deciding whether or not remove the join
+
+
+
+
 - Parameter to only look at pre aggregations within a certain time frame
-- Logging (there is a datafusion OTEL rust crate)
+
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
   - Could also display logs

@@ -4,7 +4,6 @@
 //! DataFusion DataFrames using `allow()`/`exclude()` from `column_context`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
@@ -125,14 +124,9 @@ fn infer_source_table(
 /// Manages data sources, joins, measures, pre-aggregations, and query execution.
 pub struct DataModel {
     ctx: SessionContext,
-    /// Separate context with the pre-aggregation optimizer rule registered.
-    /// Created by `build_pre_agg_optimizer()` when pre-agg objects are present.
-    /// Shares the same catalog (table registrations) as `ctx` via Arc.
-    ctx_pre_agg: Option<SessionContext>,
-    /// Set to `true` by `prepare_measure_dfs` while building DataFrames for a
-    /// query that should use pre-aggregations. `active_ctx()` checks this flag
-    /// to return the appropriate SessionContext.
-    pre_agg_active: AtomicBool,
+    /// Pre-aggregation optimizer rule, applied per-measure in `prepare_measure_dfs`.
+    /// Built by `build_pre_agg_optimizer()` when pre-agg objects are present.
+    pre_agg_rule: Option<PreAggSubstitution>,
     join_graph: Option<JoinGraph>,
     table_schemas: HashMap<String, Vec<String>>,
     measures: HashMap<String, MeasureFn>,
@@ -154,8 +148,7 @@ impl DataModel {
         );
         DataModel {
             ctx: SessionContext::new_with_config(config),
-            ctx_pre_agg: None,
-            pre_agg_active: AtomicBool::new(false),
+            pre_agg_rule: None,
             join_graph: None,
             table_schemas: HashMap::new(),
             measures: HashMap::new(),
@@ -173,8 +166,7 @@ impl DataModel {
     pub fn with_context(ctx: SessionContext) -> Self {
         DataModel {
             ctx,
-            ctx_pre_agg: None,
-            pre_agg_active: AtomicBool::new(false),
+            pre_agg_rule: None,
             join_graph: None,
             table_schemas: HashMap::new(),
             measures: HashMap::new(),
@@ -412,26 +404,13 @@ impl DataModel {
         Ok(())
     }
 
-    /// Return the active SessionContext for the current query.
-    ///
-    /// When `pre_agg_active` is set (by `prepare_measure_dfs` for queries
-    /// with `use_pre_agg=true`), returns `ctx_pre_agg` so that DataFrames
-    /// are optimized with the pre-aggregation rule. Otherwise returns `ctx`.
-    fn active_ctx(&self) -> &SessionContext {
-        if self.pre_agg_active.load(Ordering::Relaxed) {
-            self.ctx_pre_agg.as_ref().unwrap_or(&self.ctx)
-        } else {
-            &self.ctx
-        }
-    }
-
     /// Get a DataFusion DataFrame for a registered table.
     ///
     /// Eagerly pre-joins all reachable tables via the JoinGraph so that
     /// cross-table column references work in the DataFrame API (which validates
     /// schemas at expression-building time, before the optimizer runs).
     pub async fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
-        let ctx = self.active_ctx();
+        let ctx = &self.ctx;
         let mut inner = ctx.table(name).await?;
 
         if let Some(ref join_graph) = self.join_graph {
@@ -533,12 +512,12 @@ impl DataModel {
         column_context::exclude(patterns, input, columns)
     }
 
-    /// Build (or rebuild) the pre-aggregation optimizer context.
+    /// Build (or rebuild) the pre-aggregation rule.
     ///
-    /// Creates `ctx_pre_agg` — a SessionContext that snapshots the current
-    /// `ctx` state (inheriting join-elimination and catalog) and adds the
-    /// `PreAggSubstitution` rule. Call after pre-aggregation objects and their
-    /// backing parquet tables have been registered.
+    /// Creates a `PreAggSubstitution` rule that can rewrite individual measure
+    /// plans to use pre-aggregated tables. The rule is applied per-measure in
+    /// `prepare_measure_dfs` rather than as a session-level optimizer, so it
+    /// never sees the combined multi-measure plan.
     pub async fn build_pre_agg_optimizer(&mut self) -> Result<(), DataFusionError> {
         if !self.pre_agg_objects.is_empty() {
             let mut table_sources: HashMap<String, Arc<dyn TableSource>> = HashMap::new();
@@ -546,11 +525,8 @@ impl DataModel {
                 let provider = self.ctx.table_provider(&pa.name).await?;
                 table_sources.insert(pa.name.clone(), Arc::new(DefaultTableSource::new(provider)));
             }
-            let rule = PreAggSubstitution::new(self.pre_agg_objects.clone(), table_sources);
-
-            let ctx_pre_agg = SessionContext::new_with_state(self.ctx.state());
-            ctx_pre_agg.add_optimizer_rule(Arc::new(rule));
-            self.ctx_pre_agg = Some(ctx_pre_agg);
+            self.pre_agg_rule =
+                Some(PreAggSubstitution::new(self.pre_agg_objects.clone(), table_sources));
         }
 
         Ok(())
@@ -569,9 +545,7 @@ impl DataModel {
         qc.validate(&measure_metadata, &all_cols)
             .map_err(|e| DataFusionError::Plan(e))?;
 
-        // Select the pre-agg context for this query when applicable.
-        let use_pre_agg = qc.use_pre_agg && self.ctx_pre_agg.is_some();
-        self.pre_agg_active.store(use_pre_agg, Ordering::Relaxed);
+        let use_pre_agg = qc.use_pre_agg && self.pre_agg_rule.is_some();
 
         // Build each measure DataFrame (no collect)
         let mut measure_dfs: Vec<(String, DataFrame)> = Vec::new();
@@ -580,11 +554,19 @@ impl DataModel {
                 DataFusionError::Plan(format!("Unknown measure: '{}'", measure_name))
             })?;
             let df = measure_fn(qc, self).await?;
-            measure_dfs.push((measure_name.clone(), df));
-        }
 
-        // Reset to base context.
-        self.pre_agg_active.store(false, Ordering::Relaxed);
+            if use_pre_agg {
+                // Apply the pre-agg rule to each measure's plan individually.
+                // This ensures the rule only sees one measure at a time and never
+                // attempts to rewrite the combined multi-measure plan.
+                let rule = self.pre_agg_rule.as_ref().unwrap();
+                let rewritten_plan = rule.try_rewrite(df.logical_plan().clone())?;
+                let rewritten_df = DataFrame::new(self.ctx.state(), rewritten_plan);
+                measure_dfs.push((measure_name.clone(), rewritten_df));
+            } else {
+                measure_dfs.push((measure_name.clone(), df));
+            }
+        }
 
         if measure_dfs.is_empty() {
             return Err(DataFusionError::Plan("No measure results produced".into()));

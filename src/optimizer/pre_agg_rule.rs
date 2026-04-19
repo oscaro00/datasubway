@@ -184,6 +184,34 @@ impl PreAggSubstitution {
         }
     }
 
+    /// Try to rewrite a single plan using pre-aggregations.
+    ///
+    /// Returns the rewritten plan if a covering pre-agg was found, or the
+    /// original plan unchanged. This is used to apply pre-agg substitution
+    /// per-measure before plans are combined, avoiding the session-level
+    /// optimizer seeing a multi-measure plan.
+    pub fn try_rewrite(&self, plan: LogicalPlan) -> DFResult<LogicalPlan> {
+        if self.pre_aggs.is_empty() {
+            return Ok(plan);
+        }
+
+        let (group_by, agg_components, filter_cols) = Self::collect_plan_requirements(&plan);
+        let best = find_best_pre_agg(&self.pre_aggs, &group_by, &agg_components, &filter_cols);
+
+        match best {
+            Some(pa) => {
+                let source_table = pa.source_table().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Plan(format!(
+                        "Cannot infer source table from pre-agg '{}'",
+                        pa.name
+                    ))
+                })?;
+                self.rewrite_plan_with_pre_agg(plan, pa, source_table)
+            }
+            None => Ok(plan),
+        }
+    }
+
     /// Collect all column references from the plan to determine what the pre-agg must cover.
     fn collect_plan_requirements(
         plan: &LogicalPlan,

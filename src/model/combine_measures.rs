@@ -54,14 +54,58 @@ pub fn combine_measure_dfs(
                 // Fallback to cross join if no common columns found
                 result_df = result_df.join(other_df, JoinType::Inner, &[], &[], None)?;
             } else {
-                let join_col_strs: Vec<&str> = join_cols.iter().map(|s| s.as_str()).collect();
-                result_df = result_df.join(
-                    other_df,
-                    JoinType::Full,
-                    &join_col_strs,
-                    &join_col_strs,
-                    None,
-                )?;
+                // Rename join columns on the right DF to avoid duplicate qualified
+                // field names (DataFusion keeps both sides' join keys in a FULL join).
+                let temp_names: Vec<String> = join_cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("__join_{i}"))
+                    .collect();
+
+                let rename_exprs: Vec<Expr> = other_df
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let name = f.name();
+                        if let Some(idx) = join_cols.iter().position(|c| c == name) {
+                            col(name.as_str()).alias(&temp_names[idx])
+                        } else {
+                            col(name.as_str())
+                        }
+                    })
+                    .collect();
+                let renamed_right = other_df.select(rename_exprs)?;
+
+                let left_strs: Vec<&str> = join_cols.iter().map(|s| s.as_str()).collect();
+                let right_strs: Vec<&str> = temp_names.iter().map(|s| s.as_str()).collect();
+                result_df =
+                    result_df.join(renamed_right, JoinType::Full, &left_strs, &right_strs, None)?;
+
+                // Coalesce left and right join keys, then drop the temp columns.
+                // Put COALESCE at the original column's position, skip the temp column.
+                let select_exprs: Vec<Expr> = result_df
+                    .schema()
+                    .fields()
+                    .iter()
+                    .filter_map(|f| {
+                        let name = f.name();
+                        if temp_names.contains(&name.to_string()) {
+                            // Skip temp column — handled by the COALESCE below
+                            None
+                        } else if let Some(idx) = join_cols.iter().position(|c| c == name) {
+                            // Replace original with COALESCE(original, temp) AS original
+                            let temp = &temp_names[idx];
+                            Some(
+                                coalesce(vec![col(name.as_str()), col(temp.as_str())])
+                                    .alias(name.clone()),
+                            )
+                        } else {
+                            Some(col(name.as_str()))
+                        }
+                    })
+                    .collect();
+                result_df = result_df.select(select_exprs)?;
             }
         }
     }
@@ -426,5 +470,81 @@ mod tests {
             .unwrap();
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_combine_multi_measure_with_qualified_groups() {
+        use datafusion_functions_aggregate::sum::sum;
+
+        let ctx = SessionContext::new();
+
+        // Register a "players" table so columns get proper table qualifiers
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("player_name", DataType::Utf8, false),
+                Field::new("goals", DataType::Int64, false),
+                Field::new("assists", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "Alice", "Alice", "Bob", "Bob",
+                ])),
+                Arc::new(arrow::array::Int64Array::from(vec![3, 7, 5, 15])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 4, 2, 13])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
+        ctx.register_table("players", Arc::new(mem_table)).unwrap();
+
+        // Simulate two measures that both group by players.player_name
+        let df1 = ctx
+            .table("players")
+            .await
+            .unwrap()
+            .aggregate(
+                vec![col("players.player_name")],
+                vec![sum(col("goals")).alias("total_goals")],
+            )
+            .unwrap();
+        let df2 = ctx
+            .table("players")
+            .await
+            .unwrap()
+            .aggregate(
+                vec![col("players.player_name")],
+                vec![sum(col("assists")).alias("total_assists")],
+            )
+            .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["total_goals".into(), "total_assists".into()],
+            None,
+            Some(vec!["players.player_name".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result =
+            combine_measure_results(vec![("total_goals", df1), ("total_assists", df2)], &qc)
+                .await
+                .unwrap();
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+
+        // Verify no duplicate columns in the output
+        let schema = result[0].schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            field_names.iter().filter(|&&n| n == "player_name").count(),
+            1,
+            "Should have exactly one player_name column, got: {:?}",
+            field_names
+        );
     }
 }
