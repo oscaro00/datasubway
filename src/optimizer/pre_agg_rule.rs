@@ -296,6 +296,38 @@ impl VirtualScanExpander {
         }
     }
 
+    /// Apply virtual-scan expansion to a combined plan that may contain multiple
+    /// virtual scan clusters (one per measure sub-plan). Splits at Join nodes so
+    /// each measure branch is expanded independently with its own column
+    /// requirements and pre-agg selection.
+    pub fn try_rewrite_combined(
+        &self,
+        plan: LogicalPlan,
+        allow_pre_agg: bool,
+    ) -> DFResult<LogicalPlan> {
+        if !has_virtual_scan(&plan) {
+            return Ok(plan);
+        }
+        self.rewrite_node_combined(plan, allow_pre_agg)
+    }
+
+    fn rewrite_node_combined(
+        &self,
+        plan: LogicalPlan,
+        allow_pre_agg: bool,
+    ) -> DFResult<LogicalPlan> {
+        match &plan {
+            LogicalPlan::Join(_) => {
+                let inputs = plan.inputs();
+                let left = self.rewrite_node_combined(inputs[0].clone(), allow_pre_agg)?;
+                let right = self.rewrite_node_combined(inputs[1].clone(), allow_pre_agg)?;
+                plan.with_new_exprs(plan.expressions(), vec![left, right])
+            }
+            _ if has_virtual_scan(&plan) => self.try_rewrite(plan, allow_pre_agg),
+            other => Ok(other.clone()),
+        }
+    }
+
     /// Apply the virtual-scan expansion to a single measure plan.
     ///
     /// Always expands virtual (`__empty_*`) scans — either to a pre-agg scan

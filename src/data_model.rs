@@ -645,21 +645,53 @@ impl DataModel {
         Ok(())
     }
 
-    /// Validate the QueryContext and build a DataFrame for each requested
-    /// measure (without collecting).
+    /// Validate the QueryContext and build a raw DataFrame for each requested
+    /// measure (without collecting or expanding virtual scans).
+    ///
+    /// Virtual scans are left in place here; the caller is responsible for
+    /// applying `VirtualScanExpander::try_rewrite_combined` to the combined plan.
     async fn prepare_measure_dfs(
         &self,
         qc: &QueryContext,
     ) -> Result<Vec<(String, DataFrame)>, DataFusionError> {
-        // Validate
         let measure_metadata: Vec<MeasureMetadata> =
             self.measure_metadata.values().cloned().collect();
         let all_cols: HashSet<String> = self.all_columns().into_iter().collect();
         qc.validate(&measure_metadata, &all_cols)
             .map_err(|e| DataFusionError::Plan(e))?;
 
-        // Build the VirtualScanExpander to use for this query.
-        // If build_pre_agg_optimizer() was never called, use a fallback with no pre-aggs.
+        let mut measure_dfs: Vec<(String, DataFrame)> = Vec::new();
+        for measure_name in &qc.measures {
+            let measure_fn = self.measures.get(measure_name).ok_or_else(|| {
+                DataFusionError::Plan(format!("Unknown measure: '{}'", measure_name))
+            })?;
+            let df = measure_fn(qc, self).await?;
+            debug_log!("prepare_measure_dfs: measure='{}' plan:\n{}", measure_name, df.logical_plan().display_indent());
+            measure_dfs.push((measure_name.clone(), df));
+        }
+
+        if measure_dfs.is_empty() {
+            return Err(DataFusionError::Plan("No measure results produced".into()));
+        }
+
+        Ok(measure_dfs)
+    }
+
+
+    /// Collect query results as RecordBatches.
+    ///
+    /// 1. Validates the QueryContext
+    /// 2. Calls each measure function to produce DataFrames
+    /// 3. Combines measures (joins, havings, sorts, limit/offset)
+    /// 4. Expands virtual scans in the combined plan (pre-agg or real joins)
+    /// 5. Collects and returns results
+    pub async fn collect(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let measure_dfs = self.prepare_measure_dfs(qc).await?;
+        let borrowed: Vec<(&str, DataFrame)> = measure_dfs
+            .iter()
+            .map(|(n, df)| (n.as_str(), df.clone()))
+            .collect();
+        let combined_df = combine_measures::combine_measure_dfs(borrowed, qc)?;
         let fallback;
         let expander: &VirtualScanExpander = match &self.pre_agg_rule {
             Some(r) => r,
@@ -673,45 +705,13 @@ impl DataModel {
                 &fallback
             }
         };
-
-        // Build each measure DataFrame (no collect)
-        let mut measure_dfs: Vec<(String, DataFrame)> = Vec::new();
-        for measure_name in &qc.measures {
-            let measure_fn = self.measures.get(measure_name).ok_or_else(|| {
-                DataFusionError::Plan(format!("Unknown measure: '{}'", measure_name))
-            })?;
-            let df = measure_fn(qc, self).await?;
-
-            // Always apply VirtualScanExpander — virtual scans from table() must be
-            // expanded to either a pre-agg scan or real join plan before execution.
-            debug_log!("prepare_measure_dfs: measure='{}' plan BEFORE rewrite:\n{}", measure_name, df.logical_plan().display_indent());
-            let rewritten_plan =
-                expander.try_rewrite(df.logical_plan().clone(), qc.use_pre_agg)?;
-            debug_log!("prepare_measure_dfs: measure='{}' plan AFTER rewrite:\n{}", measure_name, rewritten_plan.display_indent());
-            let rewritten_df = DataFrame::new(self.ctx.state(), rewritten_plan);
-            measure_dfs.push((measure_name.clone(), rewritten_df));
-        }
-
-        if measure_dfs.is_empty() {
-            return Err(DataFusionError::Plan("No measure results produced".into()));
-        }
-
-        Ok(measure_dfs)
-    }
-
-    /// Collect query results as RecordBatches.
-    ///
-    /// 1. Validates the QueryContext
-    /// 2. Calls each measure function to produce DataFrames
-    /// 3. Combines measures (joins, havings, sorts, limit/offset)
-    /// 4. Collects and returns results
-    pub async fn collect(&self, qc: &QueryContext) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let measure_dfs = self.prepare_measure_dfs(qc).await?;
-        let borrowed: Vec<(&str, DataFrame)> = measure_dfs
-            .iter()
-            .map(|(n, df)| (n.as_str(), df.clone()))
-            .collect();
-        combine_measures::combine_measure_results(borrowed, qc).await
+        debug_log!("collect: combined plan BEFORE rewrite:\n{}", combined_df.logical_plan().display_indent());
+        let rewritten = expander.try_rewrite_combined(
+            combined_df.logical_plan().clone(),
+            qc.use_pre_agg,
+        )?;
+        debug_log!("collect: combined plan AFTER rewrite:\n{}", rewritten.display_indent());
+        DataFrame::new(self.ctx.state(), rewritten).collect().await
     }
 
     /// Return an explain DataFrame for the query plan without executing it.
@@ -731,7 +731,24 @@ impl DataModel {
             .map(|(n, df)| (n.as_str(), df.clone()))
             .collect();
         let combined_df = combine_measures::combine_measure_dfs(borrowed, qc)?;
-        combined_df.explain(verbose, analyze)
+        let fallback;
+        let expander: &VirtualScanExpander = match &self.pre_agg_rule {
+            Some(r) => r,
+            None => {
+                fallback = VirtualScanExpander::new(
+                    vec![],
+                    HashMap::new(),
+                    self.real_table_sources.clone(),
+                    self.join_graph.clone(),
+                );
+                &fallback
+            }
+        };
+        let rewritten = expander.try_rewrite_combined(
+            combined_df.logical_plan().clone(),
+            qc.use_pre_agg,
+        )?;
+        DataFrame::new(self.ctx.state(), rewritten).explain(verbose, analyze)
     }
 }
 
