@@ -300,6 +300,9 @@ impl VirtualScanExpander {
     /// virtual scan clusters (one per measure sub-plan). Splits at Join nodes so
     /// each measure branch is expanded independently with its own column
     /// requirements and pre-agg selection.
+    /// This cannot easily be added to the DataFusion optimizer pipeline because
+    /// use_pre_agg decides whether or not the optimizer runs and the pipeline does not
+    /// allow enabling/disabling rules easily.
     pub fn try_rewrite_combined(
         &self,
         plan: LogicalPlan,
@@ -338,7 +341,10 @@ impl VirtualScanExpander {
             return Ok(plan);
         }
 
-        debug_log!("try_rewrite: virtual scan detected, allow_pre_agg={}", allow_pre_agg);
+        debug_log!(
+            "try_rewrite: virtual scan detected, allow_pre_agg={}",
+            allow_pre_agg
+        );
 
         let best = if allow_pre_agg {
             let (non_agg_cols, agg_cols) = collect_plan_columns(&plan);
@@ -390,7 +396,10 @@ impl VirtualScanExpander {
             }
             // The virtual scan cluster: replace entirely with the pre-agg scan.
             node if is_virtual_cluster(&node) => {
-                debug_log!("rewrite_with_pre_agg: replacing virtual cluster with pre-agg '{}'", pre_agg.name);
+                debug_log!(
+                    "rewrite_with_pre_agg: replacing virtual cluster with pre-agg '{}'",
+                    pre_agg.name
+                );
                 let scan_filters = collect_scan_filters(&node);
                 let pre_agg_scan = self.build_pre_agg_scan(pre_agg)?;
 
@@ -454,10 +463,17 @@ impl VirtualScanExpander {
             }
         }
 
-        let result = LogicalPlanBuilder::from(scan).project(projections)?.build()?;
+        let result = LogicalPlanBuilder::from(scan)
+            .project(projections)?
+            .build()?;
         debug_log!(
             "build_pre_agg_scan: output schema = {:?}",
-            result.schema().columns().iter().map(|c| format!("{}", c)).collect::<Vec<_>>()
+            result
+                .schema()
+                .columns()
+                .iter()
+                .map(|c| format!("{}", c))
+                .collect::<Vec<_>>()
         );
         Ok(result)
     }
@@ -476,7 +492,11 @@ impl VirtualScanExpander {
 
         // Collect tables referenced by the query (excluding join ON conditions)
         let referenced_tables = collect_referenced_tables(&plan);
-        debug_log!("expand_virtual_to_real: base_table='{}', referenced={:?}", base_table, referenced_tables);
+        debug_log!(
+            "expand_virtual_to_real: base_table='{}', referenced={:?}",
+            base_table,
+            referenced_tables
+        );
 
         // Build the minimal real join plan
         let real_plan = self.build_real_join_plan(&base_table, &referenced_tables)?;

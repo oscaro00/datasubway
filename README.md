@@ -250,17 +250,6 @@ datasubway = { git = "https://github.com/your-user/datasubway.git", branch = "da
 With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pull the latest, run `cargo update -p datasubway` in the consuming project.
 
 ## TO DO
-  
-- Additional issue: change the order of logical plan optimizers, so join elimination and pre agg optimizations run early to avoid messing up optimizations like projection and filter pushdown
-  - This could simplify some of the pre agg rule logical plan optimizer
-
-- covers() is overcomplicated:
-  - It should take parameters for aggregate columns and non aggregate columns
-  - It doesn't consider methods like select, with_column, etc...
-  - Just walk the logical plan and extract all Columns which will either be in an aggregate function or not
-
-- Multi step measures probably don't work currently because how can table() calls be differentiated from joins?
-  - Can you extend a new logical plan node? This might be a better way to identify table calls
 
 - More comprehensive tests, so tests are not all passing when usage is not working
 
@@ -275,10 +264,6 @@ Two approaches:
 - Different logical plan optimizer approach than the current implementation
   - Have a logical plan optimizer that run first to replace table scans with pre aggregations if necessary
   - Walk the logical plan to find necessary columns
-
-
-ISSUE!: Imagine a measures like table('table_name').join(...)
-- I think both approaches have a hard time deciding whether or not remove the join
 
 
 
