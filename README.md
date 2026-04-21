@@ -213,6 +213,9 @@ cargo test test_auto_join
 
 # Show stdout from tests (println! output)
 cargo test -- --nocapture
+
+# Show debug logs with tests
+DATASUBWAY_DEBUG=1 cargo test -- --nocapture
 ```
 
 ## Using as a Local Dependency
@@ -247,15 +250,6 @@ datasubway = { git = "https://github.com/your-user/datasubway.git", branch = "da
 With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pull the latest, run `cargo update -p datasubway` in the consuming project.
 
 ## TO DO
-
-
-- Fixing pre aggregation optimizer:
-  - Run "cargo test --test rl_test -- --nocapture" to see the current error
-  - The relation on all columns is being set to the base table (either the table of the first agg column or the table named in the table() call)
-  - This is the wrong approach because subsequent column references expect other table/relation names
-  - Solution options:
-    - Rename all later columns to the same base table (inefficent and probably error prone when joining many measures together)
-    - When reading a pre agg parquet file, update the relation of all columns to be the table it is coming from; maybe encode this in the physical parquet file when writing the file by saving columns as table_name.column_name, then change them to the right relation and column_name when reading them. When When reading a pre agg parquet file, use alias_qualified(Some("relation_name"), "column_name") to fix the relations for downstream operations
   
 - Additional issue: change the order of logical plan optimizers, so join elimination and pre agg optimizations run early to avoid messing up optimizations like projection and filter pushdown
   - This could simplify some of the pre agg rule logical plan optimizer

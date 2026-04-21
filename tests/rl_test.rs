@@ -12,7 +12,7 @@ use datasubway::model::joins::{Join, JoinDirection, JoinHow};
 use datasubway::model::pre_agg::PreAggregation;
 use datasubway::model::query_context::QueryContext;
 
-const DATA_DIR: &str = "tests/data_files/replay_tables";
+const DATA_DIR: &str = "tests/data_files";
 const PRE_AGG_DIR: &str = "tests/data_files/pre_aggs";
 
 pub async fn create_data_model() -> Result<DataModel, Box<dyn std::error::Error>> {
@@ -24,7 +24,6 @@ pub async fn create_data_model() -> Result<DataModel, Box<dyn std::error::Error>
         "games",
         "groups",
         "groups_bridge",
-        "player_settings",
         "player_stats",
         "players",
         "team_stats",
@@ -63,22 +62,6 @@ pub async fn create_data_model() -> Result<DataModel, Box<dyn std::error::Error>
         },
         Join {
             left: "player_stats".into(),
-            right: "players".into(),
-            left_on: vec!["player_id".into()],
-            right_on: vec!["player_id".into()],
-            how: JoinHow::Left,
-            direction: JoinDirection::Right2Left,
-        },
-        Join {
-            left: "player_settings".into(),
-            right: "games".into(),
-            left_on: vec!["game_id".into()],
-            right_on: vec!["game_id".into()],
-            how: JoinHow::Left,
-            direction: JoinDirection::Right2Left,
-        },
-        Join {
-            left: "player_settings".into(),
             right: "players".into(),
             left_on: vec!["player_id".into()],
             right_on: vec!["player_id".into()],
@@ -184,13 +167,14 @@ pub async fn create_data_model() -> Result<DataModel, Box<dyn std::error::Error>
 }
 
 // run with cargo test --test rl_test -- --nocapture
+// DATASUBWAY_DEBUG=1 cargo test --test rl_test -- --nocapture
 #[tokio::test]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dm = create_data_model().await?;
 
     // Query with cross-table grouping and a filter (eager joins from table())
     let qc = QueryContext::new(
-        vec!["total_player_goals".into()], // , "total_player_assists".into()
+        vec!["total_player_goals".into(), "total_player_assists".into()],
         Some(json!({"AND": [["players.platform", "=", "steam"]]})),
         Some(vec!["players.player_name".into()]),
         None,

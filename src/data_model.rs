@@ -20,8 +20,15 @@ use crate::model::data_sources;
 use crate::model::joins::{Join, JoinGraph, JoinHow};
 use crate::model::pre_agg::PreAggregation;
 use crate::model::query_context::{MeasureMetadata, QueryContext};
-use crate::optimizer::eliminate_joins_rule::EliminateUnusedJoins;
-use crate::optimizer::pre_agg_rule::PreAggSubstitution;
+use crate::optimizer::pre_agg_rule::VirtualScanExpander;
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if std::env::var("DATASUBWAY_DEBUG").is_ok() {
+            eprintln!("[datasubway data_model] {}", format!($($arg)*));
+        }
+    };
+}
 
 /// Records a single `allow()`/`exclude()` call made during measure probing.
 #[derive(Debug, Clone)]
@@ -124,11 +131,14 @@ fn infer_source_table(
 /// Manages data sources, joins, measures, pre-aggregations, and query execution.
 pub struct DataModel {
     ctx: SessionContext,
-    /// Pre-aggregation optimizer rule, applied per-measure in `prepare_measure_dfs`.
-    /// Built by `build_pre_agg_optimizer()` when pre-agg objects are present.
-    pre_agg_rule: Option<PreAggSubstitution>,
+    /// Unified virtual-scan expander rule, applied per-measure in `prepare_measure_dfs`.
+    /// Built by `build_pre_agg_optimizer()`.
+    pre_agg_rule: Option<VirtualScanExpander>,
     join_graph: Option<JoinGraph>,
     table_schemas: HashMap<String, Vec<String>>,
+    /// Real table sources for all registered tables, passed to VirtualScanExpander
+    /// so it can rebuild real join plans when no pre-agg covers the query.
+    real_table_sources: HashMap<String, Arc<dyn TableSource>>,
     measures: HashMap<String, MeasureFn>,
     measure_metadata: HashMap<String, MeasureMetadata>,
     pre_agg_objects: Vec<PreAggregation>,
@@ -151,6 +161,7 @@ impl DataModel {
             pre_agg_rule: None,
             join_graph: None,
             table_schemas: HashMap::new(),
+            real_table_sources: HashMap::new(),
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
             pre_agg_objects: Vec::new(),
@@ -169,6 +180,7 @@ impl DataModel {
             pre_agg_rule: None,
             join_graph: None,
             table_schemas: HashMap::new(),
+            real_table_sources: HashMap::new(),
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
             pre_agg_objects: Vec::new(),
@@ -185,6 +197,7 @@ impl DataModel {
     ) -> Result<(), DataFusionError> {
         let schema_names = data_sources::register_record_batch(&self.ctx, name, batch)?;
         self.table_schemas.insert(name.to_string(), schema_names);
+        self.post_register(name)?;
         Ok(())
     }
 
@@ -196,6 +209,7 @@ impl DataModel {
     ) -> Result<(), DataFusionError> {
         let schema_names = data_sources::register_parquet(&self.ctx, name, path).await?;
         self.table_schemas.insert(name.to_string(), schema_names);
+        self.post_register_async(name).await?;
         Ok(())
     }
 
@@ -203,6 +217,7 @@ impl DataModel {
     pub async fn register_csv(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
         let schema_names = data_sources::register_csv(&self.ctx, name, path).await?;
         self.table_schemas.insert(name.to_string(), schema_names);
+        self.post_register_async(name).await?;
         Ok(())
     }
 
@@ -210,6 +225,7 @@ impl DataModel {
     pub async fn register_json(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
         let schema_names = data_sources::register_json(&self.ctx, name, path).await?;
         self.table_schemas.insert(name.to_string(), schema_names);
+        self.post_register_async(name).await?;
         Ok(())
     }
 
@@ -217,14 +233,47 @@ impl DataModel {
     pub async fn register_arrow(&mut self, name: &str, path: &str) -> Result<(), DataFusionError> {
         let schema_names = data_sources::register_arrow(&self.ctx, name, path).await?;
         self.table_schemas.insert(name.to_string(), schema_names);
+        self.post_register_async(name).await?;
+        Ok(())
+    }
+
+    /// After registering a table synchronously (RecordBatch), store the real source
+    /// and register the virtual empty twin __empty_{name}.
+    fn post_register(&mut self, name: &str) -> Result<(), DataFusionError> {
+        // Register virtual empty twin using the same Arrow schema
+        let provider = futures::executor::block_on(self.ctx.table_provider(name))?;
+        let schema = provider.schema();
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let empty_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![empty_batch]])?;
+        let virtual_name = format!("__empty_{}", name);
+        self.ctx
+            .register_table(&virtual_name, Arc::new(empty_table))?;
+        // Store real table source for VirtualScanExpander
+        let source = Arc::new(DefaultTableSource::new(provider));
+        self.real_table_sources.insert(name.to_string(), source);
+        Ok(())
+    }
+
+    /// After registering a table asynchronously (parquet/csv/json/arrow), store the real source
+    /// and register the virtual empty twin __empty_{name}.
+    async fn post_register_async(&mut self, name: &str) -> Result<(), DataFusionError> {
+        let provider = self.ctx.table_provider(name).await?;
+        let schema = provider.schema();
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let empty_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![empty_batch]])?;
+        let virtual_name = format!("__empty_{}", name);
+        self.ctx
+            .register_table(&virtual_name, Arc::new(empty_table))?;
+        let source = Arc::new(DefaultTableSource::new(provider));
+        self.real_table_sources.insert(name.to_string(), source);
         Ok(())
     }
 
     /// Set the join graph from a list of Join specifications.
     pub fn set_joins(&mut self, joins: &[Join]) -> Result<(), String> {
         self.join_graph = Some(JoinGraph::new(joins)?);
-        let elim_rule = EliminateUnusedJoins::new(self.join_graph.as_ref().unwrap().clone());
-        self.ctx.add_optimizer_rule(Arc::new(elim_rule));
         Ok(())
     }
 
@@ -271,16 +320,23 @@ impl DataModel {
         for pa in pre_aggs {
             // Infer source table from qualified column names
             let source_table = infer_source_table(&pa.aggregations)?;
+            debug_log!("write_pre_agg: '{}' source_table='{}' group_by={:?} aggs={:?}", pa.name, source_table, pa.group_by, pa.aggregations);
 
-            // Build the aggregation query
-            let df = self.table(&source_table).await?;
+            // Build the aggregation query using real data (not the virtual empty tables).
+            let df = self.real_table(&source_table).await?;
+            debug_log!("write_pre_agg: real_table schema fields = {:?}", df.schema().fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>());
+            debug_log!("write_pre_agg: real_table plan =\n{}", df.logical_plan().display_indent());
 
-            // Use bare column names in parquet — DataFusion's col() resolves
-            // "orders.region" to Column { relation: Some("orders"), name: "region" },
-            // and the Arrow output field name is just "region".
-            // The optimizer wraps the pre-agg scan in a SubqueryAlias to restore
-            // the original table qualifier.
-            let group_exprs: Vec<Expr> = pa.group_by.iter().map(|c| col(c.as_str())).collect();
+            // Alias each group-by column to its encoded parquet field name.
+            // e.g. "orders.region" → parquet field "orders__region"
+            // The optimizer's build_pre_agg_scan() projection decodes this back to
+            // Column { relation: "orders", name: "region" } at query time.
+            let group_exprs: Vec<Expr> = pa
+                .group_by
+                .iter()
+                .map(|c| col(c.as_str()).alias(PreAggregation::group_by_column_name(c)))
+                .collect();
+            debug_log!("write_pre_agg: group_exprs={:?}", group_exprs);
 
             let mut agg_exprs: Vec<Expr> = Vec::new();
             for (col_name, components) in &pa.aggregations {
@@ -406,12 +462,14 @@ impl DataModel {
 
     /// Get a DataFusion DataFrame for a registered table.
     ///
-    /// Eagerly pre-joins all reachable tables via the JoinGraph so that
-    /// cross-table column references work in the DataFrame API (which validates
-    /// schemas at expression-building time, before the optimizer runs).
+    /// Returns a zero-row virtual DataFrame backed by `__empty_{name}` tables so
+    /// that all cross-table column references resolve at expression-build time.
+    /// The VirtualScanExpander rule (applied in prepare_measure_dfs) later replaces
+    /// the virtual scan cluster with either a pre-agg scan or the real join plan.
     pub async fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
         let ctx = &self.ctx;
-        let mut inner = ctx.table(name).await?;
+        let virtual_name = format!("__empty_{}", name);
+        let mut inner = ctx.table(&virtual_name).await?.alias(name)?;
 
         if let Some(ref join_graph) = self.join_graph {
             let mut joined_tables: HashSet<String> = HashSet::new();
@@ -429,6 +487,61 @@ impl DataModel {
                     if joined_tables.contains(&step.right) {
                         continue;
                     }
+                    let right_virtual = format!("__empty_{}", step.right);
+                    let right_df = ctx.table(&right_virtual).await?.alias(&step.right)?;
+                    let left_on_qualified: Vec<String> = step
+                        .left_on
+                        .iter()
+                        .map(|s| format!("{}.{}", step.left, s))
+                        .collect();
+                    let right_on_qualified: Vec<String> = step
+                        .right_on
+                        .iter()
+                        .map(|s| format!("{}.{}", step.right, s))
+                        .collect();
+                    let left_on: Vec<&str> =
+                        left_on_qualified.iter().map(|s| s.as_str()).collect();
+                    let right_on: Vec<&str> =
+                        right_on_qualified.iter().map(|s| s.as_str()).collect();
+                    let join_type = match step.how {
+                        JoinHow::Inner => JoinType::Inner,
+                        JoinHow::Left => JoinType::Left,
+                    };
+                    inner = inner.join(right_df, join_type, &left_on, &right_on, None)?;
+                    joined_tables.insert(step.right.clone());
+                }
+            }
+        }
+        Ok(inner)
+    }
+
+    /// Get a DataFusion DataFrame backed by real table data with real joins.
+    /// Used internally by write_pre_agg() which needs actual rows to compute aggregations.
+    async fn real_table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
+        let ctx = &self.ctx;
+        let mut inner = ctx.table(name).await?;
+        debug_log!("real_table: base '{}' schema fields = {:?}", name, inner.schema().fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>());
+
+        if let Some(ref join_graph) = self.join_graph {
+            let mut joined_tables: HashSet<String> = HashSet::new();
+            joined_tables.insert(name.to_string());
+
+            for target in join_graph.tables() {
+                if joined_tables.contains(target) {
+                    continue;
+                }
+                let path = match join_graph.find_path(name, target) {
+                    Some(p) => p,
+                    None => {
+                        debug_log!("real_table: no path from '{}' to '{}', skipping", name, target);
+                        continue;
+                    }
+                };
+                for step in &path {
+                    if joined_tables.contains(&step.right) {
+                        continue;
+                    }
+                    debug_log!("real_table: joining '{}' -> '{}'", step.left, step.right);
                     let right_df = ctx.table(&step.right).await?;
                     let left_on_qualified: Vec<String> = step
                         .left_on
@@ -440,7 +553,8 @@ impl DataModel {
                         .iter()
                         .map(|s| format!("{}.{}", step.right, s))
                         .collect();
-                    let left_on: Vec<&str> = left_on_qualified.iter().map(|s| s.as_str()).collect();
+                    let left_on: Vec<&str> =
+                        left_on_qualified.iter().map(|s| s.as_str()).collect();
                     let right_on: Vec<&str> =
                         right_on_qualified.iter().map(|s| s.as_str()).collect();
                     let join_type = match step.how {
@@ -512,23 +626,22 @@ impl DataModel {
         column_context::exclude(patterns, input, columns)
     }
 
-    /// Build (or rebuild) the pre-aggregation rule.
+    /// Build (or rebuild) the unified VirtualScanExpander rule.
     ///
-    /// Creates a `PreAggSubstitution` rule that can rewrite individual measure
-    /// plans to use pre-aggregated tables. The rule is applied per-measure in
-    /// `prepare_measure_dfs` rather than as a session-level optimizer, so it
-    /// never sees the combined multi-measure plan.
+    /// The rule is applied per-measure in `prepare_measure_dfs` via try_rewrite().
+    /// It either substitutes a pre-agg or expands the virtual scan cluster to real joins.
     pub async fn build_pre_agg_optimizer(&mut self) -> Result<(), DataFusionError> {
-        if !self.pre_agg_objects.is_empty() {
-            let mut table_sources: HashMap<String, Arc<dyn TableSource>> = HashMap::new();
-            for pa in &self.pre_agg_objects {
-                let provider = self.ctx.table_provider(&pa.name).await?;
-                table_sources.insert(pa.name.clone(), Arc::new(DefaultTableSource::new(provider)));
-            }
-            self.pre_agg_rule =
-                Some(PreAggSubstitution::new(self.pre_agg_objects.clone(), table_sources));
+        let mut pre_agg_sources: HashMap<String, Arc<dyn TableSource>> = HashMap::new();
+        for pa in &self.pre_agg_objects {
+            let provider = self.ctx.table_provider(&pa.name).await?;
+            pre_agg_sources.insert(pa.name.clone(), Arc::new(DefaultTableSource::new(provider)));
         }
-
+        self.pre_agg_rule = Some(VirtualScanExpander::new(
+            self.pre_agg_objects.clone(),
+            pre_agg_sources,
+            self.real_table_sources.clone(),
+            self.join_graph.clone(),
+        ));
         Ok(())
     }
 
@@ -545,7 +658,21 @@ impl DataModel {
         qc.validate(&measure_metadata, &all_cols)
             .map_err(|e| DataFusionError::Plan(e))?;
 
-        let use_pre_agg = qc.use_pre_agg && self.pre_agg_rule.is_some();
+        // Build the VirtualScanExpander to use for this query.
+        // If build_pre_agg_optimizer() was never called, use a fallback with no pre-aggs.
+        let fallback;
+        let expander: &VirtualScanExpander = match &self.pre_agg_rule {
+            Some(r) => r,
+            None => {
+                fallback = VirtualScanExpander::new(
+                    vec![],
+                    HashMap::new(),
+                    self.real_table_sources.clone(),
+                    self.join_graph.clone(),
+                );
+                &fallback
+            }
+        };
 
         // Build each measure DataFrame (no collect)
         let mut measure_dfs: Vec<(String, DataFrame)> = Vec::new();
@@ -555,17 +682,14 @@ impl DataModel {
             })?;
             let df = measure_fn(qc, self).await?;
 
-            if use_pre_agg {
-                // Apply the pre-agg rule to each measure's plan individually.
-                // This ensures the rule only sees one measure at a time and never
-                // attempts to rewrite the combined multi-measure plan.
-                let rule = self.pre_agg_rule.as_ref().unwrap();
-                let rewritten_plan = rule.try_rewrite(df.logical_plan().clone())?;
-                let rewritten_df = DataFrame::new(self.ctx.state(), rewritten_plan);
-                measure_dfs.push((measure_name.clone(), rewritten_df));
-            } else {
-                measure_dfs.push((measure_name.clone(), df));
-            }
+            // Always apply VirtualScanExpander — virtual scans from table() must be
+            // expanded to either a pre-agg scan or real join plan before execution.
+            debug_log!("prepare_measure_dfs: measure='{}' plan BEFORE rewrite:\n{}", measure_name, df.logical_plan().display_indent());
+            let rewritten_plan =
+                expander.try_rewrite(df.logical_plan().clone(), qc.use_pre_agg)?;
+            debug_log!("prepare_measure_dfs: measure='{}' plan AFTER rewrite:\n{}", measure_name, rewritten_plan.display_indent());
+            let rewritten_df = DataFrame::new(self.ctx.state(), rewritten_plan);
+            measure_dfs.push((measure_name.clone(), rewritten_df));
         }
 
         if measure_dfs.is_empty() {
@@ -1016,23 +1140,6 @@ mod tests {
         // Verify correct results: Alice=40, Bob=20
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2, "Should have 2 rows (Alice and Bob)");
-
-        // Also verify the plan does NOT contain "teams"
-        let df = dm.table("player_stats").await.unwrap();
-        let group_exprs = vec![col("players.name")];
-        let agg_df = df
-            .aggregate(group_exprs, vec![sum(col("score")).alias("total_score")])
-            .unwrap();
-
-        let plan = agg_df.into_optimized_plan().unwrap();
-        let plan_str = format!("{}", plan.display_indent());
-        println!("OPTIMIZED PLAN:\n{}", plan_str);
-
-        assert!(
-            !plan_str.contains("teams"),
-            "Optimized plan should eliminate unreferenced 'teams' join.\nPlan:\n{}",
-            plan_str
-        );
     }
 
     // ── Pre-aggregation integration tests (parquet round-trip) ─────────
@@ -1068,9 +1175,10 @@ mod tests {
     }
 
     fn make_sum_preagg_batch() -> RecordBatch {
+        // Column names use the encoded format: "orders__region", "orders__amount-sum"
         let schema = Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount-sum", DataType::Int64, false),
+            Field::new("orders__region", DataType::Utf8, false),
+            Field::new("orders__amount-sum", DataType::Int64, false),
         ]));
         RecordBatch::try_new(
             schema,
@@ -1323,9 +1431,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_pre_agg_count_rewrite() {
+        // Column names use the encoded format: "orders__region", "orders__amount-count"
         let schema = Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount-count", DataType::Int64, false),
+            Field::new("orders__region", DataType::Utf8, false),
+            Field::new("orders__amount-count", DataType::Int64, false),
         ]));
         let preagg_batch = RecordBatch::try_new(
             schema.clone(),

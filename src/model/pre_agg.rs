@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if std::env::var("DATASUBWAY_DEBUG").is_ok() {
+            eprintln!("[datasubway pre_agg] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// Maps user-facing agg names to stored component column suffixes.
 /// e.g. "mean" needs both "sum" and "count" components stored.
 pub fn agg_expansion(agg_name: &str) -> Result<Vec<&'static str>, String> {
@@ -76,42 +84,40 @@ impl PreAggregation {
         })
     }
 
-    /// Check if this pre-agg covers the requested group_by and aggregation needs.
+    /// Check if this pre-agg covers the requested column requirements.
     ///
     /// A pre-agg covers a request if:
-    /// 1. requested_group_by ⊆ self.group_by
+    /// 1. All non-aggregate column references (group-by, filter, projection, join keys, etc.)
+    ///    are in self.group_by
     /// 2. For each (col, needed_components), all components are stored
-    /// 3. All filter_columns are in self.group_by (filters need raw values)
     pub fn covers(
         &self,
-        requested_group_by: &[String],
-        requested_agg_components: &HashMap<String, HashSet<String>>,
-        filter_columns: &[String],
+        non_agg_cols: &[String],
+        agg_cols: &HashMap<String, HashSet<String>>,
     ) -> bool {
+        debug_log!("covers: checking '{}' (group_by={:?}) against non_agg={:?}", self.name, self.group_by, non_agg_cols);
         let my_group_set: HashSet<&str> = self.group_by.iter().map(|s| s.as_str()).collect();
 
-        // Check group_by coverage
-        for col in requested_group_by {
+        // Every non-aggregate column reference must be in this pre-agg's group_by
+        for col in non_agg_cols {
             if !my_group_set.contains(col.as_str()) {
-                return false;
-            }
-        }
-
-        // Check filter columns are in group_by (filters need raw values at the right granularity)
-        for col in filter_columns {
-            if !my_group_set.contains(col.as_str()) {
+                debug_log!("covers: '{}' rejected — non_agg col '{}' not in group_by", self.name, col);
                 return false;
             }
         }
 
         // Check agg component coverage
-        for (col, needed) in requested_agg_components {
+        for (col, needed) in agg_cols {
             match self.aggregations.get(col) {
-                None => return false,
+                None => {
+                    debug_log!("covers: '{}' rejected — agg col '{}' not in aggregations", self.name, col);
+                    return false;
+                }
                 Some(stored) => {
                     let stored_set: HashSet<&str> = stored.iter().map(|s| s.as_str()).collect();
                     for comp in needed {
                         if !stored_set.contains(comp.as_str()) {
+                            debug_log!("covers: '{}' rejected — component '{}' for '{}' not stored", self.name, comp, col);
                             return false;
                         }
                     }
@@ -119,14 +125,34 @@ impl PreAggregation {
             }
         }
 
+        debug_log!("covers: '{}' ACCEPTED", self.name);
         true
     }
 
-    /// Bare column name for a stored component, e.g. "amount-sum".
-    /// Strips the table qualifier from the column name before appending the component.
+    /// Parquet field name for a group-by column.
+    /// Encodes the table qualifier using "__" to avoid dot ambiguity.
+    /// e.g. "orders.region" → "orders__region"
+    pub fn group_by_column_name(col: &str) -> String {
+        col.replace('.', "__")
+    }
+
+    /// Parquet field name for a stored aggregate component.
+    /// Encodes the table qualifier and column name, then appends the component.
+    /// e.g. "orders.amount", "sum" → "orders__amount-sum"
     pub fn component_column(col: &str, component: &str) -> String {
-        let bare = col.rsplit('.').next().unwrap_or(col);
-        format!("{}-{}", bare, component)
+        let encoded = col.replace('.', "__");
+        format!("{}-{}", encoded, component)
+    }
+
+    /// Decode a parquet column name back to (table, bare_name).
+    /// Splits on the first "__" separator.
+    /// e.g. "orders__amount-sum" → ("orders", "amount-sum")
+    /// e.g. "orders__region"     → ("orders", "region")
+    pub fn decode_parquet_col_name(name: &str) -> (String, String) {
+        match name.find("__") {
+            Some(i) => (name[..i].to_string(), name[i + 2..].to_string()),
+            None => (String::new(), name.to_string()),
+        }
     }
 
     /// Extract the source table name from the qualified group-by columns.
@@ -139,13 +165,12 @@ impl PreAggregation {
 /// Find the best (smallest row_count) pre-agg that covers the request.
 pub fn find_best_pre_agg<'a>(
     pre_aggs: &'a [PreAggregation],
-    requested_group_by: &[String],
-    requested_agg_components: &HashMap<String, HashSet<String>>,
-    filter_columns: &[String],
+    non_agg_cols: &[String],
+    agg_cols: &HashMap<String, HashSet<String>>,
 ) -> Option<&'a PreAggregation> {
     pre_aggs
         .iter()
-        .filter(|pa| pa.covers(requested_group_by, requested_agg_components, filter_columns))
+        .filter(|pa| pa.covers(non_agg_cols, agg_cols))
         .min_by_key(|pa| pa.row_count)
 }
 
@@ -185,69 +210,69 @@ mod tests {
     #[test]
     fn test_covers_exact() {
         let pa = sample_pre_agg();
-        let group_by = vec!["orders.date".into(), "orders.region".into()];
-        let agg_components = HashMap::from([(
+        let non_agg_cols = vec!["orders.date".into(), "orders.region".into()];
+        let agg_cols = HashMap::from([(
             "orders.amount".to_string(),
             HashSet::from(["sum".to_string()]),
         )]);
-        assert!(pa.covers(&group_by, &agg_components, &[]));
+        assert!(pa.covers(&non_agg_cols, &agg_cols));
     }
 
     #[test]
     fn test_covers_subset_group_by() {
         let pa = sample_pre_agg();
-        let group_by = vec!["orders.region".into()]; // subset
-        let agg_components = HashMap::from([(
+        let non_agg_cols = vec!["orders.region".into()]; // subset
+        let agg_cols = HashMap::from([(
             "orders.amount".to_string(),
             HashSet::from(["sum".to_string()]),
         )]);
-        assert!(pa.covers(&group_by, &agg_components, &[]));
+        assert!(pa.covers(&non_agg_cols, &agg_cols));
     }
 
     #[test]
     fn test_covers_missing_group_col() {
         let pa = sample_pre_agg();
-        let group_by = vec!["orders.store".into()]; // not in pre-agg
-        let agg_components = HashMap::from([(
+        let non_agg_cols = vec!["orders.store".into()]; // not in pre-agg
+        let agg_cols = HashMap::from([(
             "orders.amount".to_string(),
             HashSet::from(["sum".to_string()]),
         )]);
-        assert!(!pa.covers(&group_by, &agg_components, &[]));
+        assert!(!pa.covers(&non_agg_cols, &agg_cols));
     }
 
     #[test]
     fn test_covers_missing_agg_component() {
         let pa = sample_pre_agg();
-        let group_by = vec!["orders.date".into()];
-        let agg_components = HashMap::from([(
+        let non_agg_cols = vec!["orders.date".into()];
+        let agg_cols = HashMap::from([(
             "orders.amount".to_string(),
             HashSet::from(["sumsq".to_string()]), // not stored
         )]);
-        assert!(!pa.covers(&group_by, &agg_components, &[]));
+        assert!(!pa.covers(&non_agg_cols, &agg_cols));
     }
 
     #[test]
     fn test_covers_filter_column_in_group_by() {
         let pa = sample_pre_agg();
-        let group_by = vec!["orders.date".into()];
-        let agg_components = HashMap::from([(
+        // Filter on region (non-agg, in group_by) → ok
+        let non_agg_cols = vec!["orders.date".into(), "orders.region".into()];
+        let agg_cols = HashMap::from([(
             "orders.amount".to_string(),
             HashSet::from(["sum".to_string()]),
         )]);
-        // Filter on region, which IS in group_by → ok
-        assert!(pa.covers(&group_by, &agg_components, &["orders.region".into()]));
+        assert!(pa.covers(&non_agg_cols, &agg_cols));
     }
 
     #[test]
     fn test_covers_filter_column_not_in_group_by() {
         let pa = sample_pre_agg();
-        let group_by = vec!["orders.date".into()];
-        let agg_components = HashMap::from([(
+        // Filter on store, which is NOT in group_by → rejected
+        let non_agg_cols = vec!["orders.date".into(), "orders.store".into()];
+        let agg_cols = HashMap::from([(
             "orders.amount".to_string(),
             HashSet::from(["sum".to_string()]),
         )]);
-        // Filter on store, which is NOT in group_by → rejected
-        assert!(!pa.covers(&group_by, &agg_components, &["orders.store".into()]));
+        assert!(!pa.covers(&non_agg_cols, &agg_cols));
     }
 
     #[test]
@@ -264,21 +289,40 @@ mod tests {
         pa2.row_count = 100; // smaller
 
         let pre_aggs = vec![pa1, pa2];
-        let group_by = vec!["orders.date".into()];
-        let agg_components = HashMap::from([(
+        let non_agg_cols = vec!["orders.date".into()];
+        let agg_cols = HashMap::from([(
             "orders.amount".to_string(),
             HashSet::from(["sum".to_string()]),
         )]);
 
-        let best = find_best_pre_agg(&pre_aggs, &group_by, &agg_components, &[]);
+        let best = find_best_pre_agg(&pre_aggs, &non_agg_cols, &agg_cols);
         assert_eq!(best.unwrap().name, "monthly_revenue");
+    }
+
+    #[test]
+    fn test_group_by_column_name() {
+        assert_eq!(
+            PreAggregation::group_by_column_name("orders.region"),
+            "orders__region"
+        );
     }
 
     #[test]
     fn test_component_column_naming() {
         assert_eq!(
             PreAggregation::component_column("orders.amount", "sum"),
-            "amount-sum"
+            "orders__amount-sum"
         );
+    }
+
+    #[test]
+    fn test_decode_parquet_col_name() {
+        let (table, bare) = PreAggregation::decode_parquet_col_name("orders__amount-sum");
+        assert_eq!(table, "orders");
+        assert_eq!(bare, "amount-sum");
+
+        let (table, bare) = PreAggregation::decode_parquet_col_name("orders__region");
+        assert_eq!(table, "orders");
+        assert_eq!(bare, "region");
     }
 }
