@@ -7,11 +7,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DataFusionError;
 use datafusion::datasource::DefaultTableSource;
+use datafusion::datasource::MemTable;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::prelude::*;
-use datafusion_expr::{LogicalPlan, TableSource};
+use datafusion_common::{DFSchema, TableReference};
+use datafusion_expr::{LogicalPlan, TableScan as LogicalTableScan, TableSource};
 use futures::future::BoxFuture;
 
 use crate::model::column_context;
@@ -136,6 +139,9 @@ pub struct DataModel {
     pre_agg_rule: Option<VirtualScanExpander>,
     join_graph: Option<JoinGraph>,
     table_schemas: HashMap<String, Vec<String>>,
+    /// Full Arrow schemas for all registered tables, used to build the combined
+    /// virtual schema returned by `table()`.
+    table_arrow_schemas: HashMap<String, SchemaRef>,
     /// Real table sources for all registered tables, passed to VirtualScanExpander
     /// so it can rebuild real join plans when no pre-agg covers the query.
     real_table_sources: HashMap<String, Arc<dyn TableSource>>,
@@ -161,6 +167,7 @@ impl DataModel {
             pre_agg_rule: None,
             join_graph: None,
             table_schemas: HashMap::new(),
+            table_arrow_schemas: HashMap::new(),
             real_table_sources: HashMap::new(),
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
@@ -180,6 +187,7 @@ impl DataModel {
             pre_agg_rule: None,
             join_graph: None,
             table_schemas: HashMap::new(),
+            table_arrow_schemas: HashMap::new(),
             real_table_sources: HashMap::new(),
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
@@ -238,34 +246,22 @@ impl DataModel {
     }
 
     /// After registering a table synchronously (RecordBatch), store the real source
-    /// and register the virtual empty twin __empty_{name}.
+    /// and Arrow schema for combined virtual scan construction.
     fn post_register(&mut self, name: &str) -> Result<(), DataFusionError> {
-        // Register virtual empty twin using the same Arrow schema
         let provider = futures::executor::block_on(self.ctx.table_provider(name))?;
         let schema = provider.schema();
-        let empty_batch = RecordBatch::new_empty(schema.clone());
-        let empty_table =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![empty_batch]])?;
-        let virtual_name = format!("__empty_{}", name);
-        self.ctx
-            .register_table(&virtual_name, Arc::new(empty_table))?;
-        // Store real table source for VirtualScanExpander
+        self.table_arrow_schemas.insert(name.to_string(), schema);
         let source = Arc::new(DefaultTableSource::new(provider));
         self.real_table_sources.insert(name.to_string(), source);
         Ok(())
     }
 
     /// After registering a table asynchronously (parquet/csv/json/arrow), store the real source
-    /// and register the virtual empty twin __empty_{name}.
+    /// and Arrow schema for combined virtual scan construction.
     async fn post_register_async(&mut self, name: &str) -> Result<(), DataFusionError> {
         let provider = self.ctx.table_provider(name).await?;
         let schema = provider.schema();
-        let empty_batch = RecordBatch::new_empty(schema.clone());
-        let empty_table =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![empty_batch]])?;
-        let virtual_name = format!("__empty_{}", name);
-        self.ctx
-            .register_table(&virtual_name, Arc::new(empty_table))?;
+        self.table_arrow_schemas.insert(name.to_string(), schema);
         let source = Arc::new(DefaultTableSource::new(provider));
         self.real_table_sources.insert(name.to_string(), source);
         Ok(())
@@ -320,12 +316,28 @@ impl DataModel {
         for pa in pre_aggs {
             // Infer source table from qualified column names
             let source_table = infer_source_table(&pa.aggregations)?;
-            debug_log!("write_pre_agg: '{}' source_table='{}' group_by={:?} aggs={:?}", pa.name, source_table, pa.group_by, pa.aggregations);
+            debug_log!(
+                "write_pre_agg: '{}' source_table='{}' group_by={:?} aggs={:?}",
+                pa.name,
+                source_table,
+                pa.group_by,
+                pa.aggregations
+            );
 
             // Build the aggregation query using real data (not the virtual empty tables).
             let df = self.real_table(&source_table).await?;
-            debug_log!("write_pre_agg: real_table schema fields = {:?}", df.schema().fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>());
-            debug_log!("write_pre_agg: real_table plan =\n{}", df.logical_plan().display_indent());
+            debug_log!(
+                "write_pre_agg: real_table schema fields = {:?}",
+                df.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>()
+            );
+            debug_log!(
+                "write_pre_agg: real_table plan =\n{}",
+                df.logical_plan().display_indent()
+            );
 
             // Alias each group-by column to its encoded parquet field name.
             // e.g. "orders.region" → parquet field "orders__region"
@@ -460,59 +472,84 @@ impl DataModel {
         Ok(())
     }
 
-    /// Get a DataFusion DataFrame for a registered table.
+    /// Build a combined virtual schema for `base_table` and all tables reachable
+    /// from it via the join graph.
     ///
-    /// Returns a zero-row virtual DataFrame backed by `__empty_{name}` tables so
-    /// that all cross-table column references resolve at expression-build time.
-    /// The VirtualScanExpander rule (applied in prepare_measure_dfs) later replaces
-    /// the virtual scan cluster with either a pre-agg scan or the real join plan.
-    pub async fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
-        let ctx = &self.ctx;
-        let virtual_name = format!("__empty_{}", name);
-        let mut inner = ctx.table(&virtual_name).await?.alias(name)?;
-
-        if let Some(ref join_graph) = self.join_graph {
-            let mut joined_tables: HashSet<String> = HashSet::new();
-            joined_tables.insert(name.to_string());
-
-            for target in join_graph.tables() {
-                if joined_tables.contains(target) {
-                    continue;
-                }
-                let path = match join_graph.find_path(name, target) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                for step in &path {
-                    if joined_tables.contains(&step.right) {
-                        continue;
-                    }
-                    let right_virtual = format!("__empty_{}", step.right);
-                    let right_df = ctx.table(&right_virtual).await?.alias(&step.right)?;
-                    let left_on_qualified: Vec<String> = step
-                        .left_on
-                        .iter()
-                        .map(|s| format!("{}.{}", step.left, s))
-                        .collect();
-                    let right_on_qualified: Vec<String> = step
-                        .right_on
-                        .iter()
-                        .map(|s| format!("{}.{}", step.right, s))
-                        .collect();
-                    let left_on: Vec<&str> =
-                        left_on_qualified.iter().map(|s| s.as_str()).collect();
-                    let right_on: Vec<&str> =
-                        right_on_qualified.iter().map(|s| s.as_str()).collect();
-                    let join_type = match step.how {
-                        JoinHow::Inner => JoinType::Inner,
-                        JoinHow::Left => JoinType::Left,
-                    };
-                    inner = inner.join(right_df, join_type, &left_on, &right_on, None)?;
-                    joined_tables.insert(step.right.clone());
+    /// Returns an Arrow schema (with encoded field names `table__column` to avoid
+    /// cross-table name collisions) and a DFSchema with per-field table qualifiers so
+    /// that `col("players.player_name")` resolves against the single flat scan.
+    /// Scoping to reachable tables prevents ambiguous column references when unrelated
+    /// tables share a column name (e.g. `goals` in both player_stats and team_stats).
+    fn build_combined_virtual_schema(
+        &self,
+        base_table: &str,
+    ) -> Result<(SchemaRef, DFSchema), DataFusionError> {
+        // Collect tables reachable from base_table (including itself)
+        let mut reachable: HashSet<String> = HashSet::new();
+        reachable.insert(base_table.to_string());
+        if let Some(ref jg) = self.join_graph {
+            for target in jg.tables() {
+                if jg.find_path(base_table, target).is_some() {
+                    reachable.insert(target.clone());
                 }
             }
         }
-        Ok(inner)
+
+        let mut sorted_tables: Vec<(&String, &SchemaRef)> = self
+            .table_arrow_schemas
+            .iter()
+            .filter(|(name, _)| reachable.contains(name.as_str()))
+            .collect();
+        sorted_tables.sort_by_key(|(name, _)| name.as_str());
+
+        let mut arrow_fields: Vec<Field> = Vec::new();
+        let mut df_fields: Vec<(Option<TableReference>, Arc<Field>)> = Vec::new();
+
+        for (table_name, schema) in &sorted_tables {
+            for field in schema.fields() {
+                arrow_fields.push(Field::new(
+                    format!("{}__{}", table_name, field.name()),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                ));
+                df_fields.push((
+                    Some(TableReference::bare(table_name.as_str())),
+                    Arc::new(Field::new(
+                        field.name(),
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    )),
+                ));
+            }
+        }
+
+        let arrow_schema = Arc::new(Schema::new(arrow_fields));
+        let df_schema = DFSchema::new_with_metadata(df_fields, HashMap::new())?;
+        Ok((arrow_schema, df_schema))
+    }
+
+    /// Get a DataFusion DataFrame for a registered table.
+    ///
+    /// Returns a single zero-row virtual TableScan whose `projected_schema` covers
+    /// the base table and all tables reachable from it via the join graph, with
+    /// proper per-field qualifiers. Column references like `col("players.player_name")`
+    /// resolve correctly without joining virtual tables. The VirtualScanExpander later
+    /// replaces this scan with either a pre-agg scan or a real join plan — only
+    /// joining tables the query actually references.
+    pub async fn table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
+        let (arrow_schema, df_schema) = self.build_combined_virtual_schema(name)?;
+        let empty_batch = RecordBatch::new_empty(arrow_schema.clone());
+        let mem_table = Arc::new(MemTable::try_new(arrow_schema, vec![vec![empty_batch]])?);
+        let source: Arc<dyn TableSource> = Arc::new(DefaultTableSource::new(mem_table as _));
+        let scan = LogicalPlan::TableScan(LogicalTableScan {
+            table_name: TableReference::bare(format!("__empty_{}", name)),
+            source,
+            projection: None,
+            projected_schema: Arc::new(df_schema),
+            filters: vec![],
+            fetch: None,
+        });
+        Ok(DataFrame::new(self.ctx.state(), scan))
     }
 
     /// Get a DataFusion DataFrame backed by real table data with real joins.
@@ -520,7 +557,16 @@ impl DataModel {
     async fn real_table(&self, name: &str) -> Result<DataFrame, DataFusionError> {
         let ctx = &self.ctx;
         let mut inner = ctx.table(name).await?;
-        debug_log!("real_table: base '{}' schema fields = {:?}", name, inner.schema().fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>());
+        debug_log!(
+            "real_table: base '{}' schema fields = {:?}",
+            name,
+            inner
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        );
 
         if let Some(ref join_graph) = self.join_graph {
             let mut joined_tables: HashSet<String> = HashSet::new();
@@ -533,7 +579,11 @@ impl DataModel {
                 let path = match join_graph.find_path(name, target) {
                     Some(p) => p,
                     None => {
-                        debug_log!("real_table: no path from '{}' to '{}', skipping", name, target);
+                        debug_log!(
+                            "real_table: no path from '{}' to '{}', skipping",
+                            name,
+                            target
+                        );
                         continue;
                     }
                 };
@@ -553,8 +603,7 @@ impl DataModel {
                         .iter()
                         .map(|s| format!("{}.{}", step.right, s))
                         .collect();
-                    let left_on: Vec<&str> =
-                        left_on_qualified.iter().map(|s| s.as_str()).collect();
+                    let left_on: Vec<&str> = left_on_qualified.iter().map(|s| s.as_str()).collect();
                     let right_on: Vec<&str> =
                         right_on_qualified.iter().map(|s| s.as_str()).collect();
                     let join_type = match step.how {
@@ -666,7 +715,11 @@ impl DataModel {
                 DataFusionError::Plan(format!("Unknown measure: '{}'", measure_name))
             })?;
             let df = measure_fn(qc, self).await?;
-            debug_log!("prepare_measure_dfs: measure='{}' plan:\n{}", measure_name, df.logical_plan().display_indent());
+            debug_log!(
+                "prepare_measure_dfs: measure='{}' plan:\n{}",
+                measure_name,
+                df.logical_plan().display_indent()
+            );
             measure_dfs.push((measure_name.clone(), df));
         }
 
@@ -676,7 +729,6 @@ impl DataModel {
 
         Ok(measure_dfs)
     }
-
 
     /// Collect query results as RecordBatches.
     ///
@@ -705,12 +757,16 @@ impl DataModel {
                 &fallback
             }
         };
-        debug_log!("collect: combined plan BEFORE rewrite:\n{}", combined_df.logical_plan().display_indent());
-        let rewritten = expander.try_rewrite_combined(
-            combined_df.logical_plan().clone(),
-            qc.use_pre_agg,
-        )?;
-        debug_log!("collect: combined plan AFTER rewrite:\n{}", rewritten.display_indent());
+        debug_log!(
+            "collect: combined plan BEFORE rewrite:\n{}",
+            combined_df.logical_plan().display_indent()
+        );
+        let rewritten =
+            expander.try_rewrite_combined(combined_df.logical_plan().clone(), qc.use_pre_agg)?;
+        debug_log!(
+            "collect: combined plan AFTER rewrite:\n{}",
+            rewritten.display_indent()
+        );
         DataFrame::new(self.ctx.state(), rewritten).collect().await
     }
 
@@ -744,10 +800,8 @@ impl DataModel {
                 &fallback
             }
         };
-        let rewritten = expander.try_rewrite_combined(
-            combined_df.logical_plan().clone(),
-            qc.use_pre_agg,
-        )?;
+        let rewritten =
+            expander.try_rewrite_combined(combined_df.logical_plan().clone(), qc.use_pre_agg)?;
         DataFrame::new(self.ctx.state(), rewritten).explain(verbose, analyze)
     }
 }

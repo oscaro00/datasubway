@@ -320,13 +320,26 @@ impl VirtualScanExpander {
         allow_pre_agg: bool,
     ) -> DFResult<LogicalPlan> {
         match &plan {
+            // Split at the inter-measure join: rewrite each branch independently.
             LogicalPlan::Join(_) => {
                 let inputs = plan.inputs();
                 let left = self.rewrite_node_combined(inputs[0].clone(), allow_pre_agg)?;
                 let right = self.rewrite_node_combined(inputs[1].clone(), allow_pre_agg)?;
                 plan.with_new_exprs(plan.expressions(), vec![left, right])
             }
-            _ if has_virtual_scan(&plan) => self.try_rewrite(plan, allow_pre_agg),
+            // Virtual scan leaf: apply the pre-agg / real-join rewrite to this branch.
+            node if is_virtual_cluster(node) => self.try_rewrite(plan, allow_pre_agg),
+            // Non-join wrapper with virtual scans below (Sort, Limit, Projection, etc.):
+            // recurse into children so we eventually reach the inter-measure Join or
+            // virtual cluster leaf without feeding the whole combined plan to try_rewrite.
+            _ if has_virtual_scan(&plan) => {
+                let new_inputs: Vec<LogicalPlan> = plan
+                    .inputs()
+                    .into_iter()
+                    .map(|child| self.rewrite_node_combined(child.clone(), allow_pre_agg))
+                    .collect::<DFResult<Vec<_>>>()?;
+                plan.with_new_exprs(plan.expressions(), new_inputs)
+            }
             other => Ok(other.clone()),
         }
     }
