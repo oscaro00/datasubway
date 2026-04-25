@@ -192,6 +192,15 @@ fn to_expr(expr: FilterExpr) -> Expr {
     }
 }
 
+pub(crate) fn filter_expr_to_polars(
+    expr: FilterExpr,
+    patterns: &[&str],
+    schema: &Schema,
+) -> Option<Expr> {
+    let pruned = prune(expr, patterns, schema)?;
+    Some(to_expr(pruned))
+}
+
 pub fn filter_to_expr(filter: &Value, patterns: &[&str], schema: &Schema) -> Option<Expr> {
     let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
     let pruned = prune(parsed, patterns, schema)?;

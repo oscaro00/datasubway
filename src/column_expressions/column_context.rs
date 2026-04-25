@@ -1,6 +1,7 @@
-use regex::Regex;
+use polars::lazy::dsl::{lit, Expr};
+use polars::prelude::Schema;
 
-use polars::lazy::dsl::Expr;
+use crate::column_expressions::filter_expr::{filter_expr_to_polars, FilterExpr};
 
 use super::column::{validate_table_columns, ReturnKind, TableColumn, TableColumnsReturn};
 
@@ -12,8 +13,7 @@ pub enum ColumnPattern {
 pub enum ColumnContext {
     OneString(&'static str),
     MultipleStrings(Vec<&'static str>),
-    // TODO: need to implement HashMap for parsing filter expressions
-    // HashMap(HashMap<&'static str, &'static str>),
+    Json(FilterExpr),
 }
 
 pub enum ColumnInclude {
@@ -32,19 +32,9 @@ fn normalize_column_pattern(pattern: ColumnPattern) -> Vec<TableColumn> {
         ColumnPattern::MultiplePatterns(v) => v,
     };
 
-    let re = Regex::new(r"^([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)$").unwrap();
-
     pattern_vec
         .into_iter()
-        .map(|p| {
-            if p == "*" {
-                TableColumn::new("*", "*").unwrap()
-            } else {
-                let caps = re.captures(p).unwrap();
-                TableColumn::new(caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str())
-                    .unwrap()
-            }
-        })
+        .map(|p| parse_column_pattern(p).unwrap())
         .collect()
 }
 
@@ -70,13 +60,29 @@ pub fn match_context_pattern(context_column: &TableColumn, patterns: &[TableColu
     false
 }
 
-// Might need to make allow()/exclude() macros, so that a fourth argument for the current schema gets passed
-// to the functions to make sure filter() can drop columns that cannot possibly apply to the base table
 pub fn allow(
     pattern: ColumnPattern,
     context: ColumnContext,
     include: ColumnInclude,
+    schema: &Schema,
 ) -> ColumnReturn {
+    let normalized_patterns = normalize_column_pattern(pattern);
+
+    if let ColumnContext::Json(filter_expr) = context {
+        // include is ignored for Json context — there is no meaningful way to
+        // inject arbitrary column names into an already-structured filter expression
+        let pattern_owned: Vec<String> = normalized_patterns
+            .iter()
+            .map(|tc| tc.table_column())
+            .collect();
+        let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
+
+        // lit(true) when all conditions pruned = safe pass-through (no filtering)
+        let expr =
+            filter_expr_to_polars(filter_expr, &all_patterns, schema).unwrap_or_else(|| lit(true));
+        return ColumnReturn::PolarsExpr(expr);
+    }
+
     let include_return = match include {
         ColumnInclude::OneString(s) => validate_table_columns(vec![s], ReturnKind::Strings),
         ColumnInclude::MultipleStrings(v) => validate_table_columns(v, ReturnKind::Strings),
@@ -86,11 +92,10 @@ pub fn allow(
         _ => unreachable!(),
     };
 
-    let normalized_patterns = normalize_column_pattern(pattern);
-
     let context_return = match context {
         ColumnContext::OneString(s) => validate_table_columns(vec![s], ReturnKind::TableColumns),
         ColumnContext::MultipleStrings(v) => validate_table_columns(v, ReturnKind::TableColumns),
+        ColumnContext::Json(_) => unreachable!(),
     };
     let context_vec = match context_return {
         TableColumnsReturn::TableColumns(v) => v,
@@ -110,10 +115,142 @@ pub fn allow(
     ColumnReturn::Strings(allowed_columns)
 }
 
+// Exclude should work very similarly to allow(). Instead of the context matching the patterns, they should not match.
+// The include columns should still be included automatically
 pub fn exclude(
     pattern: ColumnPattern,
     context: ColumnContext,
     include: ColumnInclude,
+    schema: &Schema,
 ) -> ColumnReturn {
     todo!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polars::lazy::dsl::{col, lit};
+    use polars::prelude::{DataType, Field, Schema};
+
+    fn test_schema() -> Schema {
+        Schema::from_iter([
+            Field::new("sales.amount".into(), DataType::Float64),
+            Field::new("date.year".into(), DataType::Int64),
+        ])
+    }
+
+    #[test]
+    fn test_json_context_prunes_non_matching_columns() {
+        let filter_expr = FilterExpr::And {
+            and: vec![
+                FilterExpr::Comparison {
+                    left: crate::column_expressions::filter_expr::Operand::Col {
+                        col: "sales.amount".to_string(),
+                    },
+                    op: crate::column_expressions::filter_expr::CompareOp::Gt,
+                    right: crate::column_expressions::filter_expr::Operand::Lit {
+                        lit: serde_json::Value::Number(serde_json::Number::from(0)),
+                    },
+                },
+                FilterExpr::Comparison {
+                    left: crate::column_expressions::filter_expr::Operand::Col {
+                        col: "date.year".to_string(),
+                    },
+                    op: crate::column_expressions::filter_expr::CompareOp::Gt,
+                    right: crate::column_expressions::filter_expr::Operand::Lit {
+                        lit: serde_json::Value::Number(serde_json::Number::from(2020)),
+                    },
+                },
+            ],
+        };
+
+        let schema = test_schema();
+        let result = allow(
+            ColumnPattern::OnePattern("sales.*"),
+            ColumnContext::Json(filter_expr),
+            ColumnInclude::OneString("sales.amount"),
+            &schema,
+        );
+
+        // date.year is pruned; only sales.amount > 0 survives
+        let expected = col("sales.amount").gt(lit(0i64));
+        assert!(matches!(result, ColumnReturn::PolarsExpr(ref e) if e == &expected));
+    }
+
+    #[test]
+    fn test_json_context_wildcard_pattern_keeps_all() {
+        let filter_expr = FilterExpr::And {
+            and: vec![
+                FilterExpr::Comparison {
+                    left: crate::column_expressions::filter_expr::Operand::Col {
+                        col: "sales.amount".to_string(),
+                    },
+                    op: crate::column_expressions::filter_expr::CompareOp::Gt,
+                    right: crate::column_expressions::filter_expr::Operand::Lit {
+                        lit: serde_json::Value::Number(serde_json::Number::from(0)),
+                    },
+                },
+                FilterExpr::Comparison {
+                    left: crate::column_expressions::filter_expr::Operand::Col {
+                        col: "date.year".to_string(),
+                    },
+                    op: crate::column_expressions::filter_expr::CompareOp::Gt,
+                    right: crate::column_expressions::filter_expr::Operand::Lit {
+                        lit: serde_json::Value::Number(serde_json::Number::from(2020)),
+                    },
+                },
+            ],
+        };
+
+        let schema = test_schema();
+        let result = allow(
+            ColumnPattern::OnePattern("*"),
+            ColumnContext::Json(filter_expr),
+            ColumnInclude::OneString("sales.amount"),
+            &schema,
+        );
+
+        let expected = col("sales.amount")
+            .gt(lit(0i64))
+            .and(col("date.year").gt(lit(2020i64)));
+        assert!(matches!(result, ColumnReturn::PolarsExpr(ref e) if e == &expected));
+    }
+
+    #[test]
+    fn test_json_context_all_pruned_returns_lit_true() {
+        let filter_expr = FilterExpr::Comparison {
+            left: crate::column_expressions::filter_expr::Operand::Col {
+                col: "unknown.col".to_string(),
+            },
+            op: crate::column_expressions::filter_expr::CompareOp::Eq,
+            right: crate::column_expressions::filter_expr::Operand::Lit {
+                lit: serde_json::Value::Number(serde_json::Number::from(1)),
+            },
+        };
+
+        let schema = test_schema();
+        let result = allow(
+            ColumnPattern::OnePattern("sales.*"),
+            ColumnContext::Json(filter_expr),
+            ColumnInclude::OneString("sales.amount"),
+            &schema,
+        );
+
+        assert!(matches!(result, ColumnReturn::PolarsExpr(ref e) if e == &lit(true)));
+    }
+
+    #[test]
+    fn test_string_context_regression() {
+        let schema = test_schema();
+        let result = allow(
+            ColumnPattern::OnePattern("sales.*"),
+            ColumnContext::OneString("sales.amount"),
+            ColumnInclude::OneString("sales.amount"),
+            &schema,
+        );
+
+        assert!(
+            matches!(result, ColumnReturn::Strings(ref v) if v == &vec!["sales.amount".to_string()])
+        );
+    }
 }
