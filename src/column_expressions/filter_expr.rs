@@ -69,7 +69,7 @@ impl FromStr for CompareOp {
     }
 }
 
-fn col_is_valid(col_name: &str, patterns: &[&str], schema: &Schema) -> bool {
+fn col_is_valid(col_name: &str, patterns: &[&str], schema: &Schema, keep_matching: bool) -> bool {
     if schema.get(col_name).is_none() {
         return false;
     }
@@ -85,10 +85,11 @@ fn col_is_valid(col_name: &str, patterns: &[&str], schema: &Schema) -> bool {
         .iter()
         .filter_map(|p| parse_column_pattern(p))
         .collect();
-    match_context_pattern(&col_tc, &pattern_tcs)
+    let matches = match_context_pattern(&col_tc, &pattern_tcs);
+    if keep_matching { matches } else { !matches }
 }
 
-fn prune(expr: FilterExpr, patterns: &[&str], schema: &Schema) -> Option<FilterExpr> {
+fn prune(expr: FilterExpr, patterns: &[&str], schema: &Schema, keep_matching: bool) -> Option<FilterExpr> {
     match expr {
         FilterExpr::Comparison {
             ref left,
@@ -96,7 +97,7 @@ fn prune(expr: FilterExpr, patterns: &[&str], schema: &Schema) -> Option<FilterE
             ..
         } => {
             let cols_valid = [left, right].iter().all(|op| match op {
-                Operand::Col { col: name } => col_is_valid(name, patterns, schema),
+                Operand::Col { col: name } => col_is_valid(name, patterns, schema, keep_matching),
                 Operand::Lit { .. } => true,
             });
             if cols_valid {
@@ -108,7 +109,7 @@ fn prune(expr: FilterExpr, patterns: &[&str], schema: &Schema) -> Option<FilterE
         FilterExpr::And { and } => {
             let children: Vec<_> = and
                 .into_iter()
-                .filter_map(|e| prune(e, patterns, schema))
+                .filter_map(|e| prune(e, patterns, schema, keep_matching))
                 .collect();
             if children.is_empty() {
                 None
@@ -119,7 +120,7 @@ fn prune(expr: FilterExpr, patterns: &[&str], schema: &Schema) -> Option<FilterE
         FilterExpr::Or { or } => {
             let children: Vec<_> = or
                 .into_iter()
-                .filter_map(|e| prune(e, patterns, schema))
+                .filter_map(|e| prune(e, patterns, schema, keep_matching))
                 .collect();
             if children.is_empty() {
                 None
@@ -196,14 +197,15 @@ pub(crate) fn filter_expr_to_polars(
     expr: FilterExpr,
     patterns: &[&str],
     schema: &Schema,
+    keep_matching: bool,
 ) -> Option<Expr> {
-    let pruned = prune(expr, patterns, schema)?;
+    let pruned = prune(expr, patterns, schema, keep_matching)?;
     Some(to_expr(pruned))
 }
 
 pub fn filter_to_expr(filter: &Value, patterns: &[&str], schema: &Schema) -> Option<Expr> {
     let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
-    let pruned = prune(parsed, patterns, schema)?;
+    let pruned = prune(parsed, patterns, schema, true)?;
     Some(to_expr(pruned))
 }
 
