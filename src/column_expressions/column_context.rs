@@ -126,8 +126,10 @@ pub fn exclude(
     let normalized_patterns = normalize_column_pattern(pattern);
 
     if let ColumnContext::Json(filter_expr) = context {
-        let pattern_owned: Vec<String> =
-            normalized_patterns.iter().map(|tc| tc.table_column()).collect();
+        let pattern_owned: Vec<String> = normalized_patterns
+            .iter()
+            .map(|tc| tc.table_column())
+            .collect();
         let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
         let expr = filter_expr_to_polars(filter_expr, &all_patterns, schema, false)
             .unwrap_or_else(|| lit(true));

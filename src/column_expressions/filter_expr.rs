@@ -86,10 +86,19 @@ fn col_is_valid(col_name: &str, patterns: &[&str], schema: &Schema, keep_matchin
         .filter_map(|p| parse_column_pattern(p))
         .collect();
     let matches = match_context_pattern(&col_tc, &pattern_tcs);
-    if keep_matching { matches } else { !matches }
+    if keep_matching {
+        matches
+    } else {
+        !matches
+    }
 }
 
-fn prune(expr: FilterExpr, patterns: &[&str], schema: &Schema, keep_matching: bool) -> Option<FilterExpr> {
+fn prune(
+    expr: FilterExpr,
+    patterns: &[&str],
+    schema: &Schema,
+    keep_matching: bool,
+) -> Option<FilterExpr> {
     match expr {
         FilterExpr::Comparison {
             ref left,
