@@ -60,6 +60,8 @@ fn match_context_pattern(context_column: &TableColumn, patterns: &[TableColumn])
     false
 }
 
+// Might need to make allow()/exclude() macros, so that a fourth argument for the current schema gets passed
+// to the functions to make sure filter() can drop columns that cannot possibly apply to the base table
 pub fn allow(
     pattern: ColumnPattern,
     context: ColumnContext,
@@ -96,4 +98,12 @@ pub fn allow(
     allowed_columns.dedup();
 
     ColumnReturn::Strings(allowed_columns)
+}
+
+pub fn exclude(
+    pattern: ColumnPattern,
+    context: ColumnContext,
+    include: ColumnInclude,
+) -> ColumnReturn {
+    todo!()
 }
