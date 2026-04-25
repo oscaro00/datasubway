@@ -48,11 +48,21 @@ fn normalize_column_pattern(pattern: ColumnPattern) -> Vec<TableColumn> {
         .collect()
 }
 
-fn match_context_pattern(context_column: &TableColumn, patterns: &[TableColumn]) -> bool {
+pub fn parse_column_pattern(pattern: &str) -> Option<TableColumn> {
+    if pattern == "*" {
+        return TableColumn::new("*", "*").ok();
+    }
+    let (table, col) = pattern.split_once('.')?;
+    TableColumn::new(table, col).ok()
+}
+
+pub fn match_context_pattern(context_column: &TableColumn, patterns: &[TableColumn]) -> bool {
     for pat in patterns.iter() {
         if pat.table() == "*" {
             return true;
-        } else if pat.table() == context_column.table() && pat.column() == context_column.column() {
+        } else if pat.table() == context_column.table()
+            && (pat.column() == "*" || pat.column() == context_column.column())
+        {
             return true;
         }
     }

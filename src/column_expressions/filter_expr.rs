@@ -6,6 +6,9 @@ use serde_json::Value;
 use polars::lazy::dsl::{col, lit, Expr};
 use polars::prelude::{NamedFrom, Schema, Series};
 
+use super::column::TableColumn;
+use super::column_context::{match_context_pattern, parse_column_pattern};
+
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub enum FilterExpr {
@@ -66,21 +69,23 @@ impl FromStr for CompareOp {
     }
 }
 
-fn col_matches_pattern(col_name: &str, pattern: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let col_parts: Vec<&str> = col_name.splitn(2, '.').collect();
-    let pat_parts: Vec<&str> = pattern.splitn(2, '.').collect();
-    if col_parts.len() != 2 || pat_parts.len() != 2 {
+fn col_is_valid(col_name: &str, patterns: &[&str], schema: &Schema) -> bool {
+    if schema.get(col_name).is_none() {
         return false;
     }
-    (pat_parts[0] == "*" || pat_parts[0] == col_parts[0])
-        && (pat_parts[1] == "*" || pat_parts[1] == col_parts[1])
-}
-
-fn col_is_valid(col_name: &str, patterns: &[&str], schema: &Schema) -> bool {
-    schema.get(col_name).is_some() && patterns.iter().any(|p| col_matches_pattern(col_name, p))
+    let (table, column) = match col_name.split_once('.') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let col_tc = match TableColumn::new(table, column) {
+        Ok(tc) => tc,
+        Err(_) => return false,
+    };
+    let pattern_tcs: Vec<TableColumn> = patterns
+        .iter()
+        .filter_map(|p| parse_column_pattern(p))
+        .collect();
+    match_context_pattern(&col_tc, &pattern_tcs)
 }
 
 fn prune(expr: FilterExpr, patterns: &[&str], schema: &Schema) -> Option<FilterExpr> {
@@ -196,7 +201,8 @@ pub fn filter_to_expr(filter: &Value, patterns: &[&str], schema: &Schema) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polars::prelude::{DataType, Field, Schema};
+    use polars::lazy::dsl::{col, lit};
+    use polars::prelude::{DataType, Field, NamedFrom, Schema, Series};
     use serde_json::json;
 
     fn test_schema() -> Schema {
@@ -228,7 +234,20 @@ mod tests {
 
         let schema = test_schema();
         let patterns = &["geography.*", "date.year", "sales.*"];
-        assert!(filter_to_expr(&filter, patterns, &schema).is_some());
+        let result = filter_to_expr(&filter, patterns, &schema);
+
+        let expected = col("geography.state")
+            .is_in(
+                lit(Series::new(
+                    "".into(),
+                    vec!["MN".to_string(), "WI".to_string()],
+                )),
+                false,
+            )
+            .and(col("date.year").gt(lit(2024i64)))
+            .and(col("sales.ty_sales").lt_eq(col("sales.ly_sales")));
+
+        assert_eq!(result, Some(expected));
     }
 
     #[test]
@@ -242,8 +261,11 @@ mod tests {
 
         let schema = test_schema();
         let patterns = &["sales.*"];
-        // "unknown.col" pruned; "sales.ty_sales" survives → Some
-        assert!(filter_to_expr(&filter, patterns, &schema).is_some());
+        let result = filter_to_expr(&filter, patterns, &schema);
+
+        // "unknown.col" pruned; only "sales.ty_sales > 0" survives
+        let expected = col("sales.ty_sales").gt(lit(0i64));
+        assert_eq!(result, Some(expected));
     }
 
     #[test]
@@ -256,6 +278,6 @@ mod tests {
 
         let schema = test_schema();
         let patterns = &["sales.*"];
-        assert!(filter_to_expr(&filter, patterns, &schema).is_none());
+        assert_eq!(filter_to_expr(&filter, patterns, &schema), None);
     }
 }
