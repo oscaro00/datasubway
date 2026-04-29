@@ -5,7 +5,9 @@ use polars::prelude::{LazyFrame, Schema};
 
 use crate::{
     model_components::{pre_aggregations::PreAggregation, query_context::QueryContext},
-    wrappers::polars::lazyframe_recorder::LazyFrameRecorder,
+    wrappers::polars::{
+        lazyframe_recorder::LazyFrameRecorder, lazyframe_wrapper::LazyFrameWrapper,
+    },
 };
 
 use super::model_components::joins::JoinGraph;
@@ -60,17 +62,23 @@ impl DataModel {
             table_name: table_name.to_string(),
             data_model: self,
             lazy_ops: Vec::new(),
-            non_agg_cols: Vec::new(),
-            agg_exprs: Vec::new(),
+            non_agg_cols: HashSet::new(),
+            agg_cols: HashMap::new(),
             non_base_tables: HashSet::new(),
             use_pre_agg: false,
         }
     }
 
-    pub(crate) fn get_table(&self, table_name: &str) -> LazyFrame {
-        self.tables
-            .get(table_name)
-            .unwrap_or_else(|| panic!("table '{table_name}' not found in DataModel"))
-            .clone()
+    pub(crate) fn get_table(&self, table_name: &str) -> LazyFrameWrapper {
+        // This function will eventually need to check if a pre aggregation exists
+
+        LazyFrameWrapper {
+            lazyframe: self
+                .tables
+                .get(table_name)
+                .unwrap_or_else(|| panic!("table '{table_name}' not found in DataModel"))
+                .clone(),
+            from_pre_agg: false,
+        }
     }
 }

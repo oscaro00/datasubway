@@ -18,10 +18,18 @@ pub fn main() -> Result<(), &'static str> {
     let dm = DataModel::new(tables, joins, HashMap::new(), vec![], None);
 
     let test_result = table!(dm, "orders")
-        .sort(["amount"], SortMultipleOptions::default())
+        .filter(Some(col("customer_id").neq(lit(20i64))))
+        .sort(Some(["amount"]), Some(SortMultipleOptions::default()))
         .collect();
 
     println!("{:?}", test_result);
+
+    let test_result2 = table!(dm, "orders")
+        .filter(None)
+        .sort(Some(["amount"]), Some(SortMultipleOptions::default()))
+        .collect();
+
+    println!("{:?}", test_result2);
 
     Ok(())
 }
