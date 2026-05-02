@@ -1,5 +1,7 @@
 use polars::prelude::*;
 
+use crate::wrappers::polars::lazygroupby_wrapper::LazyGroupByWrapper;
+
 pub struct LazyFrameWrapper {
     pub lazyframe: LazyFrame,
     pub from_pre_agg: bool,
@@ -28,6 +30,13 @@ impl LazyFrameWrapper {
                 from_pre_agg: self.from_pre_agg,
             },
             _ => self,
+        }
+    }
+
+    pub fn group_by(self, by: Vec<Expr>) -> LazyGroupByWrapper {
+        LazyGroupByWrapper {
+            lazygroupby: self.lazyframe.group_by(&by),
+            from_pre_agg: self.from_pre_agg,
         }
     }
 

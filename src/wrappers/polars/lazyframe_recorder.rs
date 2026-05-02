@@ -42,10 +42,12 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn filter(mut self, predicate: Expr) -> LazyFrameRecorder<'a> {
-        let cols = predicate.clone().meta().root_names();
-        self.non_agg_cols.extend(cols);
-        self.lazy_ops.push(LazyOp::Filter(predicate));
+    pub fn filter(mut self, predicate: Option<Expr>) -> LazyFrameRecorder<'a> {
+        if let Some(pred) = predicate {
+            let cols = pred.clone().meta().root_names();
+            self.non_agg_cols.extend(cols);
+            self.lazy_ops.push(LazyOp::Filter(pred));
+        }
         self
     }
 
@@ -127,9 +129,7 @@ impl<'a> LazyFrameRecorder<'a> {
                 (State::Frame(lfw), LazyOp::WithColumn(expr)) => {
                     State::Frame(lfw.with_column(expr))
                 }
-                (State::Frame(lfw), LazyOp::GroupBy(by)) => {
-                    State::GroupBy(LazyGroupByWrapper::group_by(lfw, by))
-                }
+                (State::Frame(lfw), LazyOp::GroupBy(by)) => State::GroupBy(lfw.group_by(by)),
                 (State::Frame(lfw), LazyOp::Limit(n)) => State::Frame(lfw.limit(n)),
                 (State::GroupBy(lgbw), LazyOp::Having(pred)) => State::GroupBy(lgbw.having(pred)),
                 (State::GroupBy(lgbw), LazyOp::Agg(aggs)) => State::Frame(lgbw.agg(aggs)),

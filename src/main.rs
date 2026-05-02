@@ -31,5 +31,14 @@ pub fn main() -> Result<(), &'static str> {
 
     println!("{:?}", test_result2);
 
+    let test_result3 = table!(dm, "orders")
+        .filter(None)
+        .group_by(vec![col("customer_id")])
+        .agg(vec![col("amount").max().alias("amount")])
+        .sort(Some(["amount"]), Some(SortMultipleOptions::default()))
+        .collect();
+
+    println!("{:?}", test_result2);
+
     Ok(())
 }

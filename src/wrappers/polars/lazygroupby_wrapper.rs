@@ -8,13 +8,6 @@ pub struct LazyGroupByWrapper {
 }
 
 impl LazyGroupByWrapper {
-    pub fn group_by(lfw: LazyFrameWrapper, by: Vec<Expr>) -> Self {
-        LazyGroupByWrapper {
-            lazygroupby: lfw.lazyframe.group_by(&by),
-            from_pre_agg: lfw.from_pre_agg,
-        }
-    }
-
     pub fn having(self, predicate: Expr) -> LazyGroupByWrapper {
         LazyGroupByWrapper {
             lazygroupby: self.lazygroupby.having(predicate),
