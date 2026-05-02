@@ -3,11 +3,20 @@ use std::collections::{HashMap, HashSet};
 use polars::prelude::*;
 
 use super::super::super::data_model::DataModel;
+use super::agg_expr_parser::extract_agg_exprs;
 use super::lazyframe_wrapper::LazyFrameWrapper;
+use super::lazygroupby_wrapper::LazyGroupByWrapper;
 
 pub enum LazyOp {
     Sort(Vec<PlSmallStr>, SortMultipleOptions),
     Filter(Expr),
+    WithColumn(Expr),
+    GroupBy(Vec<Expr>),
+    Having(Expr),
+    Agg(Vec<Expr>),
+    Head(Option<usize>),
+    Tail(Option<usize>),
+    Limit(u32),
     // ... etc
 }
 
@@ -40,12 +49,100 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
+    pub fn with_column(mut self, expr: Expr) -> LazyFrameRecorder<'a> {
+        let all_root_names = expr.clone().meta().root_names();
+        let agg_pairs = extract_agg_exprs(&expr);
+
+        let agg_col_set: HashSet<&str> = agg_pairs.iter().map(|(col, _)| col.as_str()).collect();
+
+        for name in &all_root_names {
+            if !agg_col_set.contains(name.as_str()) {
+                self.non_agg_cols.insert(name.clone());
+            }
+        }
+
+        for (col_name, agg_name) in agg_pairs {
+            self.agg_cols
+                .entry(col_name.as_str().into())
+                .or_default()
+                .push(agg_name);
+        }
+
+        self.lazy_ops.push(LazyOp::WithColumn(expr));
+        self
+    }
+
+    pub fn group_by(mut self, by: Vec<Expr>) -> LazyFrameRecorder<'a> {
+        for expr in &by {
+            self.non_agg_cols.extend(expr.clone().meta().root_names());
+        }
+        self.lazy_ops.push(LazyOp::GroupBy(by));
+        self
+    }
+
+    pub fn agg(mut self, exprs: Vec<Expr>) -> LazyFrameRecorder<'a> {
+        for expr in &exprs {
+            let all_root_names = expr.clone().meta().root_names();
+            let agg_pairs = extract_agg_exprs(expr);
+            let agg_col_set: HashSet<&str> =
+                agg_pairs.iter().map(|(col, _)| col.as_str()).collect();
+
+            for name in &all_root_names {
+                if !agg_col_set.contains(name.as_str()) {
+                    self.non_agg_cols.insert(name.clone());
+                }
+            }
+
+            for (col_name, agg_name) in agg_pairs {
+                self.agg_cols
+                    .entry(col_name.as_str().into())
+                    .or_default()
+                    .push(agg_name);
+            }
+        }
+
+        self.lazy_ops.push(LazyOp::Agg(exprs));
+        self
+    }
+
+    pub fn limit(mut self, n: u32) -> LazyFrameRecorder<'a> {
+        self.lazy_ops.push(LazyOp::Limit(n));
+        self
+    }
+
     pub fn build(self) -> LazyFrameWrapper {
-        let lfw = self.data_model.get_table(&self.table_name);
-        let mut result = self.lazy_ops.into_iter().fold(lfw, |lfw, op| match op {
-            LazyOp::Sort(by, opts) => lfw.sort(Some(by), Some(opts)),
-            LazyOp::Filter(predicate) => lfw.filter(Some(predicate)),
-        });
+        enum State {
+            Frame(LazyFrameWrapper),
+            GroupBy(LazyGroupByWrapper),
+        }
+
+        let mut state = State::Frame(self.data_model.get_table(&self.table_name));
+
+        for op in self.lazy_ops {
+            state = match (state, op) {
+                (State::Frame(lfw), LazyOp::Sort(by, opts)) => {
+                    State::Frame(lfw.sort(Some(by), Some(opts)))
+                }
+                (State::Frame(lfw), LazyOp::Filter(pred)) => State::Frame(lfw.filter(Some(pred))),
+                (State::Frame(lfw), LazyOp::WithColumn(expr)) => {
+                    State::Frame(lfw.with_column(expr))
+                }
+                (State::Frame(lfw), LazyOp::GroupBy(by)) => {
+                    State::GroupBy(LazyGroupByWrapper::group_by(lfw, by))
+                }
+                (State::Frame(lfw), LazyOp::Limit(n)) => State::Frame(lfw.limit(n)),
+                (State::GroupBy(lgbw), LazyOp::Having(pred)) => State::GroupBy(lgbw.having(pred)),
+                (State::GroupBy(lgbw), LazyOp::Agg(aggs)) => State::Frame(lgbw.agg(aggs)),
+                (State::GroupBy(lgbw), LazyOp::Head(n)) => State::Frame(lgbw.head(n)),
+                (State::GroupBy(lgbw), LazyOp::Tail(n)) => State::Frame(lgbw.tail(n)),
+                _ => panic!("invalid LazyOp sequence"),
+            };
+        }
+
+        let mut result = match state {
+            State::Frame(lfw) => lfw,
+            State::GroupBy(_) => panic!("incomplete group-by chain: missing agg/head/tail"),
+        };
         result.from_pre_agg = self.use_pre_agg;
         result
     }

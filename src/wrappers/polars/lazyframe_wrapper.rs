@@ -31,6 +31,20 @@ impl LazyFrameWrapper {
         }
     }
 
+    pub fn with_column(self, expr: Expr) -> LazyFrameWrapper {
+        LazyFrameWrapper {
+            lazyframe: self.lazyframe.with_column(expr),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
+    pub fn limit(self, n: u32) -> LazyFrameWrapper {
+        LazyFrameWrapper {
+            lazyframe: self.lazyframe.limit(n),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
     pub fn collect(self) -> Result<DataFrame, PolarsError> {
         self.lazyframe.collect()
     }
