@@ -6,18 +6,22 @@ use super::super::super::data_model::DataModel;
 use super::agg_expr_parser::extract_agg_exprs;
 use super::lazyframe_wrapper::LazyFrameWrapper;
 use super::lazygroupby_wrapper::LazyGroupByWrapper;
+use crate::column_expressions::column_context::{
+    AllowExcludeRecord, IntoFilterExpr, IntoPolarsColsExpr,
+};
 
 pub enum LazyOp {
     Sort(Vec<PlSmallStr>, SortMultipleOptions),
     Filter(Expr),
     WithColumn(Expr),
     GroupBy(Vec<Expr>),
+    GroupByDynamic,
+    Rolling,
     Having(Expr),
     Agg(Vec<Expr>),
     Head(Option<usize>),
     Tail(Option<usize>),
     Limit(u32),
-    // ... etc
 }
 
 pub struct LazyFrameRecorder<'a> {
@@ -28,6 +32,7 @@ pub struct LazyFrameRecorder<'a> {
     pub agg_cols: HashMap<PlSmallStr, Vec<String>>,
     pub non_base_tables: HashSet<String>,
     pub use_pre_agg: bool,
+    pub allow_exclude_records: Vec<AllowExcludeRecord>,
 }
 
 impl<'a> LazyFrameRecorder<'a> {
@@ -42,8 +47,8 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn filter(mut self, predicate: Option<Expr>) -> LazyFrameRecorder<'a> {
-        if let Some(pred) = predicate {
+    pub fn filter(mut self, predicate: impl IntoFilterExpr) -> LazyFrameRecorder<'a> {
+        if let Some(pred) = predicate.into_filter(&mut self.allow_exclude_records) {
             let cols = pred.clone().meta().root_names();
             self.non_agg_cols.extend(cols);
             self.lazy_ops.push(LazyOp::Filter(pred));
@@ -74,11 +79,12 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn group_by(mut self, by: Vec<Expr>) -> LazyFrameRecorder<'a> {
-        for expr in &by {
+    pub fn group_by(mut self, by: impl IntoPolarsColsExpr) -> LazyFrameRecorder<'a> {
+        let exprs = by.into_exprs_with_record(&mut self.allow_exclude_records);
+        for expr in &exprs {
             self.non_agg_cols.extend(expr.clone().meta().root_names());
         }
-        self.lazy_ops.push(LazyOp::GroupBy(by));
+        self.lazy_ops.push(LazyOp::GroupBy(exprs));
         self
     }
 
@@ -135,6 +141,9 @@ impl<'a> LazyFrameRecorder<'a> {
                 (State::GroupBy(lgbw), LazyOp::Agg(aggs)) => State::Frame(lgbw.agg(aggs)),
                 (State::GroupBy(lgbw), LazyOp::Head(n)) => State::Frame(lgbw.head(n)),
                 (State::GroupBy(lgbw), LazyOp::Tail(n)) => State::Frame(lgbw.tail(n)),
+                (_, LazyOp::GroupByDynamic) | (_, LazyOp::Rolling) => {
+                    panic!("group_by_dynamic and rolling are not yet implemented")
+                }
                 _ => panic!("invalid LazyOp sequence"),
             };
         }

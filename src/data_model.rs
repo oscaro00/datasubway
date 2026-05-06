@@ -1,10 +1,15 @@
-// NB: in the table! macro, disregard filter columns that cannot possibly join to the base table when selecting a pre aggregation
 use std::collections::{HashMap, HashSet};
 
 use polars::prelude::{LazyFrame, Schema};
 
 use crate::{
-    model_components::{pre_aggregations::PreAggregation, query_context::QueryContext},
+    model_components::{
+        measures::{
+            extract_measure_metadata, validate_measure_structure, Measure, MeasureMetadata,
+        },
+        pre_aggregations::PreAggregation,
+        query_context::QueryContext,
+    },
     wrappers::polars::{
         lazyframe_recorder::LazyFrameRecorder, lazyframe_wrapper::LazyFrameWrapper,
     },
@@ -15,7 +20,8 @@ use super::model_components::joins::JoinGraph;
 pub struct DataModel {
     tables: HashMap<String, LazyFrame>,
     joins: JoinGraph,
-    measures: HashMap<String, fn(&QueryContext) -> LazyFrame>,
+    pub(crate) measures: HashMap<String, Measure>,
+    pub measure_metadata: HashMap<String, MeasureMetadata>,
     pre_aggs: Option<Vec<PreAggregation>>,
     pre_agg_path: Option<&'static str>,
     table_schemas: HashMap<String, Schema>,
@@ -25,7 +31,6 @@ impl DataModel {
     pub fn new(
         mut tables: HashMap<String, LazyFrame>,
         joins: JoinGraph,
-        measures: HashMap<String, fn(&QueryContext) -> LazyFrame>,
         pre_aggs: Vec<PreAggregation>,
         pre_agg_path: Option<&'static str>,
     ) -> DataModel {
@@ -42,7 +47,8 @@ impl DataModel {
         DataModel {
             tables,
             joins,
-            measures,
+            measures: HashMap::new(),
+            measure_metadata: HashMap::new(),
             pre_aggs: if pre_aggs.is_empty() {
                 None
             } else {
@@ -66,12 +72,42 @@ impl DataModel {
             agg_cols: HashMap::new(),
             non_base_tables: HashSet::new(),
             use_pre_agg: false,
+            allow_exclude_records: Vec::new(),
         }
     }
 
-    pub(crate) fn get_table(&self, table_name: &str) -> LazyFrameWrapper {
-        // This function will eventually need to check if a pre aggregation exists
+    /// Returns the schema for a registered table.
+    pub fn table_schema(&self, table_name: &str) -> &Schema {
+        self.table_schemas
+            .get(table_name)
+            .unwrap_or_else(|| panic!("schema for table '{table_name}' not found"))
+    }
 
+    /// Register a measure with the DataModel. Validates structure at registration time.
+    pub fn add_measure(&mut self, measure: Measure) -> Result<(), String> {
+        if self.measures.contains_key(&measure.name) {
+            return Err(format!("measure '{}' already registered", measure.name));
+        }
+        let name = measure.name.clone();
+        let metadata = self.validate_and_extract_measure(&measure)?;
+        self.measures.insert(name.clone(), measure);
+        self.measure_metadata.insert(name, metadata);
+        Ok(())
+    }
+
+    fn validate_and_extract_measure(&self, measure: &Measure) -> Result<MeasureMetadata, String> {
+        let stub_qc = QueryContext::stub();
+        let recorder = measure.call(self, &stub_qc);
+        validate_measure_structure(&recorder)?;
+        Ok(extract_measure_metadata(&recorder, &measure.name))
+    }
+
+    /// Returns the metadata for a registered measure, if it exists.
+    pub fn measure_metadata(&self, name: &str) -> Option<&MeasureMetadata> {
+        self.measure_metadata.get(name)
+    }
+
+    pub(crate) fn get_table(&self, table_name: &str) -> LazyFrameWrapper {
         LazyFrameWrapper {
             lazyframe: self
                 .tables

@@ -9,7 +9,7 @@ use polars::prelude::{NamedFrom, Schema, Series};
 use super::column::TableColumn;
 use super::column_context::{match_context_pattern, parse_column_pattern};
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum FilterExpr {
     And {
@@ -25,14 +25,14 @@ pub enum FilterExpr {
     },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum Operand {
     Col { col: String },
     Lit { lit: Value },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CompareOp {
     Eq,
     Ne,
@@ -216,6 +216,21 @@ pub fn filter_to_expr(filter: &Value, patterns: &[&str], schema: &Schema) -> Opt
     let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
     let pruned = prune(parsed, patterns, schema, true)?;
     Some(to_expr(pruned))
+}
+
+/// Recursively collect all column names referenced in a FilterExpr.
+pub fn collect_col_names(expr: &FilterExpr) -> Vec<String> {
+    match expr {
+        FilterExpr::And { and } => and.iter().flat_map(collect_col_names).collect(),
+        FilterExpr::Or { or } => or.iter().flat_map(collect_col_names).collect(),
+        FilterExpr::Comparison { left, right, .. } => [left, right]
+            .iter()
+            .filter_map(|op| match op {
+                Operand::Col { col } => Some(col.clone()),
+                Operand::Lit { .. } => None,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]

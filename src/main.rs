@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use datasubway::{data_model::DataModel, model_components::joins::JoinGraph, table};
+use datasubway::{data_model::DataModel, model_components::joins::JoinGraph};
 use polars::prelude::*;
 
 pub fn main() -> Result<(), &'static str> {
@@ -15,30 +15,29 @@ pub fn main() -> Result<(), &'static str> {
     let tables = HashMap::from([("orders".to_string(), orders)]);
     let joins = JoinGraph::new(&[]).unwrap();
 
-    let dm = DataModel::new(tables, joins, HashMap::new(), vec![], None);
+    let dm = DataModel::new(tables, joins, vec![], None);
 
-    let test_result = table!(dm, "orders")
+    let test_result = dm
+        .table("orders")
         .filter(Some(col("customer_id").neq(lit(20i64))))
-        .sort(Some(["amount"]), Some(SortMultipleOptions::default()))
+        .sort(["amount"], SortMultipleOptions::default())
+        .build()
         .collect();
 
     println!("{:?}", test_result);
 
-    let test_result2 = table!(dm, "orders")
-        .filter(None)
-        .sort(Some(["amount"]), Some(SortMultipleOptions::default()))
-        .collect();
+    let test_result2 = dm.table("orders").build().collect();
 
     println!("{:?}", test_result2);
 
-    let test_result3 = table!(dm, "orders")
-        .filter(None)
+    let _test_result3 = dm
+        .table("orders")
         .group_by(vec![col("customer_id")])
         .agg(vec![col("amount").max().alias("amount")])
-        .sort(Some(["amount"]), Some(SortMultipleOptions::default()))
+        .build()
         .collect();
 
-    println!("{:?}", test_result2);
+    println!("{:?}", _test_result3);
 
     Ok(())
 }

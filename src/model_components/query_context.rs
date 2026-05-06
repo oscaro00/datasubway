@@ -1,1 +1,412 @@
-pub struct QueryContext {}
+use serde::{Deserialize, Serialize};
+
+use crate::column_expressions::filter_expr::{collect_col_names, FilterExpr};
+use crate::model_components::measures::MeasureMetadata;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryContext {
+    pub measures: Vec<String>,
+    pub filters: serde_json::Value,
+    pub groups: Vec<String>,
+    pub havings: serde_json::Value,
+    pub sorts: Vec<(String, String)>,
+    pub limit: usize,
+    pub offset: usize,
+    pub use_pre_agg: bool,
+}
+
+impl QueryContext {
+    pub fn new(
+        measures: Vec<String>,
+        filters: Option<serde_json::Value>,
+        groups: Option<Vec<String>>,
+        havings: Option<serde_json::Value>,
+        sorts: Option<Vec<(String, String)>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        use_pre_agg: Option<bool>,
+    ) -> Result<Self, String> {
+        if measures.is_empty() {
+            return Err("measures must not be empty".into());
+        }
+
+        let limit = limit.unwrap_or(10000);
+        if limit == 0 {
+            return Err("limit must be > 0".into());
+        }
+
+        Ok(QueryContext {
+            measures,
+            filters: filters.unwrap_or(serde_json::Value::Object(Default::default())),
+            groups: groups.unwrap_or_default(),
+            havings: havings.unwrap_or(serde_json::Value::Object(Default::default())),
+            sorts: sorts.unwrap_or_default(),
+            limit,
+            offset: offset.unwrap_or(0),
+            use_pre_agg: use_pre_agg.unwrap_or(true),
+        })
+    }
+
+    pub(crate) fn stub() -> Self {
+        QueryContext::new(
+            vec!["_stub".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("stub always valid")
+    }
+
+    fn extract_filter_cols(value: &serde_json::Value) -> Vec<String> {
+        if value.is_null() || value.as_object().map_or(false, |m| m.is_empty()) {
+            return Vec::new();
+        }
+        match serde_json::from_value::<FilterExpr>(value.clone()) {
+            Ok(expr) => collect_col_names(&expr),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Extract all column references from the filters JSON.
+    pub fn filter_columns(&self) -> Vec<String> {
+        Self::extract_filter_cols(&self.filters)
+    }
+
+    /// Extract all column references from the havings JSON.
+    pub fn having_columns(&self) -> Vec<String> {
+        Self::extract_filter_cols(&self.havings)
+    }
+
+    /// Validate the QueryContext against the data model's metadata.
+    ///
+    /// Checks:
+    /// - All measures are known
+    /// - All group columns exist in the model
+    /// - All filter columns exist in the model
+    /// - All having columns are valid (group cols or measure output cols)
+    /// - All sort columns are valid and directions are "asc"/"desc"
+    pub fn validate(
+        &self,
+        known_measures: &[MeasureMetadata],
+        all_columns: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        let measure_map: std::collections::HashMap<&str, &MeasureMetadata> = known_measures
+            .iter()
+            .map(|m| (m.name.as_str(), m))
+            .collect();
+
+        // Check measures exist
+        for m in &self.measures {
+            if !measure_map.contains_key(m.as_str()) {
+                return Err(format!("Unknown measure: '{}'", m));
+            }
+        }
+
+        // Check group columns exist
+        for g in &self.groups {
+            if !all_columns.contains(g) {
+                return Err(format!("Unknown group column: '{}'", g));
+            }
+        }
+
+        // Check filter columns exist
+        let filter_cols = self.filter_columns();
+        for fc in &filter_cols {
+            if !all_columns.contains(fc) {
+                return Err(format!("Unknown filter column: '{}'", fc));
+            }
+        }
+
+        // Build valid having columns: groups + measure output columns
+        let mut valid_having_cols: std::collections::HashSet<String> =
+            self.groups.iter().cloned().collect();
+        for m in &self.measures {
+            if let Some(meta) = measure_map.get(m.as_str()) {
+                for col in &meta.output_columns {
+                    valid_having_cols.insert(col.clone());
+                }
+            }
+        }
+
+        // Check having columns
+        let having_cols = self.having_columns();
+        for hc in &having_cols {
+            if !valid_having_cols.contains(hc) {
+                return Err(format!("Invalid having column: '{}'", hc));
+            }
+        }
+
+        // Check sort columns and directions
+        let valid_sort_cols = &valid_having_cols;
+        for (col, direction) in &self.sorts {
+            if !valid_sort_cols.contains(col) {
+                return Err(format!("Invalid sort column: '{}'", col));
+            }
+            if direction != "asc" && direction != "desc" {
+                return Err(format!("Invalid sort direction: '{}'", direction));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_basic_creation() {
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(qc.measures, vec!["revenue"]);
+        assert_eq!(qc.limit, 10000);
+        assert_eq!(qc.offset, 0);
+        assert!(qc.use_pre_agg);
+    }
+
+    #[test]
+    fn test_empty_measures_rejected() {
+        let result = QueryContext::new(vec![], None, None, None, None, None, None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zero_limit_rejected() {
+        let result = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    fn make_measure_meta(name: &str, output_cols: &[&str]) -> MeasureMetadata {
+        MeasureMetadata {
+            name: name.into(),
+            output_columns: output_cols.iter().map(|s| s.to_string()).collect(),
+            aggregate_columns: Vec::new(),
+            allow_exclude_calls: Vec::new(),
+        }
+    }
+
+    fn make_all_columns() -> std::collections::HashSet<String> {
+        ["orders.region", "orders.amount", "orders.date"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_validate_ok() {
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let measures = vec![make_measure_meta("revenue", &["revenue"])];
+        assert!(qc.validate(&measures, &make_all_columns()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_unknown_measure() {
+        let qc = QueryContext::new(
+            vec!["unknown".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let measures = vec![make_measure_meta("revenue", &["revenue"])];
+        let err = qc.validate(&measures, &make_all_columns()).unwrap_err();
+        assert!(err.contains("Unknown measure"));
+    }
+
+    #[test]
+    fn test_validate_unknown_group_column() {
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.nonexistent".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let measures = vec![make_measure_meta("revenue", &["revenue"])];
+        let err = qc.validate(&measures, &make_all_columns()).unwrap_err();
+        assert!(err.contains("Unknown group column"));
+    }
+
+    #[test]
+    fn test_validate_unknown_filter_column() {
+        let filters = json!({"and": [{"left": {"col": "orders.nonexistent"}, "op": "=", "right": {"lit": "US"}}]});
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            Some(filters),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let measures = vec![make_measure_meta("revenue", &["revenue"])];
+        let err = qc.validate(&measures, &make_all_columns()).unwrap_err();
+        assert!(err.contains("Unknown filter column"));
+    }
+
+    #[test]
+    fn test_validate_invalid_having_column() {
+        let havings =
+            json!({"and": [{"left": {"col": "nonexistent"}, "op": ">", "right": {"lit": 500}}]});
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            Some(havings),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let measures = vec![make_measure_meta("revenue", &["revenue"])];
+        let err = qc.validate(&measures, &make_all_columns()).unwrap_err();
+        assert!(err.contains("Invalid having column"));
+    }
+
+    #[test]
+    fn test_validate_valid_having_on_measure_output() {
+        let havings =
+            json!({"and": [{"left": {"col": "revenue"}, "op": ">", "right": {"lit": 500}}]});
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            Some(havings),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let measures = vec![make_measure_meta("revenue", &["revenue"])];
+        assert!(qc.validate(&measures, &make_all_columns()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_invalid_sort_direction() {
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            Some(vec![("revenue".into(), "up".into())]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let measures = vec![make_measure_meta("revenue", &["revenue"])];
+        let err = qc.validate(&measures, &make_all_columns()).unwrap_err();
+        assert!(err.contains("Invalid sort direction"));
+    }
+
+    #[test]
+    fn test_validate_invalid_sort_column() {
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            Some(vec![("nonexistent".into(), "asc".into())]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let measures = vec![make_measure_meta("revenue", &["revenue"])];
+        let err = qc.validate(&measures, &make_all_columns()).unwrap_err();
+        assert!(err.contains("Invalid sort column"));
+    }
+
+    #[test]
+    fn test_filter_column_extraction() {
+        let filters = json!({
+            "and": [
+                {"left": {"col": "orders.region"}, "op": "=",  "right": {"lit": "US"}},
+                {"left": {"col": "orders.date"},   "op": ">",  "right": {"lit": "2024-01-01"}}
+            ]
+        });
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            Some(filters),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let cols = qc.filter_columns();
+        assert!(cols.contains(&"orders.region".to_string()));
+        assert!(cols.contains(&"orders.date".to_string()));
+    }
+
+    #[test]
+    fn test_filter_column_extraction_with_column_ref() {
+        let filters = json!({
+            "and": [
+                {"left": {"col": "orders.amount"}, "op": "<=", "right": {"col": "orders.limit"}}
+            ]
+        });
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            Some(filters),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let cols = qc.filter_columns();
+        assert!(cols.contains(&"orders.amount".to_string()));
+        assert!(cols.contains(&"orders.limit".to_string()));
+    }
+}
