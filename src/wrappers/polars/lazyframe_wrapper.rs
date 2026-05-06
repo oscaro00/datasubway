@@ -57,4 +57,11 @@ impl LazyFrameWrapper {
     pub fn collect(self) -> Result<DataFrame, PolarsError> {
         self.lazyframe.collect()
     }
+
+    #[cfg(feature = "async")]
+    pub async fn collect_async(self) -> Result<DataFrame, PolarsError> {
+        tokio::task::spawn_blocking(move || self.lazyframe.collect())
+            .await
+            .expect("collect task panicked")
+    }
 }
