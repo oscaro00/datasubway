@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use polars::prelude::{LazyFrame, Schema};
+use polars::prelude::{LazyFrame, PlRefPath, PlSmallStr, Schema};
 
 use crate::{
     model_components::{
         measures::{
             extract_measure_metadata, validate_measure_structure, Measure, MeasureMetadata,
         },
-        pre_aggregations::PreAggregation,
+        pre_aggregations::{agg_expansion, find_best_pre_agg, PreAggregation},
         query_context::QueryContext,
     },
     wrappers::polars::{
@@ -107,7 +107,42 @@ impl DataModel {
         self.measure_metadata.get(name)
     }
 
-    pub(crate) fn get_table(&self, table_name: &str) -> LazyFrameWrapper {
+    pub(crate) fn get_table(
+        &self,
+        table_name: &str,
+        non_agg_cols: &HashSet<PlSmallStr>,
+        agg_cols: &HashMap<PlSmallStr, Vec<String>>,
+    ) -> LazyFrameWrapper {
+        if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, &self.pre_agg_path) {
+            let non_agg_vec: Vec<String> = non_agg_cols.iter().map(|s| s.to_string()).collect();
+
+            let agg_map: HashMap<String, HashSet<String>> = agg_cols
+                .iter()
+                .map(|(col, agg_names)| {
+                    let components: HashSet<String> = agg_names
+                        .iter()
+                        .filter_map(|name| agg_expansion(&name.to_lowercase()).ok())
+                        .flatten()
+                        .map(|s| s.to_string())
+                        .collect();
+                    (col.to_string(), components)
+                })
+                .collect();
+
+            if let Some(best) = find_best_pre_agg(pre_aggs, &non_agg_vec, &agg_map) {
+                let pre_agg_file = format!("{}/{}.parquet", path, best.name);
+                if let Ok(lf) = LazyFrame::scan_parquet(
+                    PlRefPath::from(pre_agg_file.as_str()),
+                    Default::default(),
+                ) {
+                    return LazyFrameWrapper {
+                        lazyframe: lf,
+                        from_pre_agg: true,
+                    };
+                }
+            }
+        }
+
         LazyFrameWrapper {
             lazyframe: self
                 .tables

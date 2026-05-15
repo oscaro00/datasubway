@@ -124,7 +124,11 @@ impl<'a> LazyFrameRecorder<'a> {
             GroupBy(LazyGroupByWrapper),
         }
 
-        let mut state = State::Frame(self.data_model.get_table(&self.table_name));
+        let mut state = State::Frame(self.data_model.get_table(
+            &self.table_name,
+            &self.non_agg_cols,
+            &self.agg_cols,
+        ));
 
         for op in self.lazy_ops {
             state = match (state, op) {
@@ -148,11 +152,9 @@ impl<'a> LazyFrameRecorder<'a> {
             };
         }
 
-        let mut result = match state {
+        match state {
             State::Frame(lfw) => lfw,
             State::GroupBy(_) => panic!("incomplete group-by chain: missing agg/head/tail"),
-        };
-        result.from_pre_agg = self.use_pre_agg;
-        result
+        }
     }
 }
