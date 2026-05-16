@@ -25,6 +25,20 @@ use crate::{
 
 use super::model_components::joins::JoinGraph;
 
+pub enum QueryOutput {
+    Data(DataFrame),
+    Explanation(String),
+}
+
+impl std::fmt::Debug for QueryOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryOutput::Data(df) => write!(f, "QueryOutput::Data({:?})", df.head(Some(5))),
+            QueryOutput::Explanation(s) => write!(f, "QueryOutput::Explanation({:?})", s),
+        }
+    }
+}
+
 pub struct DataModel {
     tables: HashMap<String, LazyFrame>,
     joins: JoinGraph,
@@ -167,7 +181,7 @@ impl DataModel {
         }
     }
 
-    pub fn query(&self, qc: &QueryContext) -> Result<DataFrame, String> {
+    pub fn query(&self, qc: &QueryContext, explain: bool) -> Result<QueryOutput, String> {
         let known_measures: Vec<MeasureMetadata> =
             self.measure_metadata.values().cloned().collect();
         let all_columns: HashSet<String> = self
@@ -235,9 +249,17 @@ impl DataModel {
 
         combined = combined.slice(qc.offset as i64, qc.limit as u32);
 
-        combined
-            .collect()
-            .map_err(|e| format!("query execution failed: {e}"))
+        if explain {
+            combined
+                .explain(true)
+                .map(QueryOutput::Explanation)
+                .map_err(|e| format!("explain failed: {e}"))
+        } else {
+            combined
+                .collect()
+                .map(QueryOutput::Data)
+                .map_err(|e| format!("query execution failed: {e}"))
+        }
     }
 
     /// Compute and write parquet files for the named pre-aggregations.
@@ -664,7 +686,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = dm.query(&qc).unwrap();
+        let df = match dm.query(&qc, false).unwrap() {
+            QueryOutput::Data(df) => df,
+            _ => panic!("expected Data"),
+        };
         assert_eq!(df.height(), 2);
         let total: f64 = df
             .column("orders.amount")
@@ -691,7 +716,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = dm.query(&qc).unwrap();
+        let df = match dm.query(&qc, false).unwrap() {
+            QueryOutput::Data(df) => df,
+            _ => panic!("expected Data"),
+        };
         assert_eq!(df.height(), 2);
         assert!(df.column("orders.amount").is_ok());
         assert!(df.column("orders.count").is_ok());
@@ -740,7 +768,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let err = dm.query(&qc).unwrap_err();
+        let err = dm.query(&qc, false).unwrap_err();
         assert!(
             err.contains("incompatible"),
             "expected incompatible error, got: {err}"
@@ -767,7 +795,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = dm.query(&qc).unwrap();
+        let df = match dm.query(&qc, false).unwrap() {
+            QueryOutput::Data(df) => df,
+            _ => panic!("expected Data"),
+        };
         let amounts: Vec<f64> = df
             .column("orders.amount")
             .unwrap()
@@ -793,7 +824,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = dm.query(&qc).unwrap();
+        let df = match dm.query(&qc, false).unwrap() {
+            QueryOutput::Data(df) => df,
+            _ => panic!("expected Data"),
+        };
         let amounts: Vec<f64> = df
             .column("orders.amount")
             .unwrap()
@@ -819,7 +853,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = dm.query(&qc).unwrap();
+        let df = match dm.query(&qc, false).unwrap() {
+            QueryOutput::Data(df) => df,
+            _ => panic!("expected Data"),
+        };
         assert_eq!(df.height(), 1);
     }
 }
