@@ -1,13 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
-use polars::prelude::{LazyFrame, PlRefPath, PlSmallStr, Schema};
+use polars::prelude::{
+    col, lit, Expr, JoinArgs, JoinType, LazyFrame, PlRefPath, PlSmallStr, Schema,
+};
 
 use crate::{
     model_components::{
+        joins::JoinHow,
         measures::{
             extract_measure_metadata, validate_measure_structure, Measure, MeasureMetadata,
         },
-        pre_aggregations::{agg_expansion, find_best_pre_agg, PreAggregation},
+        pre_aggregations::{agg_expansion, component_col_name, find_best_pre_agg, PreAggregation},
         query_context::QueryContext,
     },
     wrappers::polars::{
@@ -43,6 +46,13 @@ impl DataModel {
                 (name.clone(), (*schema).clone())
             })
             .collect();
+
+        let mut seen = HashSet::new();
+        for pa in &pre_aggs {
+            if !seen.insert(pa.name.as_str()) {
+                panic!("duplicate pre-aggregation name '{}'", pa.name);
+            }
+        }
 
         DataModel {
             tables,
@@ -105,6 +115,151 @@ impl DataModel {
     /// Returns the metadata for a registered measure, if it exists.
     pub fn measure_metadata(&self, name: &str) -> Option<&MeasureMetadata> {
         self.measure_metadata.get(name)
+    }
+
+    /// Compute and write parquet files for the named pre-aggregations.
+    ///
+    /// Looks up each name in the pre-aggregations registered at construction,
+    /// then writes `{pre_agg_path}/{name}.parquet` for each.
+    pub fn write_pre_aggs(&self, names: &[&str]) -> Result<(), String> {
+        let pre_aggs = self
+            .pre_aggs
+            .as_ref()
+            .ok_or("no pre-aggregations registered on this DataModel")?;
+        for &name in names {
+            let pa = pre_aggs
+                .iter()
+                .find(|pa| pa.name == name)
+                .ok_or_else(|| format!("pre-aggregation '{name}' not found"))?;
+            self.write_pre_agg(pa)?;
+        }
+        Ok(())
+    }
+
+    fn write_pre_agg(&self, pa: &PreAggregation) -> Result<(), String> {
+        let path = self
+            .pre_agg_path
+            .ok_or("pre_agg_path not set on DataModel")?;
+
+        // --- 1. Identify referenced tables ---
+        let all_col_names = pa.group_by.iter().chain(pa.aggregations.keys());
+        let mut referenced_tables: Vec<String> = all_col_names
+            .filter_map(|c| c.split_once('.').map(|(t, _)| t.to_string()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        referenced_tables.sort(); // deterministic order
+
+        if referenced_tables.is_empty() {
+            return Err("all columns must be table-qualified (e.g. orders.amount)".into());
+        }
+
+        // --- 2. Find a base table that can reach all others ---
+        let base_table = referenced_tables
+            .iter()
+            .find(|candidate| {
+                referenced_tables
+                    .iter()
+                    .all(|t| t == *candidate || self.joins.find_path(candidate, t).is_some())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "no single base table can reach all tables {:?} via join graph",
+                    referenced_tables
+                )
+            })?
+            .clone();
+
+        // --- 3. Build joined LazyFrame ---
+        let mut lf = self
+            .tables
+            .get(&base_table)
+            .ok_or_else(|| format!("table '{base_table}' not found in DataModel"))?
+            .clone();
+
+        for other in &referenced_tables {
+            if other == &base_table {
+                continue;
+            }
+            let join_path = self.joins.find_path(&base_table, other).unwrap();
+            for join in join_path {
+                let right_lf = self
+                    .tables
+                    .get(&join.right)
+                    .ok_or_else(|| format!("table '{}' not found in DataModel", join.right))?
+                    .clone();
+                let join_type = match join.how {
+                    JoinHow::Left => JoinType::Left,
+                    JoinHow::Inner => JoinType::Inner,
+                };
+                let left_on: Vec<Expr> = join.left_on.iter().map(|c| col(c.as_str())).collect();
+                let right_on: Vec<Expr> = join.right_on.iter().map(|c| col(c.as_str())).collect();
+                lf = lf.join(right_lf, left_on, right_on, JoinArgs::new(join_type));
+            }
+        }
+
+        // --- 4. Build group_by expressions (unqualified column name) ---
+        let group_by_exprs: Vec<Expr> = pa
+            .group_by
+            .iter()
+            .map(|qcol| {
+                let col_name = qcol
+                    .split_once('.')
+                    .map(|(_, c)| c)
+                    .unwrap_or(qcol.as_str());
+                col(col_name)
+            })
+            .collect();
+
+        // --- 5. Build agg expressions, one per component ---
+        let mut agg_exprs: Vec<Expr> = Vec::new();
+        for (qcol, components) in &pa.aggregations {
+            let col_name = qcol
+                .split_once('.')
+                .map(|(_, c)| c)
+                .unwrap_or(qcol.as_str());
+            for component in components {
+                let alias = component_col_name(qcol, component);
+                let expr = match component.as_str() {
+                    "sum" => col(col_name).sum().alias(&alias),
+                    "count" => col(col_name).count().alias(&alias),
+                    "min" => col(col_name).min().alias(&alias),
+                    "max" => col(col_name).max().alias(&alias),
+                    "sumsq" => col(col_name).pow(lit(2.0f64)).sum().alias(&alias),
+                    other => {
+                        return Err(format!("unknown pre-agg component '{other}'"));
+                    }
+                };
+                agg_exprs.push(expr);
+            }
+        }
+
+        // --- 6. Execute group_by + agg ---
+        let mut df = lf
+            .group_by(group_by_exprs)
+            .agg(agg_exprs)
+            .collect()
+            .map_err(|e| format!("failed to collect pre-agg: {e}"))?;
+
+        // --- 7. Rename group-by columns to their qualified form ---
+        for qcol in &pa.group_by {
+            if let Some((_, col_name)) = qcol.split_once('.') {
+                if col_name != qcol.as_str() {
+                    df.rename(col_name, qcol.as_str().into())
+                        .map_err(|e| format!("failed to rename '{col_name}' → '{qcol}': {e}"))?;
+                }
+            }
+        }
+
+        // --- 8. Write parquet ---
+        let file_path = format!("{path}/{}.parquet", pa.name);
+        let file = std::fs::File::create(&file_path)
+            .map_err(|e| format!("failed to create '{file_path}': {e}"))?;
+        polars::prelude::ParquetWriter::new(file)
+            .finish(&mut df)
+            .map_err(|e| format!("failed to write parquet: {e}"))?;
+
+        Ok(())
     }
 
     pub(crate) fn get_table(

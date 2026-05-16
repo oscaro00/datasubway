@@ -15,6 +15,12 @@ pub fn agg_expansion(agg_name: &str) -> Result<Vec<&'static str>, String> {
     }
 }
 
+/// Returns the column name for a pre-agg component stored in parquet.
+/// e.g. ("orders.amount", "sum") → "orders.amount-sum"
+pub fn component_col_name(col: &str, component: &str) -> String {
+    format!("{col}-{component}")
+}
+
 /// Maps a DataFusion aggregate function name to the pre-agg components it requires.
 pub fn agg_needed_components(agg_fn_name: &str) -> Option<Vec<&'static str>> {
     match agg_fn_name {
