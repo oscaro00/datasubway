@@ -1,10 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use polars::prelude::{
-    col, lit, Expr, JoinArgs, JoinType, LazyFrame, PlRefPath, PlSmallStr, Schema,
+    col, lit, DataFrame, Expr, JoinArgs, JoinType, LazyFrame, PlRefPath, PlSmallStr, Schema,
+    SortMultipleOptions,
 };
 
 use crate::{
+    column_expressions::{
+        column_context::{allow, exclude, AllowExcludeKind, ColumnReturn},
+        filter_expr::json_to_expr,
+    },
     model_components::{
         joins::JoinHow,
         measures::{
@@ -120,6 +125,119 @@ impl DataModel {
     /// Returns true if `target` is reachable from `base` via the join graph.
     pub fn can_join(&self, base: &str, target: &str) -> bool {
         self.joins.find_path(base, target).is_some()
+    }
+
+    fn eval_last_allow_exclude(
+        &self,
+        recorder: &LazyFrameRecorder<'_>,
+    ) -> Result<Vec<String>, String> {
+        match recorder.allow_exclude_records.last() {
+            None => {
+                let mut cols: Vec<String> = recorder
+                    .non_agg_cols
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                cols.sort();
+                Ok(cols)
+            }
+            Some(record) => {
+                let schema = self.table_schema(&recorder.table_name);
+                let result = match record.kind {
+                    AllowExcludeKind::Allow => allow(
+                        record.pattern.clone(),
+                        record.context.clone(),
+                        record.include.clone(),
+                        schema,
+                    ),
+                    AllowExcludeKind::Exclude => exclude(
+                        record.pattern.clone(),
+                        record.context.clone(),
+                        record.include.clone(),
+                        schema,
+                    ),
+                };
+                match result.inner {
+                    ColumnReturn::Strings(cols) => Ok(cols),
+                    ColumnReturn::PolarsExpr(_) => Err(
+                        "JSON-context allow/exclude cannot produce group-by column names".into(),
+                    ),
+                }
+            }
+        }
+    }
+
+    pub fn query(&self, qc: &QueryContext) -> Result<DataFrame, String> {
+        let known_measures: Vec<MeasureMetadata> =
+            self.measure_metadata.values().cloned().collect();
+        let all_columns: HashSet<String> = self
+            .table_schemas
+            .values()
+            .flat_map(|s| s.iter_names().map(|n| n.to_string()))
+            .collect();
+        qc.validate(&known_measures, &all_columns)?;
+
+        let mut recorders = Vec::new();
+        let mut expected_cols: Option<Vec<String>> = None;
+
+        for m_name in &qc.measures {
+            let measure = self.measures.get(m_name).unwrap();
+            let recorder = measure.call(self, qc);
+            let cols = self.eval_last_allow_exclude(&recorder)?;
+
+            if let Some(ref prev) = expected_cols {
+                if &cols != prev {
+                    return Err(format!(
+                        "incompatible group-by columns across measures: {:?} vs {:?}",
+                        prev, cols
+                    ));
+                }
+            } else {
+                expected_cols = Some(cols);
+            }
+            recorders.push(recorder);
+        }
+
+        let join_cols: Vec<String> = expected_cols.unwrap_or_default();
+
+        let mut frames: Vec<LazyFrame> =
+            recorders.into_iter().map(|r| r.build().lazyframe).collect();
+
+        let mut combined = frames.remove(0);
+        for frame in frames {
+            let (left_on, right_on): (Vec<Expr>, Vec<Expr>) = if join_cols.is_empty() {
+                (vec![], vec![])
+            } else {
+                let exprs: Vec<Expr> = join_cols.iter().map(|c| col(c.as_str())).collect();
+                (exprs.clone(), exprs)
+            };
+            let join_type = if join_cols.is_empty() {
+                JoinType::Cross
+            } else {
+                JoinType::Full
+            };
+            combined = combined.join(frame, left_on, right_on, JoinArgs::new(join_type));
+        }
+
+        if let Some(having_expr) = json_to_expr(&qc.havings) {
+            combined = combined.filter(having_expr);
+        }
+
+        if !qc.sorts.is_empty() {
+            let (sort_cols, descs): (Vec<PlSmallStr>, Vec<bool>) = qc
+                .sorts
+                .iter()
+                .map(|(c, d)| (PlSmallStr::from(c.as_str()), d == "desc"))
+                .unzip();
+            let opts = SortMultipleOptions::default().with_order_descending_multi(descs);
+            combined = combined.sort(sort_cols, opts);
+        }
+
+        combined = combined.slice(qc.offset as i64, qc.limit as u32);
+
+        combined
+            .collect()
+            .map_err(|e| format!("query execution failed: {e}"))
     }
 
     /// Compute and write parquet files for the named pre-aggregations.
@@ -485,5 +603,223 @@ mod tests {
     fn test_write_pre_agg_no_path_errors() {
         let dm = make_orders_dm(None, vec![daily_revenue_pre_agg()]);
         assert!(dm.write_pre_aggs(&["daily_revenue"]).is_err());
+    }
+
+    // ── query() tests ─────────────────────────────────────────────────────────
+
+    use crate::model_components::measures::Measure;
+    use crate::model_components::query_context::QueryContext;
+    use crate::wrappers::polars::lazyframe_recorder::LazyFrameRecorder;
+
+    // Groups by whatever qc.groups says; aggregates orders.amount (no alias so
+    // output_columns == ["orders.amount"] which validates correctly).
+    fn revenue_measure<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+        let group_cols: Vec<Expr> = qc.groups.iter().map(|c| col(c.as_str())).collect();
+        dm.table("orders")
+            .group_by(group_cols)
+            .agg(vec![col("orders.amount").sum()])
+    }
+
+    // Same group-by logic; aggregates orders.count.
+    fn order_count_measure<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+        let group_cols: Vec<Expr> = qc.groups.iter().map(|c| col(c.as_str())).collect();
+        dm.table("orders")
+            .group_by(group_cols)
+            .agg(vec![col("orders.count").sum()])
+    }
+
+    fn make_query_dm() -> DataModel {
+        let orders = df![
+            "orders.date"   => ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
+            "orders.region" => ["north", "south", "north", "south"],
+            "orders.amount" => [100.0f64, 200.0, 150.0, 250.0],
+            "orders.count"  => [1i64, 2, 3, 4],
+        ]
+        .unwrap()
+        .lazy();
+        let mut dm = DataModel::new(
+            HashMap::from([("orders".to_string(), orders)]),
+            JoinGraph::new(&[]).unwrap(),
+            vec![],
+            None,
+        );
+        dm.add_measure(Measure::new("revenue", revenue_measure))
+            .unwrap();
+        dm.add_measure(Measure::new("order_count", order_count_measure))
+            .unwrap();
+        dm
+    }
+
+    #[test]
+    fn test_query_single_measure() {
+        let dm = make_query_dm();
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let df = dm.query(&qc).unwrap();
+        assert_eq!(df.height(), 2);
+        let total: f64 = df
+            .column("orders.amount")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .sum();
+        assert!((total - 700.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_query_two_compatible_measures() {
+        let dm = make_query_dm();
+        let qc = QueryContext::new(
+            vec!["revenue".into(), "order_count".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let df = dm.query(&qc).unwrap();
+        assert_eq!(df.height(), 2);
+        assert!(df.column("orders.amount").is_ok());
+        assert!(df.column("orders.count").is_ok());
+    }
+
+    #[test]
+    fn test_query_incompatible_measures_errors() {
+        let orders = df![
+            "orders.date"   => ["2024-01-01"],
+            "orders.region" => ["north"],
+            "orders.amount" => [100.0f64],
+        ]
+        .unwrap()
+        .lazy();
+        let mut dm = DataModel::new(
+            HashMap::from([("orders".to_string(), orders)]),
+            JoinGraph::new(&[]).unwrap(),
+            vec![],
+            None,
+        );
+
+        fn by_region<'a>(dm: &'a DataModel, _qc: &QueryContext) -> LazyFrameRecorder<'a> {
+            dm.table("orders")
+                .group_by(vec![col("orders.region")])
+                .agg(vec![col("orders.amount").sum()])
+        }
+
+        fn by_date<'a>(dm: &'a DataModel, _qc: &QueryContext) -> LazyFrameRecorder<'a> {
+            dm.table("orders")
+                .group_by(vec![col("orders.date")])
+                .agg(vec![col("orders.amount").sum()])
+        }
+
+        dm.add_measure(Measure::new("revenue", by_region)).unwrap();
+        dm.add_measure(Measure::new("alt_revenue", by_date))
+            .unwrap();
+
+        let qc = QueryContext::new(
+            vec!["revenue".into(), "alt_revenue".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let err = dm.query(&qc).unwrap_err();
+        assert!(
+            err.contains("incompatible"),
+            "expected incompatible error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_query_with_having() {
+        let dm = make_query_dm();
+        // north: 100+150=250, south: 200+250=450 — only south passes > 300
+        let havings = serde_json::json!({
+            "left": {"col": "orders.amount"},
+            "op": ">",
+            "right": {"lit": 300.0}
+        });
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            Some(havings),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let df = dm.query(&qc).unwrap();
+        let amounts: Vec<f64> = df
+            .column("orders.amount")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(amounts.iter().all(|&v| v > 300.0));
+    }
+
+    #[test]
+    fn test_query_with_sort() {
+        let dm = make_query_dm();
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            Some(vec![("orders.amount".into(), "desc".into())]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let df = dm.query(&qc).unwrap();
+        let amounts: Vec<f64> = df
+            .column("orders.amount")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(amounts.windows(2).all(|w| w[0] >= w[1]));
+    }
+
+    #[test]
+    fn test_query_limit_offset() {
+        let dm = make_query_dm();
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            None,
+            Some(1),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let df = dm.query(&qc).unwrap();
+        assert_eq!(df.height(), 1);
     }
 }

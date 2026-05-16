@@ -218,6 +218,17 @@ pub fn filter_to_expr(filter: &Value, patterns: &[&str], schema: &Schema) -> Opt
     Some(to_expr(pruned))
 }
 
+/// Convert a JSON filter value directly to a polars Expr without schema-based pruning.
+/// Use this for post-aggregation filters (havings) where columns may not exist in any
+/// table schema (e.g. measure output column aliases).
+pub fn json_to_expr(filter: &Value) -> Option<Expr> {
+    if filter.is_null() || filter.as_object().map_or(false, |m| m.is_empty()) {
+        return None;
+    }
+    let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
+    Some(to_expr(parsed))
+}
+
 /// Recursively collect all column names referenced in a FilterExpr.
 pub fn collect_col_names(expr: &FilterExpr) -> Vec<String> {
     match expr {
