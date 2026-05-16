@@ -26,7 +26,7 @@ pub struct DataModel {
     pub(crate) measures: HashMap<String, Measure>,
     pub measure_metadata: HashMap<String, MeasureMetadata>,
     pre_aggs: Option<Vec<PreAggregation>>,
-    pre_agg_path: Option<&'static str>,
+    pre_agg_path: Option<String>,
     table_schemas: HashMap<String, Schema>,
 }
 
@@ -35,7 +35,7 @@ impl DataModel {
         mut tables: HashMap<String, LazyFrame>,
         joins: JoinGraph,
         pre_aggs: Vec<PreAggregation>,
-        pre_agg_path: Option<&'static str>,
+        pre_agg_path: Option<String>,
     ) -> DataModel {
         let table_schemas = tables
             .iter_mut()
@@ -139,6 +139,7 @@ impl DataModel {
     fn write_pre_agg(&self, pa: &PreAggregation) -> Result<(), String> {
         let path = self
             .pre_agg_path
+            .as_deref()
             .ok_or("pre_agg_path not set on DataModel")?;
 
         // --- 1. Identify referenced tables ---
@@ -268,7 +269,7 @@ impl DataModel {
         non_agg_cols: &HashSet<PlSmallStr>,
         agg_cols: &HashMap<PlSmallStr, Vec<String>>,
     ) -> LazyFrameWrapper {
-        if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, &self.pre_agg_path) {
+        if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, self.pre_agg_path.as_deref()) {
             let non_agg_vec: Vec<String> = non_agg_cols.iter().map(|s| s.to_string()).collect();
 
             let agg_map: HashMap<String, HashSet<String>> = agg_cols
@@ -306,5 +307,179 @@ impl DataModel {
                 .clone(),
             from_pre_agg: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polars::prelude::*;
+    use tempfile::TempDir;
+
+    fn make_orders_dm(pre_agg_path: Option<String>, pre_aggs: Vec<PreAggregation>) -> DataModel {
+        let orders = df![
+            "date"   => ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
+            "region" => ["north", "south", "north", "south"],
+            "amount" => [100.0f64, 200.0, 150.0, 250.0],
+        ]
+        .unwrap()
+        .lazy();
+        DataModel::new(
+            HashMap::from([("orders".to_string(), orders)]),
+            JoinGraph::new(&[]).unwrap(),
+            pre_aggs,
+            pre_agg_path,
+        )
+    }
+
+    fn daily_revenue_pre_agg() -> PreAggregation {
+        PreAggregation::new(
+            "daily_revenue".into(),
+            vec!["orders.date".into(), "orders.region".into()],
+            HashMap::from([(
+                "orders.amount".into(),
+                vec!["sum".into(), "mean".into()],
+            )]),
+        )
+        .unwrap()
+    }
+
+    fn write_and_get_tmp(pa: PreAggregation) -> (DataModel, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let dm = make_orders_dm(Some(path), vec![pa]);
+        dm.write_pre_aggs(&["daily_revenue"]).unwrap();
+        (dm, tmp)
+    }
+
+    #[test]
+    fn test_write_pre_agg_creates_file() {
+        let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        assert!(tmp.path().join("daily_revenue.parquet").exists());
+    }
+
+    #[test]
+    fn test_write_pre_agg_correct_schema() {
+        let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        let path = tmp.path().join("daily_revenue.parquet");
+        let mut lf = LazyFrame::scan_parquet(
+            PlRefPath::from(path.to_str().unwrap()),
+            Default::default(),
+        )
+        .unwrap();
+        let schema = lf.collect_schema().unwrap();
+        let cols: Vec<&str> = schema.iter_names().map(|n| n.as_str()).collect();
+        assert!(cols.contains(&"orders.date"), "missing orders.date");
+        assert!(cols.contains(&"orders.region"), "missing orders.region");
+        assert!(cols.contains(&"orders.amount-sum"), "missing orders.amount-sum");
+        assert!(cols.contains(&"orders.amount-count"), "missing orders.amount-count");
+    }
+
+    #[test]
+    fn test_write_pre_agg_correct_data() {
+        let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        let path = tmp.path().join("daily_revenue.parquet");
+        let df = LazyFrame::scan_parquet(
+            PlRefPath::from(path.to_str().unwrap()),
+            Default::default(),
+        )
+        .unwrap()
+        .sort(
+            ["orders.date", "orders.region"],
+            SortMultipleOptions::default(),
+        )
+        .collect()
+        .unwrap();
+
+        // 2 dates × 2 regions = 4 rows
+        assert_eq!(df.height(), 4);
+
+        // north/2024-01-01 has amount=100 → sum=100, count=1
+        let sums = df
+            .column("orders.amount-sum")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(sums.contains(&100.0_f64));
+        assert!(sums.contains(&200.0_f64));
+        assert!(sums.contains(&150.0_f64));
+        assert!(sums.contains(&250.0_f64));
+    }
+
+    #[test]
+    fn test_pre_agg_selected_when_query_covers() {
+        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        let result = dm
+            .table("orders")
+            .group_by(vec![col("orders.date"), col("orders.region")])
+            .agg(vec![col("orders.amount").sum()])
+            .build();
+        assert!(result.from_pre_agg);
+    }
+
+    #[test]
+    fn test_pre_agg_not_selected_when_query_does_not_cover() {
+        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        // "orders.store" is not in the pre-agg group_by
+        let result = dm
+            .table("orders")
+            .group_by(vec![col("orders.store")])
+            .agg(vec![col("orders.amount").sum()])
+            .build();
+        assert!(!result.from_pre_agg);
+    }
+
+    #[test]
+    fn test_pre_agg_end_to_end_sum_matches() {
+        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+
+        let mut result = dm
+            .table("orders")
+            .group_by(vec![col("orders.date"), col("orders.region")])
+            .agg(vec![col("orders.amount").sum().alias("total")])
+            .build()
+            .collect()
+            .unwrap();
+        result = result
+            .sort(["orders.date", "orders.region"], SortMultipleOptions::default())
+            .unwrap();
+
+        let totals: Vec<f64> = result
+            .column("total")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+
+        // Sorted by date+region: north/01, south/01, north/02, south/02
+        assert_eq!(totals, vec![100.0, 200.0, 150.0, 250.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate pre-aggregation name")]
+    fn test_duplicate_pre_agg_name_panics() {
+        make_orders_dm(
+            None,
+            vec![daily_revenue_pre_agg(), daily_revenue_pre_agg()],
+        );
+    }
+
+    #[test]
+    fn test_write_unknown_name_errors() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let dm = make_orders_dm(Some(path), vec![daily_revenue_pre_agg()]);
+        assert!(dm.write_pre_aggs(&["nonexistent"]).is_err());
+    }
+
+    #[test]
+    fn test_write_pre_agg_no_path_errors() {
+        let dm = make_orders_dm(None, vec![daily_revenue_pre_agg()]);
+        assert!(dm.write_pre_aggs(&["daily_revenue"]).is_err());
     }
 }
