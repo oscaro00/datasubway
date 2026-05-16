@@ -117,6 +117,11 @@ impl DataModel {
         self.measure_metadata.get(name)
     }
 
+    /// Returns true if `target` is reachable from `base` via the join graph.
+    pub fn can_join(&self, base: &str, target: &str) -> bool {
+        self.joins.find_path(base, target).is_some()
+    }
+
     /// Compute and write parquet files for the named pre-aggregations.
     ///
     /// Looks up each name in the pre-aggregations registered at construction,
@@ -336,10 +341,7 @@ mod tests {
         PreAggregation::new(
             "daily_revenue".into(),
             vec!["orders.date".into(), "orders.region".into()],
-            HashMap::from([(
-                "orders.amount".into(),
-                vec!["sum".into(), "mean".into()],
-            )]),
+            HashMap::from([("orders.amount".into(), vec!["sum".into(), "mean".into()])]),
         )
         .unwrap()
     }
@@ -362,34 +364,36 @@ mod tests {
     fn test_write_pre_agg_correct_schema() {
         let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
         let path = tmp.path().join("daily_revenue.parquet");
-        let mut lf = LazyFrame::scan_parquet(
-            PlRefPath::from(path.to_str().unwrap()),
-            Default::default(),
-        )
-        .unwrap();
+        let mut lf =
+            LazyFrame::scan_parquet(PlRefPath::from(path.to_str().unwrap()), Default::default())
+                .unwrap();
         let schema = lf.collect_schema().unwrap();
         let cols: Vec<&str> = schema.iter_names().map(|n| n.as_str()).collect();
         assert!(cols.contains(&"orders.date"), "missing orders.date");
         assert!(cols.contains(&"orders.region"), "missing orders.region");
-        assert!(cols.contains(&"orders.amount-sum"), "missing orders.amount-sum");
-        assert!(cols.contains(&"orders.amount-count"), "missing orders.amount-count");
+        assert!(
+            cols.contains(&"orders.amount-sum"),
+            "missing orders.amount-sum"
+        );
+        assert!(
+            cols.contains(&"orders.amount-count"),
+            "missing orders.amount-count"
+        );
     }
 
     #[test]
     fn test_write_pre_agg_correct_data() {
         let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
         let path = tmp.path().join("daily_revenue.parquet");
-        let df = LazyFrame::scan_parquet(
-            PlRefPath::from(path.to_str().unwrap()),
-            Default::default(),
-        )
-        .unwrap()
-        .sort(
-            ["orders.date", "orders.region"],
-            SortMultipleOptions::default(),
-        )
-        .collect()
-        .unwrap();
+        let df =
+            LazyFrame::scan_parquet(PlRefPath::from(path.to_str().unwrap()), Default::default())
+                .unwrap()
+                .sort(
+                    ["orders.date", "orders.region"],
+                    SortMultipleOptions::default(),
+                )
+                .collect()
+                .unwrap();
 
         // 2 dates × 2 regions = 4 rows
         assert_eq!(df.height(), 4);
@@ -444,7 +448,10 @@ mod tests {
             .collect()
             .unwrap();
         result = result
-            .sort(["orders.date", "orders.region"], SortMultipleOptions::default())
+            .sort(
+                ["orders.date", "orders.region"],
+                SortMultipleOptions::default(),
+            )
             .unwrap();
 
         let totals: Vec<f64> = result
@@ -463,10 +470,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "duplicate pre-aggregation name")]
     fn test_duplicate_pre_agg_name_panics() {
-        make_orders_dm(
-            None,
-            vec![daily_revenue_pre_agg(), daily_revenue_pre_agg()],
-        );
+        make_orders_dm(None, vec![daily_revenue_pre_agg(), daily_revenue_pre_agg()]);
     }
 
     #[test]

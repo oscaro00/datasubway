@@ -10,6 +10,54 @@ use crate::column_expressions::column_context::{
     AllowExcludeRecord, IntoFilterExpr, IntoPolarsColsExpr,
 };
 
+fn prune_filter_by_tables(expr: Expr, base_table: &str, data_model: &DataModel) -> Option<Expr> {
+    match expr {
+        Expr::BinaryExpr {
+            left,
+            op: Operator::And,
+            right,
+        } => {
+            let l = prune_filter_by_tables((*left).clone(), base_table, data_model);
+            let r = prune_filter_by_tables((*right).clone(), base_table, data_model);
+            match (l, r) {
+                (Some(l), Some(r)) => Some(l.and(r)),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            }
+        }
+        Expr::BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        } => {
+            let l = prune_filter_by_tables((*left).clone(), base_table, data_model);
+            let r = prune_filter_by_tables((*right).clone(), base_table, data_model);
+            match (l, r) {
+                (Some(l), Some(r)) => Some(l.or(r)),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            }
+        }
+        other => {
+            let all_reachable = other.clone().meta().root_names().iter().all(|col| {
+                match col.as_str().split_once('.') {
+                    Some((table, _)) => {
+                        table == base_table || data_model.can_join(base_table, table)
+                    }
+                    None => true,
+                }
+            });
+            if all_reachable {
+                Some(other)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 pub enum LazyOp {
     Sort(Vec<PlSmallStr>, SortMultipleOptions),
     Filter(Expr),
@@ -49,9 +97,11 @@ impl<'a> LazyFrameRecorder<'a> {
 
     pub fn filter(mut self, predicate: impl IntoFilterExpr) -> LazyFrameRecorder<'a> {
         if let Some(pred) = predicate.into_filter(&mut self.allow_exclude_records) {
-            let cols = pred.clone().meta().root_names();
-            self.non_agg_cols.extend(cols);
-            self.lazy_ops.push(LazyOp::Filter(pred));
+            if let Some(pruned) = prune_filter_by_tables(pred, &self.table_name, self.data_model) {
+                let cols = pruned.clone().meta().root_names();
+                self.non_agg_cols.extend(cols);
+                self.lazy_ops.push(LazyOp::Filter(pruned));
+            }
         }
         self
     }
@@ -156,5 +206,128 @@ impl<'a> LazyFrameRecorder<'a> {
             State::Frame(lfw) => lfw,
             State::GroupBy(_) => panic!("incomplete group-by chain: missing agg/head/tail"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_components::joins::{Join, JoinDirection, JoinGraph, JoinHow};
+    use std::collections::HashMap;
+
+    fn make_dm() -> DataModel {
+        let orders = df![
+            "amount"    => [100.0f64, 200.0],
+            "region"    => ["north", "south"],
+        ]
+        .unwrap()
+        .lazy();
+        let customers = df![
+            "region"    => ["north", "south"],
+            "country"   => ["US", "UK"],
+        ]
+        .unwrap()
+        .lazy();
+        let products = df![
+            "price"     => [10.0f64, 20.0],
+        ]
+        .unwrap()
+        .lazy();
+
+        // orders → customers (joined), products is standalone
+        let joins = vec![Join {
+            left: "orders".into(),
+            right: "customers".into(),
+            left_on: vec!["orders.region".into()],
+            right_on: vec!["customers.region".into()],
+            how: JoinHow::Left,
+            direction: JoinDirection::Both,
+        }];
+
+        DataModel::new(
+            HashMap::from([
+                ("orders".into(), orders),
+                ("customers".into(), customers),
+                ("products".into(), products),
+            ]),
+            JoinGraph::new(&joins).unwrap(),
+            vec![],
+            None,
+        )
+    }
+
+    fn filter_ops(recorder: LazyFrameRecorder<'_>) -> Vec<Expr> {
+        recorder
+            .lazy_ops
+            .into_iter()
+            .filter_map(|op| match op {
+                LazyOp::Filter(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_fully_reachable_filter_is_applied() {
+        let dm = make_dm();
+        // customers is joined to orders — filter should be kept
+        let recorder = dm
+            .table("orders")
+            .filter(col("customers.country").eq(lit("US")));
+        assert_eq!(filter_ops(recorder).len(), 1);
+    }
+
+    #[test]
+    fn test_fully_unreachable_filter_is_dropped() {
+        let dm = make_dm();
+        // products has no join to orders — filter should be silently ignored
+        let recorder = dm
+            .table("orders")
+            .filter(col("products.price").lt(lit(50.0f64)));
+        assert_eq!(filter_ops(recorder).len(), 0);
+    }
+
+    #[test]
+    fn test_compound_and_partial_prune() {
+        let dm = make_dm();
+        // AND: left branch (orders) reachable, right branch (products) not
+        // Expected: only the orders.amount clause survives
+        let recorder = dm.table("orders").filter(
+            col("orders.amount")
+                .gt(lit(0.0f64))
+                .and(col("products.price").lt(lit(50.0f64))),
+        );
+        let ops = filter_ops(recorder);
+        assert_eq!(ops.len(), 1);
+        // The surviving expression should reference orders.amount, not products.price
+        let names = ops[0].clone().meta().root_names();
+        assert!(names.iter().any(|n| n.as_str() == "orders.amount"));
+        assert!(!names.iter().any(|n| n.as_str() == "products.price"));
+    }
+
+    #[test]
+    fn test_compound_and_all_reachable_kept() {
+        let dm = make_dm();
+        let recorder = dm.table("orders").filter(
+            col("orders.amount")
+                .gt(lit(0.0f64))
+                .and(col("customers.country").eq(lit("US"))),
+        );
+        let ops = filter_ops(recorder);
+        assert_eq!(ops.len(), 1);
+        let names = ops[0].clone().meta().root_names();
+        assert!(names.iter().any(|n| n.as_str() == "orders.amount"));
+        assert!(names.iter().any(|n| n.as_str() == "customers.country"));
+    }
+
+    #[test]
+    fn test_compound_and_all_unreachable_dropped() {
+        let dm = make_dm();
+        let recorder = dm.table("orders").filter(
+            col("products.price")
+                .gt(lit(5.0f64))
+                .and(col("products.price").lt(lit(50.0f64))),
+        );
+        assert_eq!(filter_ops(recorder).len(), 0);
     }
 }
