@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [features]
 async = ["dep:tokio", "polars/async"]
+dynamic_group_by = ["polars/dynamic_group_by"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }

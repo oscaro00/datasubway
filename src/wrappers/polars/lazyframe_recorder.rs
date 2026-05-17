@@ -63,8 +63,10 @@ pub enum LazyOp {
     Filter(Expr),
     WithColumn(Expr),
     GroupBy(Vec<Expr>),
-    GroupByDynamic,
-    Rolling,
+    #[cfg(feature = "dynamic_group_by")]
+    GroupByDynamic(Expr, Vec<Expr>, DynamicGroupOptions),
+    #[cfg(feature = "dynamic_group_by")]
+    Rolling(Expr, Vec<Expr>, RollingGroupOptions),
     Having(Expr),
     Agg(Vec<Expr>),
     Head(Option<usize>),
@@ -163,6 +165,48 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
+    #[cfg(feature = "dynamic_group_by")]
+    pub fn group_by_dynamic<E>(
+        mut self,
+        index_column: Expr,
+        group_by: E,
+        options: DynamicGroupOptions,
+    ) -> LazyFrameRecorder<'a>
+    where
+        E: AsRef<[Expr]>,
+    {
+        let group_by_vec = group_by.as_ref().to_vec();
+        self.non_agg_cols
+            .extend(index_column.clone().meta().root_names());
+        for expr in &group_by_vec {
+            self.non_agg_cols.extend(expr.clone().meta().root_names());
+        }
+        self.lazy_ops
+            .push(LazyOp::GroupByDynamic(index_column, group_by_vec, options));
+        self
+    }
+
+    #[cfg(feature = "dynamic_group_by")]
+    pub fn rolling<E>(
+        mut self,
+        index_column: Expr,
+        group_by: E,
+        options: RollingGroupOptions,
+    ) -> LazyFrameRecorder<'a>
+    where
+        E: AsRef<[Expr]>,
+    {
+        let group_by_vec = group_by.as_ref().to_vec();
+        self.non_agg_cols
+            .extend(index_column.clone().meta().root_names());
+        for expr in &group_by_vec {
+            self.non_agg_cols.extend(expr.clone().meta().root_names());
+        }
+        self.lazy_ops
+            .push(LazyOp::Rolling(index_column, group_by_vec, options));
+        self
+    }
+
     pub fn limit(mut self, n: u32) -> LazyFrameRecorder<'a> {
         self.lazy_ops.push(LazyOp::Limit(n));
         self
@@ -191,13 +235,18 @@ impl<'a> LazyFrameRecorder<'a> {
                 }
                 (State::Frame(lfw), LazyOp::GroupBy(by)) => State::GroupBy(lfw.group_by(by)),
                 (State::Frame(lfw), LazyOp::Limit(n)) => State::Frame(lfw.limit(n)),
+                #[cfg(feature = "dynamic_group_by")]
+                (State::Frame(lfw), LazyOp::GroupByDynamic(index_column, group_by, options)) => {
+                    State::GroupBy(lfw.group_by_dynamic(index_column, group_by, options))
+                }
+                #[cfg(feature = "dynamic_group_by")]
+                (State::Frame(lfw), LazyOp::Rolling(index_column, group_by, options)) => {
+                    State::GroupBy(lfw.rolling(index_column, group_by, options))
+                }
                 (State::GroupBy(lgbw), LazyOp::Having(pred)) => State::GroupBy(lgbw.having(pred)),
                 (State::GroupBy(lgbw), LazyOp::Agg(aggs)) => State::Frame(lgbw.agg(aggs)),
                 (State::GroupBy(lgbw), LazyOp::Head(n)) => State::Frame(lgbw.head(n)),
                 (State::GroupBy(lgbw), LazyOp::Tail(n)) => State::Frame(lgbw.tail(n)),
-                (_, LazyOp::GroupByDynamic) | (_, LazyOp::Rolling) => {
-                    panic!("group_by_dynamic and rolling are not yet implemented")
-                }
                 _ => panic!("invalid LazyOp sequence"),
             };
         }

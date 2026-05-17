@@ -47,6 +47,34 @@ impl LazyFrameWrapper {
         }
     }
 
+    #[cfg(feature = "dynamic_group_by")]
+    pub fn group_by_dynamic(
+        self,
+        index_column: Expr,
+        group_by: Vec<Expr>,
+        options: DynamicGroupOptions,
+    ) -> LazyGroupByWrapper {
+        LazyGroupByWrapper {
+            lazygroupby: self
+                .lazyframe
+                .group_by_dynamic(index_column, &group_by, options),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
+    #[cfg(feature = "dynamic_group_by")]
+    pub fn rolling(
+        self,
+        index_column: Expr,
+        group_by: Vec<Expr>,
+        options: RollingGroupOptions,
+    ) -> LazyGroupByWrapper {
+        LazyGroupByWrapper {
+            lazygroupby: self.lazyframe.rolling(index_column, &group_by, options),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
     pub fn limit(self, n: u32) -> LazyFrameWrapper {
         LazyFrameWrapper {
             lazyframe: self.lazyframe.limit(n),

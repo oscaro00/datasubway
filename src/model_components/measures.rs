@@ -40,7 +40,9 @@ pub fn validate_measure_structure(recorder: &LazyFrameRecorder) -> Result<(), St
         return Err("measure must end with agg()".into());
     }
     match &ops[ops.len() - 2] {
-        LazyOp::GroupBy(_) | LazyOp::GroupByDynamic | LazyOp::Rolling => Ok(()),
+        LazyOp::GroupBy(_) => Ok(()),
+        #[cfg(feature = "dynamic_group_by")]
+        LazyOp::GroupByDynamic(_, _, _) | LazyOp::Rolling(_, _, _) => Ok(()),
         _ => Err(
             "second-to-last operation must be group_by(), group_by_dynamic(), or rolling()".into(),
         ),

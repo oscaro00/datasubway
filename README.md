@@ -67,9 +67,6 @@ cargo test test_auto_join
 
 # Show stdout from tests (println! output)
 cargo test -- --nocapture
-
-# Show debug logs with tests
-DATASUBWAY_DEBUG=1 cargo test -- --nocapture
 ```
 
 ## Using as a Local Dependency
@@ -98,7 +95,7 @@ If you want to switch from a local path to a git dependency (e.g. to share acros
 
 ```toml
 [dependencies]
-datasubway = { git = "https://github.com/your-user/datasubway.git", branch = "datafusion_rust" }
+datasubway = { git = "https://github.com/your-user/datasubway.git", branch = "rust_wrapper_approach" }
 ```
 
 With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pull the latest, run `cargo update -p datasubway` in the consuming project.
@@ -109,6 +106,7 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 - Look into using flight to avoid serialization
 - Logging
+- More aggregation algorithms like KLL or t-digest for percentiles
 
 
 
