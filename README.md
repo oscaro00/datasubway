@@ -102,7 +102,7 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
-- Complete Lazyframe wrapper approach in rust
+- Complete Lazyframe wrapper approach in rust (adding more methods from polars)
 
 - Look into using flight to avoid serialization
 - Logging

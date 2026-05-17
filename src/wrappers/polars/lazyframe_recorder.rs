@@ -60,8 +60,14 @@ fn prune_filter_by_tables(expr: Expr, base_table: &str, data_model: &DataModel) 
 
 pub enum LazyOp {
     Sort(Vec<PlSmallStr>, SortMultipleOptions),
+    SortByExprs(Vec<Expr>, SortMultipleOptions),
+    TopK(u32, Vec<Expr>, SortMultipleOptions),
+    BottomK(u32, Vec<Expr>, SortMultipleOptions),
+    Reverse,
+    Remove(Expr),
     Filter(Expr),
     WithColumn(Expr),
+    WithColumns(Vec<Expr>),
     GroupBy(Vec<Expr>),
     #[cfg(feature = "dynamic_group_by")]
     GroupByDynamic(Expr, Vec<Expr>, DynamicGroupOptions),
@@ -72,6 +78,7 @@ pub enum LazyOp {
     Head(Option<usize>),
     Tail(Option<usize>),
     Limit(u32),
+    Slice(i64, u32),
 }
 
 pub struct LazyFrameRecorder<'a> {
@@ -94,6 +101,60 @@ impl<'a> LazyFrameRecorder<'a> {
         let cols = by.into_vec();
         self.non_agg_cols.extend(cols.iter().cloned());
         self.lazy_ops.push(LazyOp::Sort(cols, sort_options));
+        self
+    }
+
+    pub fn sort_by_exprs(
+        mut self,
+        by: Vec<Expr>,
+        sort_options: SortMultipleOptions,
+    ) -> LazyFrameRecorder<'a> {
+        for expr in &by {
+            self.non_agg_cols.extend(expr.clone().meta().root_names());
+        }
+        self.lazy_ops.push(LazyOp::SortByExprs(by, sort_options));
+        self
+    }
+
+    pub fn remove(mut self, predicate: impl IntoFilterExpr) -> LazyFrameRecorder<'a> {
+        if let Some(pred) = predicate.into_filter(&mut self.allow_exclude_records) {
+            if let Some(pruned) = prune_filter_by_tables(pred, &self.table_name, self.data_model) {
+                let cols = pruned.clone().meta().root_names();
+                self.non_agg_cols.extend(cols);
+                self.lazy_ops.push(LazyOp::Remove(pruned));
+            }
+        }
+        self
+    }
+
+    pub fn reverse(mut self) -> LazyFrameRecorder<'a> {
+        self.lazy_ops.push(LazyOp::Reverse);
+        self
+    }
+
+    pub fn top_k(
+        mut self,
+        k: u32,
+        by: Vec<Expr>,
+        sort_options: SortMultipleOptions,
+    ) -> LazyFrameRecorder<'a> {
+        for expr in &by {
+            self.non_agg_cols.extend(expr.clone().meta().root_names());
+        }
+        self.lazy_ops.push(LazyOp::TopK(k, by, sort_options));
+        self
+    }
+
+    pub fn bottom_k(
+        mut self,
+        k: u32,
+        by: Vec<Expr>,
+        sort_options: SortMultipleOptions,
+    ) -> LazyFrameRecorder<'a> {
+        for expr in &by {
+            self.non_agg_cols.extend(expr.clone().meta().root_names());
+        }
+        self.lazy_ops.push(LazyOp::BottomK(k, by, sort_options));
         self
     }
 
@@ -128,6 +189,30 @@ impl<'a> LazyFrameRecorder<'a> {
         }
 
         self.lazy_ops.push(LazyOp::WithColumn(expr));
+        self
+    }
+
+    pub fn with_columns(mut self, exprs: Vec<Expr>) -> LazyFrameRecorder<'a> {
+        for expr in &exprs {
+            let all_root_names = expr.clone().meta().root_names();
+            let agg_pairs = extract_agg_exprs(expr);
+            let agg_col_set: HashSet<&str> =
+                agg_pairs.iter().map(|(col, _)| col.as_str()).collect();
+
+            for name in &all_root_names {
+                if !agg_col_set.contains(name.as_str()) {
+                    self.non_agg_cols.insert(name.clone());
+                }
+            }
+
+            for (col_name, agg_name) in agg_pairs {
+                self.agg_cols
+                    .entry(col_name.as_str().into())
+                    .or_default()
+                    .push(agg_name);
+            }
+        }
+        self.lazy_ops.push(LazyOp::WithColumns(exprs));
         self
     }
 
@@ -207,6 +292,11 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
+    pub fn slice(mut self, offset: i64, len: u32) -> LazyFrameRecorder<'a> {
+        self.lazy_ops.push(LazyOp::Slice(offset, len));
+        self
+    }
+
     pub fn limit(mut self, n: u32) -> LazyFrameRecorder<'a> {
         self.lazy_ops.push(LazyOp::Limit(n));
         self
@@ -229,11 +319,30 @@ impl<'a> LazyFrameRecorder<'a> {
                 (State::Frame(lfw), LazyOp::Sort(by, opts)) => {
                     State::Frame(lfw.sort(Some(by), Some(opts)))
                 }
+                (State::Frame(lfw), LazyOp::SortByExprs(by, opts)) => {
+                    State::Frame(lfw.sort_by_exprs(by, opts))
+                }
+                (State::Frame(lfw), LazyOp::TopK(k, by, opts)) => {
+                    State::Frame(lfw.top_k(k, by, opts))
+                }
+                (State::Frame(lfw), LazyOp::BottomK(k, by, opts)) => {
+                    State::Frame(lfw.bottom_k(k, by, opts))
+                }
+                (State::Frame(lfw), LazyOp::Reverse) => State::Frame(lfw.reverse()),
+                (State::Frame(lfw), LazyOp::Remove(pred)) => {
+                    State::Frame(lfw.remove(Some(pred)))
+                }
                 (State::Frame(lfw), LazyOp::Filter(pred)) => State::Frame(lfw.filter(Some(pred))),
                 (State::Frame(lfw), LazyOp::WithColumn(expr)) => {
                     State::Frame(lfw.with_column(expr))
                 }
+                (State::Frame(lfw), LazyOp::WithColumns(exprs)) => {
+                    State::Frame(lfw.with_columns(exprs))
+                }
                 (State::Frame(lfw), LazyOp::GroupBy(by)) => State::GroupBy(lfw.group_by(by)),
+                (State::Frame(lfw), LazyOp::Slice(offset, len)) => {
+                    State::Frame(lfw.slice(offset, len))
+                }
                 (State::Frame(lfw), LazyOp::Limit(n)) => State::Frame(lfw.limit(n)),
                 #[cfg(feature = "dynamic_group_by")]
                 (State::Frame(lfw), LazyOp::GroupByDynamic(index_column, group_by, options)) => {

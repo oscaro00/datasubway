@@ -19,6 +19,17 @@ impl LazyFrameWrapper {
         }
     }
 
+    pub fn remove(self, predicate: Option<Expr>) -> LazyFrameWrapper {
+        if let Some(pred) = predicate {
+            LazyFrameWrapper {
+                lazyframe: self.lazyframe.remove(pred),
+                from_pre_agg: self.from_pre_agg,
+            }
+        } else {
+            self
+        }
+    }
+
     pub fn sort(
         self,
         by: Option<impl IntoVec<PlSmallStr>>,
@@ -47,6 +58,13 @@ impl LazyFrameWrapper {
         }
     }
 
+    pub fn with_columns(self, exprs: Vec<Expr>) -> LazyFrameWrapper {
+        LazyFrameWrapper {
+            lazyframe: self.lazyframe.with_columns(&exprs),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
     #[cfg(feature = "dynamic_group_by")]
     pub fn group_by_dynamic(
         self,
@@ -71,6 +89,41 @@ impl LazyFrameWrapper {
     ) -> LazyGroupByWrapper {
         LazyGroupByWrapper {
             lazygroupby: self.lazyframe.rolling(index_column, &group_by, options),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
+    pub fn sort_by_exprs(self, by: Vec<Expr>, sort_options: SortMultipleOptions) -> LazyFrameWrapper {
+        LazyFrameWrapper {
+            lazyframe: self.lazyframe.sort_by_exprs(&by, sort_options),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
+    pub fn top_k(self, k: u32, by: Vec<Expr>, sort_options: SortMultipleOptions) -> LazyFrameWrapper {
+        LazyFrameWrapper {
+            lazyframe: self.lazyframe.top_k(k, &by, sort_options),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
+    pub fn bottom_k(self, k: u32, by: Vec<Expr>, sort_options: SortMultipleOptions) -> LazyFrameWrapper {
+        LazyFrameWrapper {
+            lazyframe: self.lazyframe.bottom_k(k, &by, sort_options),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
+    pub fn reverse(self) -> LazyFrameWrapper {
+        LazyFrameWrapper {
+            lazyframe: self.lazyframe.reverse(),
+            from_pre_agg: self.from_pre_agg,
+        }
+    }
+
+    pub fn slice(self, offset: i64, len: u32) -> LazyFrameWrapper {
+        LazyFrameWrapper {
+            lazyframe: self.lazyframe.slice(offset, len),
             from_pre_agg: self.from_pre_agg,
         }
     }
