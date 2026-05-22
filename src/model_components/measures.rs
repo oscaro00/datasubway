@@ -88,7 +88,6 @@ mod tests {
                 ColumnPattern::OnePattern("orders.*".into()),
                 ColumnContext::MultipleStrings(qc.groups.clone()),
                 ColumnInclude::OneString("orders.amount".into()),
-                dm.table_schema("orders"),
             ))
             .agg(vec![col("orders.amount").sum().alias("revenue")])
     }

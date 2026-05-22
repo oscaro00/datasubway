@@ -1,5 +1,4 @@
 use polars::lazy::dsl::{col, lit, Expr};
-use polars::prelude::Schema;
 
 use crate::column_expressions::filter_expr::{filter_expr_to_polars, FilterExpr};
 
@@ -20,6 +19,7 @@ pub enum ColumnContext {
 
 #[derive(Clone, Debug)]
 pub enum ColumnInclude {
+    None,
     OneString(String),
     MultipleStrings(Vec<String>),
 }
@@ -147,6 +147,7 @@ pub fn match_context_pattern(context_column: &TableColumn, patterns: &[TableColu
 
 fn include_to_strings(include: ColumnInclude) -> Vec<String> {
     let include_return = match include {
+        ColumnInclude::None => return vec![],
         ColumnInclude::OneString(s) => {
             validate_table_columns(vec![s.as_str()], ReturnKind::Strings)
         }
@@ -183,7 +184,6 @@ pub fn allow(
     pattern: ColumnPattern,
     context: ColumnContext,
     include: ColumnInclude,
-    schema: &Schema,
 ) -> AllowExcludeResult {
     let record = AllowExcludeRecord {
         kind: AllowExcludeKind::Allow,
@@ -200,8 +200,8 @@ pub fn allow(
             .map(|tc| tc.table_column())
             .collect();
         let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
-        let expr = filter_expr_to_polars(filter_expr, &all_patterns, schema, true)
-            .unwrap_or_else(|| lit(true));
+        let expr =
+            filter_expr_to_polars(filter_expr, &all_patterns, true).unwrap_or_else(|| lit(true));
         return AllowExcludeResult {
             inner: ColumnReturn::PolarsExpr(expr),
             record,
@@ -231,7 +231,6 @@ pub fn exclude(
     pattern: ColumnPattern,
     context: ColumnContext,
     include: ColumnInclude,
-    schema: &Schema,
 ) -> AllowExcludeResult {
     let record = AllowExcludeRecord {
         kind: AllowExcludeKind::Exclude,
@@ -248,8 +247,8 @@ pub fn exclude(
             .map(|tc| tc.table_column())
             .collect();
         let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
-        let expr = filter_expr_to_polars(filter_expr, &all_patterns, schema, false)
-            .unwrap_or_else(|| lit(true));
+        let expr =
+            filter_expr_to_polars(filter_expr, &all_patterns, false).unwrap_or_else(|| lit(true));
         return AllowExcludeResult {
             inner: ColumnReturn::PolarsExpr(expr),
             record,
@@ -281,15 +280,6 @@ pub fn exclude(
 mod tests {
     use super::*;
     use polars::lazy::dsl::{col, lit};
-    use polars::prelude::{DataType, Field, Schema};
-
-    fn test_schema() -> Schema {
-        Schema::from_iter([
-            Field::new("sales.amount".into(), DataType::Float64),
-            Field::new("date.year".into(), DataType::Int64),
-        ])
-    }
-
     #[test]
     fn test_json_context_prunes_non_matching_columns() {
         let filter_expr = FilterExpr::And {
@@ -315,12 +305,10 @@ mod tests {
             ],
         };
 
-        let schema = test_schema();
         let result = allow(
             ColumnPattern::OnePattern("sales.*".into()),
             ColumnContext::Json(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
-            &schema,
         );
 
         let expected = col("sales.amount").gt(lit(0i64));
@@ -352,12 +340,10 @@ mod tests {
             ],
         };
 
-        let schema = test_schema();
         let result = allow(
             ColumnPattern::OnePattern("*".into()),
             ColumnContext::Json(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
-            &schema,
         );
 
         let expected = col("sales.amount")
@@ -378,12 +364,10 @@ mod tests {
             },
         };
 
-        let schema = test_schema();
         let result = allow(
             ColumnPattern::OnePattern("sales.*".into()),
             ColumnContext::Json(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
-            &schema,
         );
 
         assert!(matches!(result.inner, ColumnReturn::PolarsExpr(ref e) if e == &lit(true)));
@@ -391,12 +375,10 @@ mod tests {
 
     #[test]
     fn test_string_context_regression() {
-        let schema = test_schema();
         let result = allow(
             ColumnPattern::OnePattern("sales.*".into()),
             ColumnContext::OneString("sales.amount".into()),
             ColumnInclude::OneString("sales.amount".into()),
-            &schema,
         );
 
         assert!(
@@ -406,12 +388,10 @@ mod tests {
 
     #[test]
     fn test_exclude_string_context_drops_matching_columns() {
-        let schema = test_schema();
         let result = exclude(
             ColumnPattern::OnePattern("date.*".into()),
             ColumnContext::MultipleStrings(vec!["sales.amount".into(), "date.year".into()]),
             ColumnInclude::OneString("sales.amount".into()),
-            &schema,
         );
 
         assert!(
@@ -421,12 +401,10 @@ mod tests {
 
     #[test]
     fn test_exclude_string_context_include_always_kept() {
-        let schema = test_schema();
         let result = exclude(
             ColumnPattern::OnePattern("date.*".into()),
             ColumnContext::MultipleStrings(vec!["sales.amount".into(), "date.year".into()]),
             ColumnInclude::OneString("date.year".into()),
-            &schema,
         );
 
         assert!(
@@ -459,12 +437,10 @@ mod tests {
             ],
         };
 
-        let schema = test_schema();
         let result = exclude(
             ColumnPattern::OnePattern("date.*".into()),
             ColumnContext::Json(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
-            &schema,
         );
 
         let expected = col("sales.amount").gt(lit(0i64));
@@ -483,12 +459,10 @@ mod tests {
             },
         };
 
-        let schema = test_schema();
         let result = exclude(
             ColumnPattern::OnePattern("sales.*".into()),
             ColumnContext::Json(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
-            &schema,
         );
 
         assert!(matches!(result.inner, ColumnReturn::PolarsExpr(ref e) if e == &lit(true)));

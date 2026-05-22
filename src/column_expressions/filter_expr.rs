@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use polars::lazy::dsl::{col, lit, Expr};
-use polars::prelude::{NamedFrom, Schema, Series};
+use polars::prelude::{NamedFrom, Series};
 
 use super::column::TableColumn;
 use super::column_context::{match_context_pattern, parse_column_pattern};
@@ -69,10 +69,7 @@ impl FromStr for CompareOp {
     }
 }
 
-fn col_is_valid(col_name: &str, patterns: &[&str], schema: &Schema, keep_matching: bool) -> bool {
-    if schema.get(col_name).is_none() {
-        return false;
-    }
+fn col_is_valid(col_name: &str, patterns: &[&str], keep_matching: bool) -> bool {
     let (table, column) = match col_name.split_once('.') {
         Some(parts) => parts,
         None => return false,
@@ -93,12 +90,7 @@ fn col_is_valid(col_name: &str, patterns: &[&str], schema: &Schema, keep_matchin
     }
 }
 
-fn prune(
-    expr: FilterExpr,
-    patterns: &[&str],
-    schema: &Schema,
-    keep_matching: bool,
-) -> Option<FilterExpr> {
+fn prune(expr: FilterExpr, patterns: &[&str], keep_matching: bool) -> Option<FilterExpr> {
     match expr {
         FilterExpr::Comparison {
             ref left,
@@ -106,7 +98,7 @@ fn prune(
             ..
         } => {
             let cols_valid = [left, right].iter().all(|op| match op {
-                Operand::Col { col: name } => col_is_valid(name, patterns, schema, keep_matching),
+                Operand::Col { col: name } => col_is_valid(name, patterns, keep_matching),
                 Operand::Lit { .. } => true,
             });
             if cols_valid {
@@ -118,7 +110,7 @@ fn prune(
         FilterExpr::And { and } => {
             let children: Vec<_> = and
                 .into_iter()
-                .filter_map(|e| prune(e, patterns, schema, keep_matching))
+                .filter_map(|e| prune(e, patterns, keep_matching))
                 .collect();
             if children.is_empty() {
                 None
@@ -129,7 +121,7 @@ fn prune(
         FilterExpr::Or { or } => {
             let children: Vec<_> = or
                 .into_iter()
-                .filter_map(|e| prune(e, patterns, schema, keep_matching))
+                .filter_map(|e| prune(e, patterns, keep_matching))
                 .collect();
             if children.is_empty() {
                 None
@@ -205,16 +197,15 @@ fn to_expr(expr: FilterExpr) -> Expr {
 pub(crate) fn filter_expr_to_polars(
     expr: FilterExpr,
     patterns: &[&str],
-    schema: &Schema,
     keep_matching: bool,
 ) -> Option<Expr> {
-    let pruned = prune(expr, patterns, schema, keep_matching)?;
+    let pruned = prune(expr, patterns, keep_matching)?;
     Some(to_expr(pruned))
 }
 
-pub fn filter_to_expr(filter: &Value, patterns: &[&str], schema: &Schema) -> Option<Expr> {
+pub fn filter_to_expr(filter: &Value, patterns: &[&str]) -> Option<Expr> {
     let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
-    let pruned = prune(parsed, patterns, schema, true)?;
+    let pruned = prune(parsed, patterns, true)?;
     Some(to_expr(pruned))
 }
 
@@ -248,17 +239,8 @@ pub fn collect_col_names(expr: &FilterExpr) -> Vec<String> {
 mod tests {
     use super::*;
     use polars::lazy::dsl::{col, lit};
-    use polars::prelude::{DataType, Field, NamedFrom, Schema, Series};
+    use polars::prelude::{NamedFrom, Series};
     use serde_json::json;
-
-    fn test_schema() -> Schema {
-        Schema::from_iter([
-            Field::new("geography.state".into(), DataType::String),
-            Field::new("date.year".into(), DataType::Int64),
-            Field::new("sales.ty_sales".into(), DataType::Float64),
-            Field::new("sales.ly_sales".into(), DataType::Float64),
-        ])
-    }
 
     #[test]
     fn test_parse_and_convert() {
@@ -278,9 +260,8 @@ mod tests {
             ]
         });
 
-        let schema = test_schema();
         let patterns = &["geography.*", "date.year", "sales.*"];
-        let result = filter_to_expr(&filter, patterns, &schema);
+        let result = filter_to_expr(&filter, patterns);
 
         let expected = col("geography.state")
             .is_in(
@@ -297,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prunes_invalid_column() {
+    fn test_prunes_non_matching_column() {
         let filter = json!({
             "and": [
                 {"left": {"col": "sales.ty_sales"}, "op": ">",  "right": {"lit": 0}},
@@ -305,11 +286,10 @@ mod tests {
             ]
         });
 
-        let schema = test_schema();
         let patterns = &["sales.*"];
-        let result = filter_to_expr(&filter, patterns, &schema);
+        let result = filter_to_expr(&filter, patterns);
 
-        // "unknown.col" pruned; only "sales.ty_sales > 0" survives
+        // "unknown.col" doesn't match "sales.*" so it's pruned
         let expected = col("sales.ty_sales").gt(lit(0i64));
         assert_eq!(result, Some(expected));
     }
@@ -322,8 +302,7 @@ mod tests {
             ]
         });
 
-        let schema = test_schema();
         let patterns = &["sales.*"];
-        assert_eq!(filter_to_expr(&filter, patterns, &schema), None);
+        assert_eq!(filter_to_expr(&filter, patterns), None);
     }
 }

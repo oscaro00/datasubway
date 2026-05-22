@@ -51,11 +51,19 @@ pub struct DataModel {
 
 impl DataModel {
     pub fn new(
-        mut tables: HashMap<String, LazyFrame>,
+        tables: HashMap<String, LazyFrame>,
         joins: JoinGraph,
         pre_aggs: Vec<PreAggregation>,
         pre_agg_path: Option<String>,
     ) -> DataModel {
+        let mut tables: HashMap<String, LazyFrame> = tables
+            .into_iter()
+            .map(|(name, lf)| {
+                let lf = Self::prefix_columns_if_needed(&name, lf);
+                (name, lf)
+            })
+            .collect();
+
         let table_schemas = tables
             .iter_mut()
             .map(|(name, lf)| {
@@ -86,6 +94,24 @@ impl DataModel {
             pre_agg_path,
             table_schemas,
         }
+    }
+
+    fn prefix_columns_if_needed(table_name: &str, mut lf: LazyFrame) -> LazyFrame {
+        let schema = lf
+            .collect_schema()
+            .unwrap_or_else(|e| panic!("failed to get schema for '{table_name}': {e}"));
+        let prefix = format!("{}.", table_name);
+        let to_rename: Vec<(String, String)> = schema
+            .iter_names()
+            .filter(|name| !name.starts_with(prefix.as_str()))
+            .map(|name| (name.to_string(), format!("{}{}", prefix, name)))
+            .collect();
+        if to_rename.is_empty() {
+            return lf;
+        }
+        let existing: Vec<String> = to_rename.iter().map(|(e, _)| e.clone()).collect();
+        let new_names: Vec<String> = to_rename.iter().map(|(_, n)| n.clone()).collect();
+        lf.rename(existing, new_names, false)
     }
 
     pub fn table(&self, table_name: &str) -> LazyFrameRecorder<'_> {
@@ -156,19 +182,16 @@ impl DataModel {
                 Ok(cols)
             }
             Some(record) => {
-                let schema = self.table_schema(&recorder.table_name);
                 let result = match record.kind {
                     AllowExcludeKind::Allow => allow(
                         record.pattern.clone(),
                         record.context.clone(),
                         record.include.clone(),
-                        schema,
                     ),
                     AllowExcludeKind::Exclude => exclude(
                         record.pattern.clone(),
                         record.context.clone(),
                         record.include.clone(),
-                        schema,
                     ),
                 };
                 match result.inner {
@@ -344,34 +367,20 @@ impl DataModel {
             }
         }
 
-        // --- 4. Build group_by expressions (unqualified column name) ---
-        let group_by_exprs: Vec<Expr> = pa
-            .group_by
-            .iter()
-            .map(|qcol| {
-                let col_name = qcol
-                    .split_once('.')
-                    .map(|(_, c)| c)
-                    .unwrap_or(qcol.as_str());
-                col(col_name)
-            })
-            .collect();
+        // --- 4. Build group_by expressions ---
+        let group_by_exprs: Vec<Expr> = pa.group_by.iter().map(|qcol| col(qcol.as_str())).collect();
 
         // --- 5. Build agg expressions, one per component ---
         let mut agg_exprs: Vec<Expr> = Vec::new();
         for (qcol, components) in &pa.aggregations {
-            let col_name = qcol
-                .split_once('.')
-                .map(|(_, c)| c)
-                .unwrap_or(qcol.as_str());
             for component in components {
                 let alias = component_col_name(qcol, component);
                 let expr = match component.as_str() {
-                    "sum" => col(col_name).sum().alias(&alias),
-                    "count" => col(col_name).count().alias(&alias),
-                    "min" => col(col_name).min().alias(&alias),
-                    "max" => col(col_name).max().alias(&alias),
-                    "sumsq" => col(col_name).pow(lit(2.0f64)).sum().alias(&alias),
+                    "sum" => col(qcol.as_str()).sum().alias(&alias),
+                    "count" => col(qcol.as_str()).count().alias(&alias),
+                    "min" => col(qcol.as_str()).min().alias(&alias),
+                    "max" => col(qcol.as_str()).max().alias(&alias),
+                    "sumsq" => col(qcol.as_str()).pow(lit(2.0f64)).sum().alias(&alias),
                     other => {
                         return Err(format!("unknown pre-agg component '{other}'"));
                     }
@@ -386,16 +395,6 @@ impl DataModel {
             .agg(agg_exprs)
             .collect()
             .map_err(|e| format!("failed to collect pre-agg: {e}"))?;
-
-        // --- 7. Rename group-by columns to their qualified form ---
-        for qcol in &pa.group_by {
-            if let Some((_, col_name)) = qcol.split_once('.') {
-                if col_name != qcol.as_str() {
-                    df.rename(col_name, qcol.as_str().into())
-                        .map_err(|e| format!("failed to rename '{col_name}' → '{qcol}': {e}"))?;
-                }
-            }
-        }
 
         // --- 8. Write parquet ---
         let file_path = format!("{path}/{}.parquet", pa.name);
@@ -444,12 +443,52 @@ impl DataModel {
             }
         }
 
+        let mut lf = self
+            .tables
+            .get(table_name)
+            .unwrap_or_else(|| panic!("table '{table_name}' not found in DataModel"))
+            .clone();
+
+        // Collect external table names referenced by non-aggregated or aggregated columns
+        let all_col_names = non_agg_cols
+            .iter()
+            .map(|s| s.as_str())
+            .chain(agg_cols.keys().map(|s| s.as_str()));
+        let mut external_tables: Vec<String> = all_col_names
+            .filter_map(|c| c.split_once('.').map(|(t, _)| t.to_string()))
+            .filter(|t| t != table_name)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        external_tables.sort();
+
+        let mut joined: HashSet<String> = HashSet::from([table_name.to_string()]);
+        for ext in &external_tables {
+            if let Some(path) = self.joins.find_path(table_name, ext) {
+                for join in path {
+                    if joined.contains(&join.right) {
+                        continue;
+                    }
+                    let right_lf = self
+                        .tables
+                        .get(&join.right)
+                        .unwrap_or_else(|| panic!("table '{}' not found in DataModel", join.right))
+                        .clone();
+                    let join_type = match join.how {
+                        JoinHow::Left => JoinType::Left,
+                        JoinHow::Inner => JoinType::Inner,
+                    };
+                    let left_on: Vec<Expr> = join.left_on.iter().map(|c| col(c.as_str())).collect();
+                    let right_on: Vec<Expr> =
+                        join.right_on.iter().map(|c| col(c.as_str())).collect();
+                    lf = lf.join(right_lf, left_on, right_on, JoinArgs::new(join_type));
+                    joined.insert(join.right.clone());
+                }
+            }
+        }
+
         LazyFrameWrapper {
-            lazyframe: self
-                .tables
-                .get(table_name)
-                .unwrap_or_else(|| panic!("table '{table_name}' not found in DataModel"))
-                .clone(),
+            lazyframe: lf,
             from_pre_agg: false,
         }
     }
