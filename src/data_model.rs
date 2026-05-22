@@ -462,6 +462,11 @@ impl DataModel {
             .collect();
         external_tables.sort();
 
+        // Tracks columns dropped by prior joins: dropped_name → surviving_name.
+        // Polars drops the right-side key after each join, so any subsequent join
+        // that references the dropped name must be redirected to the surviving key.
+        let mut col_remap: HashMap<String, String> = HashMap::new();
+
         let mut joined: HashSet<String> = HashSet::from([table_name.to_string()]);
         for ext in &external_tables {
             if let Some(path) = self.joins.find_path(table_name, ext) {
@@ -478,9 +483,27 @@ impl DataModel {
                         JoinHow::Left => JoinType::Left,
                         JoinHow::Inner => JoinType::Inner,
                     };
-                    let left_on: Vec<Expr> = join.left_on.iter().map(|c| col(c.as_str())).collect();
+                    let left_on: Vec<Expr> = join
+                        .left_on
+                        .iter()
+                        .map(|c| {
+                            let name = col_remap
+                                .get(c.as_str())
+                                .map(|s| s.as_str())
+                                .unwrap_or(c.as_str());
+                            col(name)
+                        })
+                        .collect();
                     let right_on: Vec<Expr> =
                         join.right_on.iter().map(|c| col(c.as_str())).collect();
+                    // After the join, each right key is dropped; record the surviving left key.
+                    for (left_col, right_col) in join.left_on.iter().zip(join.right_on.iter()) {
+                        let surviving = col_remap
+                            .get(left_col.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| left_col.clone());
+                        col_remap.insert(right_col.clone(), surviving);
+                    }
                     lf = lf.join(right_lf, left_on, right_on, JoinArgs::new(join_type));
                     joined.insert(join.right.clone());
                 }
