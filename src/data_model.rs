@@ -204,7 +204,7 @@ impl DataModel {
         }
     }
 
-    pub fn query(&self, qc: &QueryContext, explain: bool) -> Result<QueryOutput, String> {
+    fn build_combined_frame(&self, qc: &QueryContext) -> Result<LazyFrame, String> {
         let known_measures: Vec<MeasureMetadata> =
             self.measure_metadata.values().cloned().collect();
         let all_columns: HashSet<String> = self
@@ -271,8 +271,11 @@ impl DataModel {
             combined = combined.sort(sort_cols, opts);
         }
 
-        combined = combined.slice(qc.offset as i64, qc.limit as u32);
+        Ok(combined.slice(qc.offset as i64, qc.limit as u32))
+    }
 
+    pub fn query(&self, qc: &QueryContext, explain: bool) -> Result<QueryOutput, String> {
+        let combined = self.build_combined_frame(qc)?;
         if explain {
             combined
                 .explain(true)
@@ -281,6 +284,27 @@ impl DataModel {
         } else {
             combined
                 .collect()
+                .map(QueryOutput::Data)
+                .map_err(|e| format!("query execution failed: {e}"))
+        }
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn query_async(
+        &self,
+        qc: &QueryContext,
+        explain: bool,
+    ) -> Result<QueryOutput, String> {
+        let combined = self.build_combined_frame(qc)?;
+        if explain {
+            combined
+                .explain(true)
+                .map(QueryOutput::Explanation)
+                .map_err(|e| format!("explain failed: {e}"))
+        } else {
+            tokio::task::spawn_blocking(move || combined.collect())
+                .await
+                .expect("collect task panicked")
                 .map(QueryOutput::Data)
                 .map_err(|e| format!("query execution failed: {e}"))
         }
@@ -753,6 +777,37 @@ mod tests {
         )
         .unwrap();
         let df = match dm.query(&qc, false).unwrap() {
+            QueryOutput::Data(df) => df,
+            _ => panic!("expected Data"),
+        };
+        assert_eq!(df.height(), 2);
+        let total: f64 = df
+            .column("orders.amount")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .sum();
+        assert!((total - 700.0).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_async_single_measure() {
+        let dm = make_query_dm();
+        let qc = QueryContext::new(
+            vec!["revenue".into()],
+            None,
+            Some(vec!["orders.region".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let df = match dm.query_async(&qc, false).await.unwrap() {
             QueryOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
