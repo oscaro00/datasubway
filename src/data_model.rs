@@ -126,7 +126,7 @@ impl DataModel {
             non_agg_cols: HashSet::new(),
             agg_cols: HashMap::new(),
             non_base_tables: HashSet::new(),
-            use_pre_agg: false,
+            use_pre_agg: true,
             allow_exclude_records: Vec::new(),
         }
     }
@@ -219,7 +219,8 @@ impl DataModel {
 
         for m_name in &qc.measures {
             let measure = self.measures.get(m_name).unwrap();
-            let recorder = measure.call(self, qc);
+            let mut recorder = measure.call(self, qc);
+            recorder.use_pre_agg = qc.use_pre_agg;
             let cols = self.eval_last_allow_exclude(&recorder)?;
 
             if let Some(ref prev) = expected_cols {
@@ -412,36 +413,39 @@ impl DataModel {
         table_name: &str,
         non_agg_cols: &HashSet<PlSmallStr>,
         agg_cols: &HashMap<PlSmallStr, Vec<String>>,
+        use_pre_agg: bool,
     ) -> LazyFrameWrapper {
-        if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, self.pre_agg_path.as_deref()) {
-            let non_agg_vec: Vec<String> = non_agg_cols.iter().map(|s| s.to_string()).collect();
+        if use_pre_agg {
+            if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, self.pre_agg_path.as_deref()) {
+                let non_agg_vec: Vec<String> = non_agg_cols.iter().map(|s| s.to_string()).collect();
 
-            let agg_map: HashMap<String, HashSet<String>> = agg_cols
-                .iter()
-                .map(|(col, agg_names)| {
-                    let components: HashSet<String> = agg_names
-                        .iter()
-                        .filter_map(|name| agg_expansion(&name.to_lowercase()).ok())
-                        .flatten()
-                        .map(|s| s.to_string())
-                        .collect();
-                    (col.to_string(), components)
-                })
-                .collect();
+                let agg_map: HashMap<String, HashSet<String>> = agg_cols
+                    .iter()
+                    .map(|(col, agg_names)| {
+                        let components: HashSet<String> = agg_names
+                            .iter()
+                            .filter_map(|name| agg_expansion(&name.to_lowercase()).ok())
+                            .flatten()
+                            .map(|s| s.to_string())
+                            .collect();
+                        (col.to_string(), components)
+                    })
+                    .collect();
 
-            if let Some(best) = find_best_pre_agg(pre_aggs, &non_agg_vec, &agg_map) {
-                let pre_agg_file = format!("{}/{}.parquet", path, best.name);
-                if let Ok(lf) = LazyFrame::scan_parquet(
-                    PlRefPath::from(pre_agg_file.as_str()),
-                    Default::default(),
-                ) {
-                    return LazyFrameWrapper {
-                        lazyframe: lf,
-                        from_pre_agg: true,
-                    };
+                if let Some(best) = find_best_pre_agg(pre_aggs, &non_agg_vec, &agg_map) {
+                    let pre_agg_file = format!("{}/{}.parquet", path, best.name);
+                    if let Ok(lf) = LazyFrame::scan_parquet(
+                        PlRefPath::from(pre_agg_file.as_str()),
+                        Default::default(),
+                    ) {
+                        return LazyFrameWrapper {
+                            lazyframe: lf,
+                            from_pre_agg: true,
+                        };
+                    }
                 }
             }
-        }
+        } // end if use_pre_agg
 
         let mut lf = self
             .tables

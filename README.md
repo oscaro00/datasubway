@@ -102,17 +102,14 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 ## TO DO
 
-- Complete Lazyframe wrapper approach in rust
-
 - Look into using flight to avoid serialization
-- Logging
+  - Test a basic axum api
+
+- FilterContext and filter() to just auto join/select/filter rows rather than aggregating
 - More aggregation algorithms like KLL or t-digest for percentiles
-
-
-
-
-
 - Parameter to only look at pre aggregations within a certain time frame
+
+- Logging
 
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files

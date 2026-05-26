@@ -312,6 +312,7 @@ impl<'a> LazyFrameRecorder<'a> {
             &self.table_name,
             &self.non_agg_cols,
             &self.agg_cols,
+            self.use_pre_agg,
         ));
 
         for op in self.lazy_ops {

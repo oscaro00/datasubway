@@ -7,13 +7,15 @@ use datasubway::data_model::{DataModel, QueryOutput};
 use datasubway::model_components::{
     joins::{Join, JoinDirection, JoinGraph, JoinHow},
     measures::Measure,
+    pre_aggregations::PreAggregation,
     query_context::QueryContext,
 };
 use datasubway::wrappers::polars::lazyframe_recorder::LazyFrameRecorder;
 use polars::prelude::*;
+use tempfile::TempDir;
 
-fn build_dm() -> DataModel {
-    let tables = HashMap::from([
+fn make_tables() -> HashMap<String, LazyFrame> {
+    HashMap::from([
         (
             "players".to_string(),
             LazyFrame::scan_parquet(
@@ -61,9 +63,11 @@ fn build_dm() -> DataModel {
             )
             .unwrap(),
         ),
-    ]);
+    ])
+}
 
-    let joins = vec![
+fn make_joins() -> Vec<Join> {
+    vec![
         Join {
             left: "games".into(),
             right: "player_stats".into(),
@@ -112,18 +116,55 @@ fn build_dm() -> DataModel {
             how: JoinHow::Left,
             direction: JoinDirection::RightOnLeft,
         },
-    ];
+    ]
+}
 
-    let mut dm = DataModel::new(tables, JoinGraph::new(&joins).unwrap(), vec![], None);
-
+fn build_dm() -> DataModel {
+    let mut dm = DataModel::new(
+        make_tables(),
+        JoinGraph::new(&make_joins()).unwrap(),
+        vec![],
+        None,
+    );
     dm.add_measure(Measure::new("player_goals", player_goals))
         .unwrap();
     dm.add_measure(Measure::new("team_goals", team_goals))
         .unwrap();
     dm.add_measure(Measure::new("game_count", game_count))
         .unwrap();
-
     dm
+}
+
+/// Pre-aggregation for player_goals grouped by player_id — covers any query
+/// that groups only by players.player_name and sums player_stats.goals.
+fn player_goals_pre_agg() -> PreAggregation {
+    PreAggregation::new(
+        "player_goals_by_player".into(),
+        vec!["players.player_name".into()],
+        HashMap::from([("player_stats.goals".into(), vec!["sum".into()])]),
+    )
+    .unwrap()
+}
+
+/// Returns a DataModel with the player_goals pre-agg written to a temp dir,
+/// plus the TempDir handle (dropping it removes the files).
+fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().to_str().unwrap().to_string();
+    let mut dm = DataModel::new(
+        make_tables(),
+        JoinGraph::new(&make_joins()).unwrap(),
+        vec![player_goals_pre_agg()],
+        Some(path),
+    );
+    dm.add_measure(Measure::new("player_goals", player_goals))
+        .unwrap();
+    dm.add_measure(Measure::new("team_goals", team_goals))
+        .unwrap();
+    dm.add_measure(Measure::new("game_count", game_count))
+        .unwrap();
+    dm.write_pre_aggs(&["player_goals_by_player"]).unwrap();
+    (dm, tmp)
 }
 
 fn player_goals<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
@@ -188,7 +229,11 @@ fn test_player_goals_by_player_name() {
         vec!["player_goals".to_string()],
         None,
         Some(vec!["players.player_name".to_string()]),
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
@@ -215,8 +260,11 @@ fn test_player_goals_by_player_name() {
 
     let cols = &["players.player_name", "player_stats.goals"];
     assert!(
-        sorted_select(actual, "players.player_name", cols)
-            .equals_missing(&sorted_select(expected, "players.player_name", cols)),
+        sorted_select(actual, "players.player_name", cols).equals_missing(&sorted_select(
+            expected,
+            "players.player_name",
+            cols
+        )),
         "player_goals by player_name mismatch"
     );
 }
@@ -228,7 +276,11 @@ fn test_team_goals_by_team_name() {
         vec!["team_goals".to_string()],
         None,
         Some(vec!["team_stats.team_name".to_string()]),
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
@@ -245,8 +297,11 @@ fn test_team_goals_by_team_name() {
 
     let cols = &["team_stats.team_name", "team_stats.goals"];
     assert!(
-        sorted_select(actual, "team_stats.team_name", cols)
-            .equals_missing(&sorted_select(expected, "team_stats.team_name", cols)),
+        sorted_select(actual, "team_stats.team_name", cols).equals_missing(&sorted_select(
+            expected,
+            "team_stats.team_name",
+            cols
+        )),
         "team_goals by team_name mismatch"
     );
 }
@@ -258,13 +313,17 @@ fn test_game_count_by_group() {
         vec!["game_count".to_string()],
         None,
         Some(vec!["groups.group_name".to_string()]),
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
 
-    let games = scan("tests/data_files/games.parquet")
-        .select([col("game_id").alias("games.game_id")]);
+    let games =
+        scan("tests/data_files/games.parquet").select([col("game_id").alias("games.game_id")]);
     let gb = scan("tests/data_files/groups_bridge.parquet").select([
         col("game_id").alias("groups_bridge.game_id"),
         col("group_id").alias("groups_bridge.group_id"),
@@ -293,8 +352,11 @@ fn test_game_count_by_group() {
 
     let cols = &["groups.group_name", "games.game_count"];
     assert!(
-        sorted_select(actual, "groups.group_name", cols)
-            .equals_missing(&sorted_select(expected, "groups.group_name", cols)),
+        sorted_select(actual, "groups.group_name", cols).equals_missing(&sorted_select(
+            expected,
+            "groups.group_name",
+            cols
+        )),
         "game_count by group_name mismatch"
     );
 }
@@ -306,7 +368,11 @@ fn test_player_goals_by_platform() {
         vec!["player_goals".to_string()],
         None,
         Some(vec!["players.platform".to_string()]),
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
@@ -338,8 +404,11 @@ fn test_player_goals_by_platform() {
     );
     let cols = &["players.platform", "player_stats.goals"];
     assert!(
-        sorted_select(actual, "players.platform", cols)
-            .equals_missing(&sorted_select(expected, "players.platform", cols)),
+        sorted_select(actual, "players.platform", cols).equals_missing(&sorted_select(
+            expected,
+            "players.platform",
+            cols
+        )),
         "player_goals by platform mismatch"
     );
 }
@@ -351,7 +420,11 @@ fn test_multi_measure_join() {
         vec!["player_goals".to_string(), "game_count".to_string()],
         None,
         Some(vec!["players.player_name".to_string()]),
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
@@ -376,8 +449,8 @@ fn test_multi_measure_join() {
         .collect()
         .unwrap();
 
-    let games = scan("tests/data_files/games.parquet")
-        .select([col("game_id").alias("games.game_id")]);
+    let games =
+        scan("tests/data_files/games.parquet").select([col("game_id").alias("games.game_id")]);
     let ps2 = scan("tests/data_files/player_stats.parquet").select([
         col("game_id").alias("player_stats.game_id"),
         col("player_id").alias("player_stats.player_id"),
@@ -414,12 +487,18 @@ fn test_multi_measure_join() {
     let sort_col = "players.player_name";
     let measure_cols = &["player_stats.goals", "games.game_count"];
     let actual_sorted = actual
-        .sort([sort_col], SortMultipleOptions::default().with_nulls_last(true))
+        .sort(
+            [sort_col],
+            SortMultipleOptions::default().with_nulls_last(true),
+        )
         .unwrap()
         .select(measure_cols)
         .unwrap();
     let expected_sorted = expected
-        .sort([sort_col], SortMultipleOptions::default().with_nulls_last(true))
+        .sort(
+            [sort_col],
+            SortMultipleOptions::default().with_nulls_last(true),
+        )
         .unwrap()
         .select(measure_cols)
         .unwrap();
@@ -436,7 +515,11 @@ fn test_player_goals_and_game_count_by_group() {
         vec!["player_goals".to_string(), "game_count".to_string()],
         None,
         Some(vec!["groups.group_name".to_string()]),
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
@@ -473,8 +556,8 @@ fn test_player_goals_and_game_count_by_group() {
         .unwrap();
 
     // game_count by group: games -> groups_bridge -> groups
-    let games = scan("tests/data_files/games.parquet")
-        .select([col("game_id").alias("games.game_id")]);
+    let games =
+        scan("tests/data_files/games.parquet").select([col("game_id").alias("games.game_id")]);
     let game_count_df = games
         .join(
             gb,
@@ -507,17 +590,63 @@ fn test_player_goals_and_game_count_by_group() {
     let sort_col = "groups.group_name";
     let measure_cols = &["player_stats.goals", "games.game_count"];
     let actual_sorted = actual
-        .sort([sort_col], SortMultipleOptions::default().with_nulls_last(true))
+        .sort(
+            [sort_col],
+            SortMultipleOptions::default().with_nulls_last(true),
+        )
         .unwrap()
         .select(measure_cols)
         .unwrap();
     let expected_sorted = expected
-        .sort([sort_col], SortMultipleOptions::default().with_nulls_last(true))
+        .sort(
+            [sort_col],
+            SortMultipleOptions::default().with_nulls_last(true),
+        )
         .unwrap()
         .select(measure_cols)
         .unwrap();
     assert!(
         actual_sorted.equals_missing(&expected_sorted),
         "multi-measure (player_goals + game_count) by group_name mismatch"
+    );
+}
+
+/// Verify that `use_pre_agg` in QueryContext controls whether the pre-aggregation
+/// parquet file appears in the query's logical plan.
+#[test]
+fn test_pre_agg_explain_toggle() {
+    let (dm, _tmp) = build_dm_with_pre_agg();
+
+    // Query grouped by players.player_name — covered by player_goals_by_player pre-agg.
+    let make_qc = |use_pre_agg: bool| {
+        QueryContext::new(
+            vec!["player_goals".to_string()],
+            None,
+            Some(vec!["players.player_name".to_string()]),
+            None,
+            None,
+            None,
+            None,
+            Some(use_pre_agg),
+        )
+        .unwrap()
+    };
+
+    let explain_with = match dm.query(&make_qc(true), true).unwrap() {
+        QueryOutput::Explanation(s) => s,
+        _ => panic!("expected Explanation"),
+    };
+    let explain_without = match dm.query(&make_qc(false), true).unwrap() {
+        QueryOutput::Explanation(s) => s,
+        _ => panic!("expected Explanation"),
+    };
+
+    assert!(
+        explain_with.contains("player_goals_by_player"),
+        "use_pre_agg=true: expected pre-agg file in plan, got:\n{explain_with}"
+    );
+    assert!(
+        !explain_without.contains("player_goals_by_player"),
+        "use_pre_agg=false: expected no pre-agg file in plan, got:\n{explain_without}"
     );
 }
