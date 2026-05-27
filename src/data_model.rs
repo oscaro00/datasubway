@@ -17,7 +17,7 @@ use crate::{
         measures::{
             extract_measure_metadata, validate_measure_structure, Measure, MeasureMetadata,
         },
-        pre_aggregations::{agg_expansion, component_col_name, find_best_pre_agg, PreAggregation},
+        pre_aggregations::{agg_expansion, component_col_name, PreAggregation},
         query_context::QueryContext,
     },
     wrappers::polars::{
@@ -129,6 +129,7 @@ impl DataModel {
             agg_cols: HashMap::new(),
             non_base_tables: HashSet::new(),
             use_pre_agg: true,
+            pre_agg_valid_secs: None,
             allow_exclude_records: Vec::new(),
         }
     }
@@ -223,6 +224,7 @@ impl DataModel {
             let measure = self.measures.get(m_name).unwrap();
             let mut recorder = measure.call(self, qc);
             recorder.use_pre_agg = qc.use_pre_agg;
+            recorder.pre_agg_valid_secs = qc.pre_agg_valid_secs;
             let cols = self.eval_last_allow_exclude(&recorder)?;
 
             if let Some(ref prev) = expected_cols {
@@ -452,6 +454,7 @@ impl DataModel {
         non_agg_cols: &HashSet<PlSmallStr>,
         agg_cols: &HashMap<PlSmallStr, Vec<String>>,
         use_pre_agg: bool,
+        pre_agg_valid_secs: Option<u64>,
     ) -> LazyFrameWrapper {
         if use_pre_agg {
             if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, self.pre_agg_path.as_deref()) {
@@ -470,22 +473,48 @@ impl DataModel {
                     })
                     .collect();
 
-                if let Some(best) = find_best_pre_agg(pre_aggs, &non_agg_vec, &agg_map) {
-                    debug!(pre_agg = %best.name, table = %table_name, "using pre-aggregation");
-                    let pre_agg_file = format!("{}/{}.parquet", path, best.name);
+                let mut candidates: Vec<&PreAggregation> = pre_aggs
+                    .iter()
+                    .filter(|pa| pa.covers(&non_agg_vec, &agg_map))
+                    .collect();
+                candidates.sort_by_key(|pa| pa.row_count);
+
+                'candidates: for candidate in candidates {
+                    let pre_agg_file = format!("{}/{}.parquet", path, candidate.name);
+
+                    if let Some(max_age_secs) = pre_agg_valid_secs {
+                        match std::fs::metadata(&pre_agg_file)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                        {
+                            Some(modified) => {
+                                let age = modified.elapsed().unwrap_or(std::time::Duration::MAX);
+                                if age > std::time::Duration::from_secs(max_age_secs) {
+                                    debug!(pre_agg = %candidate.name, "pre-agg too old, trying next candidate");
+                                    continue 'candidates;
+                                }
+                            }
+                            None => {
+                                debug!(pre_agg = %candidate.name, "pre-agg age unknown, trying next candidate");
+                                continue 'candidates;
+                            }
+                        }
+                    }
+
                     if let Ok(lf) = LazyFrame::scan_parquet(
                         PlRefPath::from(pre_agg_file.as_str()),
                         Default::default(),
                     ) {
+                        debug!(pre_agg = %candidate.name, table = %table_name, "using pre-aggregation");
                         return LazyFrameWrapper {
                             lazyframe: lf,
                             from_pre_agg: true,
                         };
                     }
-                    debug!(pre_agg = %best.name, "pre-agg parquet not found, falling back to base table");
-                } else {
-                    trace!(table = %table_name, "no pre-aggregation covers query");
+                    debug!(pre_agg = %candidate.name, "pre-agg parquet not found, trying next candidate");
                 }
+
+                trace!(table = %table_name, "no valid pre-aggregation found, falling back to base table");
             }
         } // end if use_pre_agg
 
@@ -793,6 +822,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let df = match dm.query(&qc, false).unwrap() {
@@ -824,6 +854,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let df = match dm.query_async(&qc, false).await.unwrap() {
@@ -849,6 +880,7 @@ mod tests {
             vec!["revenue".into(), "order_count".into()],
             None,
             Some(vec!["orders.region".into()]),
+            None,
             None,
             None,
             None,
@@ -906,6 +938,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let err = dm.query(&qc, false).unwrap_err();
@@ -929,6 +962,7 @@ mod tests {
             None,
             Some(vec!["orders.region".into()]),
             Some(havings),
+            None,
             None,
             None,
             None,
@@ -962,6 +996,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let df = match dm.query(&qc, false).unwrap() {
@@ -990,6 +1025,7 @@ mod tests {
             None,
             Some(1),
             Some(1),
+            None,
             None,
         )
         .unwrap();

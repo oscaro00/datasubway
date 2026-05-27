@@ -234,6 +234,7 @@ fn test_player_goals_by_player_name() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
@@ -281,6 +282,7 @@ fn test_team_goals_by_team_name() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
@@ -313,6 +315,7 @@ fn test_game_count_by_group() {
         vec!["game_count".to_string()],
         None,
         Some(vec!["groups.group_name".to_string()]),
+        None,
         None,
         None,
         None,
@@ -373,6 +376,7 @@ fn test_player_goals_by_platform() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     let actual = dm_query(&dm, &qc);
@@ -420,6 +424,7 @@ fn test_multi_measure_join() {
         vec!["player_goals".to_string(), "game_count".to_string()],
         None,
         Some(vec!["players.player_name".to_string()]),
+        None,
         None,
         None,
         None,
@@ -515,6 +520,7 @@ fn test_player_goals_and_game_count_by_group() {
         vec!["player_goals".to_string(), "game_count".to_string()],
         None,
         Some(vec!["groups.group_name".to_string()]),
+        None,
         None,
         None,
         None,
@@ -628,6 +634,7 @@ fn test_pre_agg_explain_toggle() {
             None,
             None,
             Some(use_pre_agg),
+            None,
         )
         .unwrap()
     };

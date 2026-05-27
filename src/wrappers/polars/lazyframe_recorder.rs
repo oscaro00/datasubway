@@ -90,6 +90,7 @@ pub struct LazyFrameRecorder<'a> {
     pub agg_cols: HashMap<PlSmallStr, Vec<String>>,
     pub non_base_tables: HashSet<String>,
     pub use_pre_agg: bool,
+    pub pre_agg_valid_secs: Option<u64>,
     pub allow_exclude_records: Vec<AllowExcludeRecord>,
 }
 
@@ -318,6 +319,7 @@ impl<'a> LazyFrameRecorder<'a> {
             &self.non_agg_cols,
             &self.agg_cols,
             self.use_pre_agg,
+            self.pre_agg_valid_secs,
         ));
 
         for op in self.lazy_ops {
