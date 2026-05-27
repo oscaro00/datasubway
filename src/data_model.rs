@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use tracing::{debug, trace};
+
 use polars::prelude::{
     col, lit, DataFrame, Expr, JoinArgs, JoinType, LazyFrame, PlRefPath, PlSmallStr, Schema,
     SortMultipleOptions,
@@ -274,8 +276,14 @@ impl DataModel {
         Ok(combined.slice(qc.offset as i64, qc.limit as u32))
     }
 
+    #[tracing::instrument(skip(self, qc), fields(measures = ?qc.measures))]
     pub fn query(&self, qc: &QueryContext, explain: bool) -> Result<QueryOutput, String> {
         let combined = self.build_combined_frame(qc)?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let Ok(plan) = combined.clone().explain(true) {
+                debug!(query_plan = %plan, "polars query plan");
+            }
+        }
         if explain {
             combined
                 .explain(true)
@@ -290,12 +298,18 @@ impl DataModel {
     }
 
     #[cfg(feature = "async")]
+    #[tracing::instrument(skip(self, qc), fields(measures = ?qc.measures))]
     pub async fn query_async(
         &self,
         qc: &QueryContext,
         explain: bool,
     ) -> Result<QueryOutput, String> {
         let combined = self.build_combined_frame(qc)?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let Ok(plan) = combined.clone().explain(true) {
+                debug!(query_plan = %plan, "polars query plan");
+            }
+        }
         if explain {
             combined
                 .explain(true)
@@ -457,6 +471,7 @@ impl DataModel {
                     .collect();
 
                 if let Some(best) = find_best_pre_agg(pre_aggs, &non_agg_vec, &agg_map) {
+                    debug!(pre_agg = %best.name, table = %table_name, "using pre-aggregation");
                     let pre_agg_file = format!("{}/{}.parquet", path, best.name);
                     if let Ok(lf) = LazyFrame::scan_parquet(
                         PlRefPath::from(pre_agg_file.as_str()),
@@ -467,10 +482,14 @@ impl DataModel {
                             from_pre_agg: true,
                         };
                     }
+                    debug!(pre_agg = %best.name, "pre-agg parquet not found, falling back to base table");
+                } else {
+                    trace!(table = %table_name, "no pre-aggregation covers query");
                 }
             }
         } // end if use_pre_agg
 
+        debug!(table = %table_name, "scanning base table");
         let mut lf = self
             .tables
             .get(table_name)

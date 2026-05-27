@@ -100,13 +100,15 @@ datasubway = { git = "https://github.com/your-user/datasubway.git", branch = "ru
 
 With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pull the latest, run `cargo update -p datasubway` in the consuming project.
 
+## Access to logging
+
+To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("datasubway=debug").init()` in their binary, then control verbosity with `RUST_LOG=datasubway=debug` (or `trace` for recorder-level detail).
+
 ## TO DO
 
 - FilterContext and filter() to just auto join/select/filter rows rather than aggregating
 - More aggregation algorithms like KLL or t-digest for percentiles
 - Parameter to only look at pre aggregations within a certain time frame
-
-- Logging
 
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files

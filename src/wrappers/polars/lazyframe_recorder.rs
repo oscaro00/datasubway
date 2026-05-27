@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use polars::prelude::*;
+use tracing::trace;
 
 use super::super::super::data_model::DataModel;
 use super::agg_expr_parser::extract_agg_exprs;
@@ -164,6 +165,7 @@ impl<'a> LazyFrameRecorder<'a> {
                 let cols = pruned.clone().meta().root_names();
                 self.non_agg_cols.extend(cols);
                 self.lazy_ops.push(LazyOp::Filter(pruned));
+                trace!(table = %self.table_name, "recorded filter op");
             }
         }
         self
@@ -221,6 +223,7 @@ impl<'a> LazyFrameRecorder<'a> {
         for expr in &exprs {
             self.non_agg_cols.extend(expr.clone().meta().root_names());
         }
+        trace!(table = %self.table_name, by = exprs.len(), "recorded group_by op");
         self.lazy_ops.push(LazyOp::GroupBy(exprs));
         self
     }
@@ -246,6 +249,7 @@ impl<'a> LazyFrameRecorder<'a> {
             }
         }
 
+        trace!(table = %self.table_name, aggs = exprs.len(), "recorded agg op");
         self.lazy_ops.push(LazyOp::Agg(exprs));
         self
     }
@@ -303,6 +307,7 @@ impl<'a> LazyFrameRecorder<'a> {
     }
 
     pub fn build(self) -> LazyFrameWrapper {
+        trace!(table = %self.table_name, ops = self.lazy_ops.len(), "building lazyframe");
         enum State {
             Frame(LazyFrameWrapper),
             GroupBy(LazyGroupByWrapper),
@@ -330,9 +335,7 @@ impl<'a> LazyFrameRecorder<'a> {
                     State::Frame(lfw.bottom_k(k, by, opts))
                 }
                 (State::Frame(lfw), LazyOp::Reverse) => State::Frame(lfw.reverse()),
-                (State::Frame(lfw), LazyOp::Remove(pred)) => {
-                    State::Frame(lfw.remove(Some(pred)))
-                }
+                (State::Frame(lfw), LazyOp::Remove(pred)) => State::Frame(lfw.remove(Some(pred))),
                 (State::Frame(lfw), LazyOp::Filter(pred)) => State::Frame(lfw.filter(Some(pred))),
                 (State::Frame(lfw), LazyOp::WithColumn(expr)) => {
                     State::Frame(lfw.with_column(expr))

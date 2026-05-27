@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use tracing::trace;
 
 /// Whether the join is inner or left.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,6 +95,12 @@ impl JoinGraph {
                     if neighbor == end {
                         let mut result = path.clone();
                         result.push(join.clone());
+                        trace!(
+                            from = start,
+                            to = end,
+                            hops = result.len(),
+                            "join path resolved"
+                        );
                         return Some(result);
                     }
                     if !visited.contains(neighbor) {
@@ -105,6 +112,7 @@ impl JoinGraph {
                 }
             }
         }
+        trace!(from = start, to = end, "no join path found");
         None
     }
 
