@@ -107,6 +107,7 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 ## TO DO
 
 - FilterContext and filter() to just auto join/select/filter rows rather than aggregating
+  - There might be a more elegant way to do this within QueryContext (like a columns argument rather than measures)
 - More aggregation algorithms like KLL or t-digest for percentiles
 - Parameter to only look at pre aggregations within a certain time frame
 
