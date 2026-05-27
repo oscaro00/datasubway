@@ -13,6 +13,7 @@ pub struct QueryContext {
     pub limit: usize,
     pub offset: usize,
     pub use_pre_agg: bool,
+    pub pre_agg_valid_secs: Option<u64>,
 }
 
 impl QueryContext {
@@ -25,6 +26,7 @@ impl QueryContext {
         limit: Option<usize>,
         offset: Option<usize>,
         use_pre_agg: Option<bool>,
+        pre_agg_valid_secs: Option<u64>,
     ) -> Result<Self, String> {
         if measures.is_empty() {
             return Err("measures must not be empty".into());
@@ -44,12 +46,14 @@ impl QueryContext {
             limit,
             offset: offset.unwrap_or(0),
             use_pre_agg: use_pre_agg.unwrap_or(true),
+            pre_agg_valid_secs,
         })
     }
 
     pub(crate) fn stub() -> Self {
         QueryContext::new(
             vec!["_stub".into()],
+            None,
             None,
             None,
             None,
@@ -171,6 +175,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(qc.measures, vec!["revenue"]);
@@ -181,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_empty_measures_rejected() {
-        let result = QueryContext::new(vec![], None, None, None, None, None, None, None);
+        let result = QueryContext::new(vec![], None, None, None, None, None, None, None, None);
         assert!(result.is_err());
     }
 
@@ -194,6 +199,7 @@ mod tests {
             None,
             None,
             Some(0),
+            None,
             None,
             None,
         );
@@ -227,6 +233,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let measures = vec![make_measure_meta("revenue", &["revenue"])];
@@ -237,6 +244,7 @@ mod tests {
     fn test_validate_unknown_measure() {
         let qc = QueryContext::new(
             vec!["unknown".into()],
+            None,
             None,
             None,
             None,
@@ -262,6 +270,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let measures = vec![make_measure_meta("revenue", &["revenue"])];
@@ -275,6 +284,7 @@ mod tests {
         let qc = QueryContext::new(
             vec!["revenue".into()],
             Some(filters),
+            None,
             None,
             None,
             None,
@@ -301,6 +311,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let measures = vec![make_measure_meta("revenue", &["revenue"])];
@@ -317,6 +328,7 @@ mod tests {
             None,
             Some(vec!["orders.region".into()]),
             Some(havings),
+            None,
             None,
             None,
             None,
@@ -338,6 +350,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let measures = vec![make_measure_meta("revenue", &["revenue"])];
@@ -353,6 +366,7 @@ mod tests {
             Some(vec!["orders.region".into()]),
             None,
             Some(vec![("nonexistent".into(), "asc".into())]),
+            None,
             None,
             None,
             None,
@@ -380,6 +394,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let cols = qc.filter_columns();
@@ -397,6 +412,7 @@ mod tests {
         let qc = QueryContext::new(
             vec!["revenue".into()],
             Some(filters),
+            None,
             None,
             None,
             None,
