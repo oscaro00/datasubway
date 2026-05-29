@@ -456,7 +456,7 @@ impl DataModel {
         use_pre_agg: bool,
         pre_agg_valid_secs: Option<u64>,
     ) -> LazyFrameWrapper {
-        if use_pre_agg {
+        if use_pre_agg & !agg_cols.is_empty() {
             if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, self.pre_agg_path.as_deref()) {
                 let non_agg_vec: Vec<String> = non_agg_cols.iter().map(|s| s.to_string()).collect();
 
