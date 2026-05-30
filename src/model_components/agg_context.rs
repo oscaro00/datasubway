@@ -4,7 +4,7 @@ use crate::column_expressions::filter_expr::extract_filter_cols;
 use crate::model_components::measures::MeasureMetadata;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryContext {
+pub struct AggContext {
     pub measures: Vec<String>,
     pub filters: serde_json::Value,
     pub groups: Vec<String>,
@@ -16,7 +16,7 @@ pub struct QueryContext {
     pub pre_agg_valid_secs: Option<u64>,
 }
 
-impl QueryContext {
+impl AggContext {
     pub fn new(
         measures: Vec<String>,
         filters: Option<serde_json::Value>,
@@ -37,7 +37,7 @@ impl QueryContext {
             return Err("limit must be > 0".into());
         }
 
-        Ok(QueryContext {
+        Ok(AggContext {
             measures,
             filters: filters.unwrap_or(serde_json::Value::Object(Default::default())),
             groups: groups.unwrap_or_default(),
@@ -51,7 +51,7 @@ impl QueryContext {
     }
 
     pub(crate) fn stub() -> Self {
-        QueryContext::new(
+        AggContext::new(
             vec!["_stub".into()],
             None,
             None,
@@ -75,14 +75,6 @@ impl QueryContext {
         extract_filter_cols(&self.havings)
     }
 
-    /// Validate the QueryContext against the data model's metadata.
-    ///
-    /// Checks:
-    /// - All measures are known
-    /// - All group columns exist in the model
-    /// - All filter columns exist in the model
-    /// - All having columns are valid (group cols or measure output cols)
-    /// - All sort columns are valid and directions are "asc"/"desc"
     pub fn validate(
         &self,
         known_measures: &[MeasureMetadata],
@@ -93,21 +85,18 @@ impl QueryContext {
             .map(|m| (m.name.as_str(), m))
             .collect();
 
-        // Check measures exist
         for m in &self.measures {
             if !measure_map.contains_key(m.as_str()) {
                 return Err(format!("Unknown measure: '{}'", m));
             }
         }
 
-        // Check group columns exist
         for g in &self.groups {
             if !all_columns.contains(g) {
                 return Err(format!("Unknown group column: '{}'", g));
             }
         }
 
-        // Check filter columns exist
         let filter_cols = self.filter_columns();
         for fc in &filter_cols {
             if !all_columns.contains(fc) {
@@ -115,7 +104,6 @@ impl QueryContext {
             }
         }
 
-        // Build valid having columns: groups + measure output columns
         let mut valid_having_cols: std::collections::HashSet<String> =
             self.groups.iter().cloned().collect();
         for m in &self.measures {
@@ -126,7 +114,6 @@ impl QueryContext {
             }
         }
 
-        // Check having columns
         let having_cols = self.having_columns();
         for hc in &having_cols {
             if !valid_having_cols.contains(hc) {
@@ -134,7 +121,6 @@ impl QueryContext {
             }
         }
 
-        // Check sort columns and directions
         let valid_sort_cols = &valid_having_cols;
         for (col, direction) in &self.sorts {
             if !valid_sort_cols.contains(col) {
@@ -156,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_basic_creation() {
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             None,
@@ -176,13 +162,13 @@ mod tests {
 
     #[test]
     fn test_empty_measures_rejected() {
-        let result = QueryContext::new(vec![], None, None, None, None, None, None, None, None);
+        let result = AggContext::new(vec![], None, None, None, None, None, None, None, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_zero_limit_rejected() {
-        let result = QueryContext::new(
+        let result = AggContext::new(
             vec!["revenue".into()],
             None,
             None,
@@ -214,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_validate_ok() {
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -232,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_measure() {
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["unknown".into()],
             None,
             None,
@@ -251,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_group_column() {
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.nonexistent".into()]),
@@ -271,7 +257,7 @@ mod tests {
     #[test]
     fn test_validate_unknown_filter_column() {
         let filters = json!({"and": [{"left": {"col": "orders.nonexistent"}, "op": "=", "right": {"lit": "US"}}]});
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             Some(filters),
             None,
@@ -292,7 +278,7 @@ mod tests {
     fn test_validate_invalid_having_column() {
         let havings =
             json!({"and": [{"left": {"col": "nonexistent"}, "op": ">", "right": {"lit": 500}}]});
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -313,7 +299,7 @@ mod tests {
     fn test_validate_valid_having_on_measure_output() {
         let havings =
             json!({"and": [{"left": {"col": "revenue"}, "op": ">", "right": {"lit": 500}}]});
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -331,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_sort_direction() {
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -350,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_sort_column() {
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -375,7 +361,7 @@ mod tests {
                 {"left": {"col": "orders.date"},   "op": ">",  "right": {"lit": "2024-01-01"}}
             ]
         });
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             Some(filters),
             None,
@@ -399,7 +385,7 @@ mod tests {
                 {"left": {"col": "orders.amount"}, "op": "<=", "right": {"col": "orders.limit"}}
             ]
         });
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             Some(filters),
             None,

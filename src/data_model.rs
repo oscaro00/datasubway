@@ -13,13 +13,13 @@ use crate::{
         filter_expr::json_to_expr,
     },
     model_components::{
+        agg_context::AggContext,
         joins::JoinHow,
         measures::{
             extract_measure_metadata, validate_measure_structure, Measure, MeasureMetadata,
         },
         pre_aggregations::{agg_expansion, component_col_name, PreAggregation},
-        query_context::QueryContext,
-        view_context::ViewContext,
+        select_context::SelectContext,
     },
     wrappers::polars::{
         lazyframe_recorder::LazyFrameRecorder, lazyframe_wrapper::LazyFrameWrapper,
@@ -40,6 +40,11 @@ impl std::fmt::Debug for DataOutput {
             DataOutput::Explanation(s) => write!(f, "DataOutput::Explanation({:?})", s),
         }
     }
+}
+
+pub enum DataQuery {
+    Agg(AggContext),
+    View(SelectContext),
 }
 
 pub struct DataModel {
@@ -155,7 +160,7 @@ impl DataModel {
     }
 
     fn validate_and_extract_measure(&self, measure: &Measure) -> Result<MeasureMetadata, String> {
-        let stub_qc = QueryContext::stub();
+        let stub_qc = AggContext::stub();
         let recorder = measure.call(self, &stub_qc);
         validate_measure_structure(&recorder)?;
         Ok(extract_measure_metadata(&recorder, &measure.name))
@@ -208,7 +213,7 @@ impl DataModel {
         }
     }
 
-    fn build_combined_frame(&self, qc: &QueryContext) -> Result<LazyFrame, String> {
+    fn build_agg_frame(&self, qc: &AggContext) -> Result<LazyFrame, String> {
         let known_measures: Vec<MeasureMetadata> =
             self.measure_metadata.values().cloned().collect();
         let all_columns: HashSet<String> = self
@@ -279,55 +284,52 @@ impl DataModel {
         Ok(combined.slice(qc.offset as i64, qc.limit as u32))
     }
 
-    #[tracing::instrument(skip(self, qc), fields(measures = ?qc.measures))]
-    pub fn query(&self, qc: &QueryContext, explain: bool) -> Result<DataOutput, String> {
-        let combined = self.build_combined_frame(qc)?;
+    pub fn execute(&self, q: &DataQuery, explain: bool) -> Result<DataOutput, String> {
+        let lf = match q {
+            DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
+            DataQuery::View(ctx) => self.build_select_frame(ctx)?,
+        };
         if tracing::enabled!(tracing::Level::DEBUG) {
-            if let Ok(plan) = combined.clone().explain(true) {
+            if let Ok(plan) = lf.clone().explain(true) {
                 debug!(query_plan = %plan, "polars query plan");
             }
         }
         if explain {
-            combined
-                .explain(true)
+            lf.explain(true)
                 .map(DataOutput::Explanation)
                 .map_err(|e| format!("explain failed: {e}"))
         } else {
-            combined
-                .collect()
+            lf.collect()
                 .map(DataOutput::Data)
-                .map_err(|e| format!("query execution failed: {e}"))
+                .map_err(|e| format!("execution failed: {e}"))
         }
     }
 
     #[cfg(feature = "async")]
-    #[tracing::instrument(skip(self, qc), fields(measures = ?qc.measures))]
-    pub async fn query_async(
-        &self,
-        qc: &QueryContext,
-        explain: bool,
-    ) -> Result<DataOutput, String> {
-        let combined = self.build_combined_frame(qc)?;
+    pub async fn execute_async(&self, q: &DataQuery, explain: bool) -> Result<DataOutput, String> {
+        let lf = match q {
+            DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
+            DataQuery::View(ctx) => self.build_select_frame(ctx)?,
+        };
         if tracing::enabled!(tracing::Level::DEBUG) {
-            if let Ok(plan) = combined.clone().explain(true) {
+            if let Ok(plan) = lf.clone().explain(true) {
                 debug!(query_plan = %plan, "polars query plan");
             }
         }
         if explain {
-            combined
-                .explain(true)
+            lf.explain(true)
                 .map(DataOutput::Explanation)
                 .map_err(|e| format!("explain failed: {e}"))
         } else {
-            tokio::task::spawn_blocking(move || combined.collect())
+            tokio::task::spawn_blocking(move || lf.collect())
                 .await
                 .expect("collect task panicked")
                 .map(DataOutput::Data)
-                .map_err(|e| format!("query execution failed: {e}"))
+                .map_err(|e| format!("execution failed: {e}"))
         }
     }
 
-    fn build_view_frame(&self, vc: &ViewContext) -> Result<LazyFrame, String> {
+    fn build_select_frame(&self, vc: &SelectContext) -> Result<LazyFrame, String> {
         let all_columns: HashSet<String> = self
             .table_schemas
             .values()
@@ -398,25 +400,6 @@ impl DataModel {
         }
 
         Ok(lf.slice(vc.offset as i64, vc.limit as u32))
-    }
-
-    #[tracing::instrument(skip(self, vc), fields(columns = ?vc.columns))]
-    pub fn view(&self, vc: &ViewContext, explain: bool) -> Result<DataOutput, String> {
-        let lf = self.build_view_frame(vc)?;
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            if let Ok(plan) = lf.clone().explain(true) {
-                debug!(query_plan = %plan, "polars query plan");
-            }
-        }
-        if explain {
-            lf.explain(true)
-                .map(DataOutput::Explanation)
-                .map_err(|e| format!("explain failed: {e}"))
-        } else {
-            lf.collect()
-                .map(DataOutput::Data)
-                .map_err(|e| format!("view execution failed: {e}"))
-        }
     }
 
     /// Compute and write parquet files for the named pre-aggregations.
@@ -860,21 +843,18 @@ mod tests {
 
     // ── query() tests ─────────────────────────────────────────────────────────
 
+    use crate::model_components::agg_context::AggContext;
     use crate::model_components::measures::Measure;
-    use crate::model_components::query_context::QueryContext;
     use crate::wrappers::polars::lazyframe_recorder::LazyFrameRecorder;
 
-    // Groups by whatever qc.groups says; aggregates orders.amount (no alias so
-    // output_columns == ["orders.amount"] which validates correctly).
-    fn revenue_measure<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+    fn revenue_measure<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
         let group_cols: Vec<Expr> = qc.groups.iter().map(|c| col(c.as_str())).collect();
         dm.table("orders")
             .group_by(group_cols)
             .agg(vec![col("orders.amount").sum()])
     }
 
-    // Same group-by logic; aggregates orders.count.
-    fn order_count_measure<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+    fn order_count_measure<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
         let group_cols: Vec<Expr> = qc.groups.iter().map(|c| col(c.as_str())).collect();
         dm.table("orders")
             .group_by(group_cols)
@@ -906,7 +886,7 @@ mod tests {
     #[test]
     fn test_query_single_measure() {
         let dm = make_query_dm();
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -918,7 +898,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = match dm.query(&qc, false).unwrap() {
+        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
             DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
@@ -938,7 +918,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_query_async_single_measure() {
         let dm = make_query_dm();
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -950,7 +930,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = match dm.query_async(&qc, false).await.unwrap() {
+        let df = match dm.execute_async(&DataQuery::Agg(qc), false).await.unwrap() {
             DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
@@ -969,7 +949,7 @@ mod tests {
     #[test]
     fn test_query_two_compatible_measures() {
         let dm = make_query_dm();
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into(), "order_count".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -981,7 +961,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = match dm.query(&qc, false).unwrap() {
+        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
             DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
@@ -1006,13 +986,13 @@ mod tests {
             None,
         );
 
-        fn by_region<'a>(dm: &'a DataModel, _qc: &QueryContext) -> LazyFrameRecorder<'a> {
+        fn by_region<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
             dm.table("orders")
                 .group_by(vec![col("orders.region")])
                 .agg(vec![col("orders.amount").sum()])
         }
 
-        fn by_date<'a>(dm: &'a DataModel, _qc: &QueryContext) -> LazyFrameRecorder<'a> {
+        fn by_date<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
             dm.table("orders")
                 .group_by(vec![col("orders.date")])
                 .agg(vec![col("orders.amount").sum()])
@@ -1022,7 +1002,7 @@ mod tests {
         dm.add_measure(Measure::new("alt_revenue", by_date))
             .unwrap();
 
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into(), "alt_revenue".into()],
             None,
             None,
@@ -1034,7 +1014,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let err = dm.query(&qc, false).unwrap_err();
+        let err = dm.execute(&DataQuery::Agg(qc), false).unwrap_err();
         assert!(
             err.contains("incompatible"),
             "expected incompatible error, got: {err}"
@@ -1050,7 +1030,7 @@ mod tests {
             "op": ">",
             "right": {"lit": 300.0}
         });
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -1062,7 +1042,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = match dm.query(&qc, false).unwrap() {
+        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
             DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
@@ -1080,7 +1060,7 @@ mod tests {
     #[test]
     fn test_query_with_sort() {
         let dm = make_query_dm();
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -1092,7 +1072,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = match dm.query(&qc, false).unwrap() {
+        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
             DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
@@ -1110,7 +1090,7 @@ mod tests {
     #[test]
     fn test_query_limit_offset() {
         let dm = make_query_dm();
-        let qc = QueryContext::new(
+        let qc = AggContext::new(
             vec!["revenue".into()],
             None,
             Some(vec!["orders.region".into()]),
@@ -1122,7 +1102,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let df = match dm.query(&qc, false).unwrap() {
+        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
             DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };

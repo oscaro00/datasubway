@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::column_expressions::filter_expr::extract_filter_cols;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ViewContext {
+pub struct SelectContext {
     pub columns: Vec<String>,
     pub filters: serde_json::Value,
     pub sorts: Vec<(String, String)>,
@@ -11,7 +11,7 @@ pub struct ViewContext {
     pub offset: usize,
 }
 
-impl ViewContext {
+impl SelectContext {
     pub fn new(
         columns: Vec<String>,
         filters: Option<serde_json::Value>,
@@ -28,7 +28,7 @@ impl ViewContext {
             return Err("limit must be > 0".into());
         }
 
-        Ok(ViewContext {
+        Ok(SelectContext {
             columns,
             filters: filters.unwrap_or(serde_json::Value::Object(Default::default())),
             sorts: sorts.unwrap_or_default(),
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn test_basic_creation() {
-        let vc = ViewContext::new(
+        let sc = SelectContext::new(
             vec!["orders.region".into(), "orders.amount".into()],
             None,
             None,
@@ -90,26 +90,26 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(vc.columns, vec!["orders.region", "orders.amount"]);
-        assert_eq!(vc.limit, 10000);
-        assert_eq!(vc.offset, 0);
+        assert_eq!(sc.columns, vec!["orders.region", "orders.amount"]);
+        assert_eq!(sc.limit, 10000);
+        assert_eq!(sc.offset, 0);
     }
 
     #[test]
     fn test_empty_columns_rejected() {
-        let result = ViewContext::new(vec![], None, None, None, None);
+        let result = SelectContext::new(vec![], None, None, None, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_zero_limit_rejected() {
-        let result = ViewContext::new(vec!["orders.region".into()], None, None, Some(0), None);
+        let result = SelectContext::new(vec!["orders.region".into()], None, None, Some(0), None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_ok() {
-        let vc = ViewContext::new(
+        let sc = SelectContext::new(
             vec!["orders.region".into(), "orders.amount".into()],
             None,
             None,
@@ -117,21 +117,21 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(vc.validate(&make_all_columns()).is_ok());
+        assert!(sc.validate(&make_all_columns()).is_ok());
     }
 
     #[test]
     fn test_validate_unknown_column() {
-        let vc =
-            ViewContext::new(vec!["orders.nonexistent".into()], None, None, None, None).unwrap();
-        let err = vc.validate(&make_all_columns()).unwrap_err();
+        let sc =
+            SelectContext::new(vec!["orders.nonexistent".into()], None, None, None, None).unwrap();
+        let err = sc.validate(&make_all_columns()).unwrap_err();
         assert!(err.contains("Unknown column"));
     }
 
     #[test]
     fn test_validate_unknown_filter_column() {
         let filters = json!({"and": [{"left": {"col": "orders.nonexistent"}, "op": "=", "right": {"lit": "US"}}]});
-        let vc = ViewContext::new(
+        let sc = SelectContext::new(
             vec!["orders.region".into()],
             Some(filters),
             None,
@@ -139,13 +139,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let err = vc.validate(&make_all_columns()).unwrap_err();
+        let err = sc.validate(&make_all_columns()).unwrap_err();
         assert!(err.contains("Unknown filter column"));
     }
 
     #[test]
     fn test_validate_sort_not_in_columns() {
-        let vc = ViewContext::new(
+        let sc = SelectContext::new(
             vec!["orders.region".into()],
             None,
             Some(vec![("orders.amount".into(), "asc".into())]),
@@ -153,13 +153,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let err = vc.validate(&make_all_columns()).unwrap_err();
+        let err = sc.validate(&make_all_columns()).unwrap_err();
         assert!(err.contains("Sort column not in selected columns"));
     }
 
     #[test]
     fn test_validate_invalid_sort_direction() {
-        let vc = ViewContext::new(
+        let sc = SelectContext::new(
             vec!["orders.region".into()],
             None,
             Some(vec![("orders.region".into(), "up".into())]),
@@ -167,7 +167,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let err = vc.validate(&make_all_columns()).unwrap_err();
+        let err = sc.validate(&make_all_columns()).unwrap_err();
         assert!(err.contains("Invalid sort direction"));
     }
 
@@ -179,7 +179,7 @@ mod tests {
                 {"left": {"col": "orders.date"}, "op": ">", "right": {"lit": "2024-01-01"}}
             ]
         });
-        let vc = ViewContext::new(
+        let sc = SelectContext::new(
             vec!["orders.region".into()],
             Some(filters),
             None,
@@ -187,7 +187,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let cols = vc.filter_columns();
+        let cols = sc.filter_columns();
         assert!(cols.contains(&"orders.region".to_string()));
         assert!(cols.contains(&"orders.date".to_string()));
     }

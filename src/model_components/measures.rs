@@ -1,6 +1,6 @@
 use crate::column_expressions::column_context::AllowExcludeRecord;
 use crate::data_model::DataModel;
-use crate::model_components::query_context::QueryContext;
+use crate::model_components::agg_context::AggContext;
 use crate::wrappers::polars::lazyframe_recorder::{LazyFrameRecorder, LazyOp};
 
 #[derive(Debug, Clone)]
@@ -11,7 +11,7 @@ pub struct MeasureMetadata {
     pub allow_exclude_calls: Vec<AllowExcludeRecord>,
 }
 
-pub type MeasureFn = for<'a> fn(&'a DataModel, &QueryContext) -> LazyFrameRecorder<'a>;
+pub type MeasureFn = for<'a> fn(&'a DataModel, &AggContext) -> LazyFrameRecorder<'a>;
 
 pub struct Measure {
     pub name: String,
@@ -26,7 +26,7 @@ impl Measure {
         }
     }
 
-    pub(crate) fn call<'a>(&self, dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+    pub(crate) fn call<'a>(&self, dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
         (self.func)(dm, qc)
     }
 }
@@ -82,7 +82,7 @@ mod tests {
         DataModel::new(tables, joins, vec![], None)
     }
 
-    fn valid_measure<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+    fn valid_measure<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
         dm.table("orders")
             .group_by(allow(
                 ColumnPattern::OnePattern("orders.*".into()),
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_missing_agg_fails_validation() {
-        fn no_agg<'a>(dm: &'a DataModel, _qc: &QueryContext) -> LazyFrameRecorder<'a> {
+        fn no_agg<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
             dm.table("orders").group_by(vec![col("orders.region")])
         }
         let mut dm = make_dm();
@@ -112,13 +112,13 @@ mod tests {
 
     #[test]
     fn test_wrong_second_to_last_fails_validation() {
-        fn bad_measure<'a>(dm: &'a DataModel, _qc: &QueryContext) -> LazyFrameRecorder<'a> {
+        fn bad_measure<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
             dm.table("orders")
                 .filter(col("orders.amount").gt(lit(0.0f64)))
                 .agg(vec![col("orders.amount").sum()])
         }
         let dm = make_dm();
-        let stub_qc = QueryContext::stub();
+        let stub_qc = AggContext::stub();
         let recorder = bad_measure(&dm, &stub_qc);
         let err = validate_measure_structure(&recorder).unwrap_err();
         assert!(
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_plain_vec_group_by_has_no_records() {
-        fn plain_measure<'a>(dm: &'a DataModel, _qc: &QueryContext) -> LazyFrameRecorder<'a> {
+        fn plain_measure<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
             dm.table("orders")
                 .group_by(vec![col("orders.region")])
                 .agg(vec![col("orders.amount").sum().alias("revenue")])

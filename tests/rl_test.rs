@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use datasubway::column_expressions::column_context::{
     allow, ColumnContext, ColumnInclude, ColumnPattern,
 };
-use datasubway::data_model::{DataModel, DataOutput};
+use datasubway::data_model::{DataModel, DataOutput, DataQuery};
 use datasubway::model_components::{
+    agg_context::AggContext,
     joins::{Join, JoinDirection, JoinGraph, JoinHow},
     measures::Measure,
     pre_aggregations::PreAggregation,
-    query_context::QueryContext,
 };
 use datasubway::wrappers::polars::lazyframe_recorder::LazyFrameRecorder;
 use polars::prelude::*;
@@ -167,7 +167,7 @@ fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
     (dm, tmp)
 }
 
-fn player_goals<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+fn player_goals<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
     dm.table("player_stats")
         .group_by(allow(
             ColumnPattern::OnePattern("*".into()),
@@ -179,7 +179,7 @@ fn player_goals<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'
             .alias("player_stats.goals")])
 }
 
-fn team_goals<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+fn team_goals<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
     dm.table("team_stats")
         .group_by(allow(
             ColumnPattern::OnePattern("*".into()),
@@ -191,7 +191,7 @@ fn team_goals<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a>
             .alias("team_stats.goals")])
 }
 
-fn game_count<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a> {
+fn game_count<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
     dm.table("games")
         .group_by(allow(
             ColumnPattern::OnePattern("*".into()),
@@ -201,8 +201,8 @@ fn game_count<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a>
         .agg(vec![col("games.game_id").count().alias("games.game_count")])
 }
 
-fn dm_query(dm: &DataModel, qc: &QueryContext) -> DataFrame {
-    match dm.query(qc, false).unwrap() {
+fn dm_query(dm: &DataModel, qc: AggContext) -> DataFrame {
+    match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
         DataOutput::Data(df) => df,
         _ => panic!("expected Data"),
     }
@@ -225,7 +225,7 @@ fn sorted_select(df: DataFrame, sort_by: &str, cols: &[&str]) -> DataFrame {
 #[test]
 fn test_player_goals_by_player_name() {
     let dm = build_dm();
-    let qc = QueryContext::new(
+    let qc = AggContext::new(
         vec!["player_goals".to_string()],
         None,
         Some(vec!["players.player_name".to_string()]),
@@ -237,7 +237,7 @@ fn test_player_goals_by_player_name() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, &qc);
+    let actual = dm_query(&dm, qc);
 
     let ps = scan("tests/data_files/player_stats.parquet").select([
         col("player_id").alias("player_stats.player_id"),
@@ -273,7 +273,7 @@ fn test_player_goals_by_player_name() {
 #[test]
 fn test_team_goals_by_team_name() {
     let dm = build_dm();
-    let qc = QueryContext::new(
+    let qc = AggContext::new(
         vec!["team_goals".to_string()],
         None,
         Some(vec!["team_stats.team_name".to_string()]),
@@ -285,7 +285,7 @@ fn test_team_goals_by_team_name() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, &qc);
+    let actual = dm_query(&dm, qc);
 
     let expected = scan("tests/data_files/team_stats.parquet")
         .select([
@@ -311,7 +311,7 @@ fn test_team_goals_by_team_name() {
 #[test]
 fn test_game_count_by_group() {
     let dm = build_dm();
-    let qc = QueryContext::new(
+    let qc = AggContext::new(
         vec!["game_count".to_string()],
         None,
         Some(vec!["groups.group_name".to_string()]),
@@ -323,7 +323,7 @@ fn test_game_count_by_group() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, &qc);
+    let actual = dm_query(&dm, qc);
 
     let games =
         scan("tests/data_files/games.parquet").select([col("game_id").alias("games.game_id")]);
@@ -367,7 +367,7 @@ fn test_game_count_by_group() {
 #[test]
 fn test_player_goals_by_platform() {
     let dm = build_dm();
-    let qc = QueryContext::new(
+    let qc = AggContext::new(
         vec!["player_goals".to_string()],
         None,
         Some(vec!["players.platform".to_string()]),
@@ -379,7 +379,7 @@ fn test_player_goals_by_platform() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, &qc);
+    let actual = dm_query(&dm, qc);
 
     let ps = scan("tests/data_files/player_stats.parquet").select([
         col("player_id").alias("player_stats.player_id"),
@@ -420,7 +420,7 @@ fn test_player_goals_by_platform() {
 #[test]
 fn test_multi_measure_join() {
     let dm = build_dm();
-    let qc = QueryContext::new(
+    let qc = AggContext::new(
         vec!["player_goals".to_string(), "game_count".to_string()],
         None,
         Some(vec!["players.player_name".to_string()]),
@@ -432,7 +432,7 @@ fn test_multi_measure_join() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, &qc);
+    let actual = dm_query(&dm, qc);
 
     let ps = scan("tests/data_files/player_stats.parquet").select([
         col("player_id").alias("player_stats.player_id"),
@@ -516,7 +516,7 @@ fn test_multi_measure_join() {
 #[test]
 fn test_player_goals_and_game_count_by_group() {
     let dm = build_dm();
-    let qc = QueryContext::new(
+    let qc = AggContext::new(
         vec!["player_goals".to_string(), "game_count".to_string()],
         None,
         Some(vec!["groups.group_name".to_string()]),
@@ -528,7 +528,7 @@ fn test_player_goals_and_game_count_by_group() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, &qc);
+    let actual = dm_query(&dm, qc);
 
     // player_goals by group: player_stats -> groups_bridge -> groups
     let ps = scan("tests/data_files/player_stats.parquet").select([
@@ -617,7 +617,7 @@ fn test_player_goals_and_game_count_by_group() {
     );
 }
 
-/// Verify that `use_pre_agg` in QueryContext controls whether the pre-aggregation
+/// Verify that `use_pre_agg` in AggContext controls whether the pre-aggregation
 /// parquet file appears in the query's logical plan.
 #[test]
 fn test_pre_agg_explain_toggle() {
@@ -625,7 +625,7 @@ fn test_pre_agg_explain_toggle() {
 
     // Query grouped by players.player_name — covered by player_goals_by_player pre-agg.
     let make_qc = |use_pre_agg: bool| {
-        QueryContext::new(
+        AggContext::new(
             vec!["player_goals".to_string()],
             None,
             Some(vec!["players.player_name".to_string()]),
@@ -639,11 +639,11 @@ fn test_pre_agg_explain_toggle() {
         .unwrap()
     };
 
-    let explain_with = match dm.query(&make_qc(true), true).unwrap() {
+    let explain_with = match dm.execute(&DataQuery::Agg(make_qc(true)), true).unwrap() {
         DataOutput::Explanation(s) => s,
         _ => panic!("expected Explanation"),
     };
-    let explain_without = match dm.query(&make_qc(false), true).unwrap() {
+    let explain_without = match dm.execute(&DataQuery::Agg(make_qc(false)), true).unwrap() {
         DataOutput::Explanation(s) => s,
         _ => panic!("expected Explanation"),
     };
