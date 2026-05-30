@@ -4,7 +4,7 @@ use tracing::{debug, trace};
 
 use polars::prelude::{
     col, lit, DataFrame, Expr, JoinArgs, JoinType, LazyFrame, PlRefPath, PlSmallStr, Schema,
-    SortMultipleOptions,
+    SortMultipleOptions, UniqueKeepStrategy,
 };
 
 use crate::{
@@ -14,6 +14,7 @@ use crate::{
     },
     model_components::{
         agg_context::AggContext,
+        column_values_context::ColumnValuesContext,
         joins::JoinHow,
         measures::{
             extract_measure_metadata, validate_measure_structure, Measure, MeasureMetadata,
@@ -45,6 +46,7 @@ impl std::fmt::Debug for DataOutput {
 pub enum DataQuery {
     Agg(AggContext),
     View(SelectContext),
+    ColumnValues(ColumnValuesContext),
 }
 
 pub struct DataModel {
@@ -288,6 +290,7 @@ impl DataModel {
         let lf = match q {
             DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
             DataQuery::View(ctx) => self.build_select_frame(ctx)?,
+            DataQuery::ColumnValues(ctx) => self.build_column_values_frame(ctx)?,
         };
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Ok(plan) = lf.clone().explain(true) {
@@ -310,6 +313,7 @@ impl DataModel {
         let lf = match q {
             DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
             DataQuery::View(ctx) => self.build_select_frame(ctx)?,
+            DataQuery::ColumnValues(ctx) => self.build_column_values_frame(ctx)?,
         };
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Ok(plan) = lf.clone().explain(true) {
@@ -666,6 +670,73 @@ impl DataModel {
             lazyframe: lf,
             from_pre_agg: false,
         }
+    }
+
+    fn build_column_values_frame(&self, ctx: &ColumnValuesContext) -> Result<LazyFrame, String> {
+        let (table_name, _) = ctx.column.split_once('.').unwrap();
+
+        if !self.tables.contains_key(table_name) {
+            return Err(format!("unknown table: '{table_name}'"));
+        }
+        let schema = self.table_schemas.get(table_name).unwrap();
+        if !schema
+            .iter_names()
+            .any(|n| n.as_str() == ctx.column.as_str())
+        {
+            return Err(format!("unknown column: '{}'", ctx.column));
+        }
+
+        if ctx.use_pre_agg {
+            if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, self.pre_agg_path.as_deref()) {
+                let mut candidates: Vec<&PreAggregation> = pre_aggs
+                    .iter()
+                    .filter(|pa| pa.group_by.contains(&ctx.column))
+                    .collect();
+                candidates.sort_by_key(|pa| pa.row_count);
+
+                'candidates: for candidate in candidates {
+                    let pre_agg_file = format!("{}/{}.parquet", path, candidate.name);
+
+                    if let Some(max_age_secs) = ctx.pre_agg_valid_secs {
+                        match std::fs::metadata(&pre_agg_file)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                        {
+                            Some(modified) => {
+                                let age = modified.elapsed().unwrap_or(std::time::Duration::MAX);
+                                if age > std::time::Duration::from_secs(max_age_secs) {
+                                    debug!(pre_agg = %candidate.name, "pre-agg too old, trying next candidate");
+                                    continue 'candidates;
+                                }
+                            }
+                            None => {
+                                debug!(pre_agg = %candidate.name, "pre-agg age unknown, trying next candidate");
+                                continue 'candidates;
+                            }
+                        }
+                    }
+
+                    if let Ok(lf) = LazyFrame::scan_parquet(
+                        PlRefPath::from(pre_agg_file.as_str()),
+                        Default::default(),
+                    ) {
+                        debug!(pre_agg = %candidate.name, column = %ctx.column, "using pre-aggregation for column values");
+                        return Ok(lf
+                            .select([col(ctx.column.as_str())])
+                            .unique(None, UniqueKeepStrategy::Any));
+                    }
+                    debug!(pre_agg = %candidate.name, "pre-agg parquet not found, trying next candidate");
+                }
+
+                trace!(column = %ctx.column, "no valid pre-aggregation found, falling back to base table");
+            }
+        }
+
+        debug!(column = %ctx.column, "scanning base table for column values");
+        let lf = self.tables.get(table_name).unwrap().clone();
+        Ok(lf
+            .select([col(ctx.column.as_str())])
+            .unique(None, UniqueKeepStrategy::Any))
     }
 }
 
@@ -1107,5 +1178,65 @@ mod tests {
             _ => panic!("expected Data"),
         };
         assert_eq!(df.height(), 1);
+    }
+
+    // ── get_column_values tests ───────────────────────────────────────────────
+
+    use crate::model_components::column_values_context::ColumnValuesContext;
+
+    fn column_values_df(dm: &DataModel, ctx: ColumnValuesContext) -> DataFrame {
+        match dm.execute(&DataQuery::ColumnValues(ctx), false).unwrap() {
+            DataOutput::Data(df) => df,
+            _ => panic!("expected Data"),
+        }
+    }
+
+    #[test]
+    fn test_column_values_from_base_table() {
+        let dm = make_orders_dm(None, vec![]);
+        let ctx = ColumnValuesContext::new("orders.region".into(), false, None).unwrap();
+        let df = column_values_df(&dm, ctx);
+        assert_eq!(df.height(), 2); // "north" and "south"
+    }
+
+    #[test]
+    fn test_column_values_prefers_pre_agg() {
+        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        let ctx = ColumnValuesContext::new("orders.region".into(), true, None).unwrap();
+        let df = column_values_df(&dm, ctx);
+        assert_eq!(df.height(), 2);
+    }
+
+    #[test]
+    fn test_column_values_falls_back_when_no_pre_agg_covers() {
+        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        // "orders.amount" is aggregated in the pre-agg but not in group_by
+        let ctx = ColumnValuesContext::new("orders.amount".into(), true, None).unwrap();
+        let df = column_values_df(&dm, ctx);
+        // base table has 4 rows, all amounts are distinct
+        assert_eq!(df.height(), 4);
+    }
+
+    #[test]
+    fn test_column_values_stale_pre_agg_falls_back() {
+        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        // max age of 0 seconds: any written file is immediately considered stale
+        let ctx = ColumnValuesContext::new("orders.region".into(), true, Some(0)).unwrap();
+        let df = column_values_df(&dm, ctx);
+        assert_eq!(df.height(), 2);
+    }
+
+    #[test]
+    fn test_column_values_unknown_table() {
+        let dm = make_orders_dm(None, vec![]);
+        let ctx = ColumnValuesContext::new("ghost.col".into(), false, None).unwrap();
+        assert!(dm.execute(&DataQuery::ColumnValues(ctx), false).is_err());
+    }
+
+    #[test]
+    fn test_column_values_unknown_column() {
+        let dm = make_orders_dm(None, vec![]);
+        let ctx = ColumnValuesContext::new("orders.ghost".into(), false, None).unwrap();
+        assert!(dm.execute(&DataQuery::ColumnValues(ctx), false).is_err());
     }
 }
