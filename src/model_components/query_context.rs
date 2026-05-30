@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::column_expressions::filter_expr::{collect_col_names, FilterExpr};
+use crate::column_expressions::filter_expr::extract_filter_cols;
 use crate::model_components::measures::MeasureMetadata;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,24 +65,14 @@ impl QueryContext {
         .expect("stub always valid")
     }
 
-    fn extract_filter_cols(value: &serde_json::Value) -> Vec<String> {
-        if value.is_null() || value.as_object().map_or(false, |m| m.is_empty()) {
-            return Vec::new();
-        }
-        match serde_json::from_value::<FilterExpr>(value.clone()) {
-            Ok(expr) => collect_col_names(&expr),
-            Err(_) => Vec::new(),
-        }
-    }
-
     /// Extract all column references from the filters JSON.
     pub fn filter_columns(&self) -> Vec<String> {
-        Self::extract_filter_cols(&self.filters)
+        extract_filter_cols(&self.filters)
     }
 
     /// Extract all column references from the havings JSON.
     pub fn having_columns(&self) -> Vec<String> {
-        Self::extract_filter_cols(&self.havings)
+        extract_filter_cols(&self.havings)
     }
 
     /// Validate the QueryContext against the data model's metadata.

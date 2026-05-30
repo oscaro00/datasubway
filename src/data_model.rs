@@ -19,6 +19,7 @@ use crate::{
         },
         pre_aggregations::{agg_expansion, component_col_name, PreAggregation},
         query_context::QueryContext,
+        view_context::ViewContext,
     },
     wrappers::polars::{
         lazyframe_recorder::LazyFrameRecorder, lazyframe_wrapper::LazyFrameWrapper,
@@ -27,16 +28,16 @@ use crate::{
 
 use super::model_components::joins::JoinGraph;
 
-pub enum QueryOutput {
+pub enum DataOutput {
     Data(DataFrame),
     Explanation(String),
 }
 
-impl std::fmt::Debug for QueryOutput {
+impl std::fmt::Debug for DataOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QueryOutput::Data(df) => write!(f, "QueryOutput::Data({:?})", df.head(Some(5))),
-            QueryOutput::Explanation(s) => write!(f, "QueryOutput::Explanation({:?})", s),
+            DataOutput::Data(df) => write!(f, "DataOutput::Data({:?})", df.head(Some(5))),
+            DataOutput::Explanation(s) => write!(f, "DataOutput::Explanation({:?})", s),
         }
     }
 }
@@ -279,7 +280,7 @@ impl DataModel {
     }
 
     #[tracing::instrument(skip(self, qc), fields(measures = ?qc.measures))]
-    pub fn query(&self, qc: &QueryContext, explain: bool) -> Result<QueryOutput, String> {
+    pub fn query(&self, qc: &QueryContext, explain: bool) -> Result<DataOutput, String> {
         let combined = self.build_combined_frame(qc)?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Ok(plan) = combined.clone().explain(true) {
@@ -289,12 +290,12 @@ impl DataModel {
         if explain {
             combined
                 .explain(true)
-                .map(QueryOutput::Explanation)
+                .map(DataOutput::Explanation)
                 .map_err(|e| format!("explain failed: {e}"))
         } else {
             combined
                 .collect()
-                .map(QueryOutput::Data)
+                .map(DataOutput::Data)
                 .map_err(|e| format!("query execution failed: {e}"))
         }
     }
@@ -305,7 +306,7 @@ impl DataModel {
         &self,
         qc: &QueryContext,
         explain: bool,
-    ) -> Result<QueryOutput, String> {
+    ) -> Result<DataOutput, String> {
         let combined = self.build_combined_frame(qc)?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Ok(plan) = combined.clone().explain(true) {
@@ -315,14 +316,106 @@ impl DataModel {
         if explain {
             combined
                 .explain(true)
-                .map(QueryOutput::Explanation)
+                .map(DataOutput::Explanation)
                 .map_err(|e| format!("explain failed: {e}"))
         } else {
             tokio::task::spawn_blocking(move || combined.collect())
                 .await
                 .expect("collect task panicked")
-                .map(QueryOutput::Data)
+                .map(DataOutput::Data)
                 .map_err(|e| format!("query execution failed: {e}"))
+        }
+    }
+
+    fn build_view_frame(&self, vc: &ViewContext) -> Result<LazyFrame, String> {
+        let all_columns: HashSet<String> = self
+            .table_schemas
+            .values()
+            .flat_map(|s| s.iter_names().map(|n| n.to_string()))
+            .collect();
+        vc.validate(&all_columns)?;
+
+        // Collect all columns needed for joining: selected + filter columns
+        let mut all_needed: HashSet<PlSmallStr> = vc
+            .columns
+            .iter()
+            .map(|c| PlSmallStr::from(c.as_str()))
+            .collect();
+        for fc in vc.filter_columns() {
+            all_needed.insert(PlSmallStr::from(fc.as_str()));
+        }
+
+        // Determine referenced tables
+        let mut referenced_tables: Vec<String> = all_needed
+            .iter()
+            .filter_map(|c| c.as_str().split_once('.').map(|(t, _)| t.to_string()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        referenced_tables.sort();
+
+        if referenced_tables.is_empty() {
+            return Err("columns must be table-qualified (e.g. table.column)".into());
+        }
+
+        // Find a base table that can reach all others via join graph
+        let base_table = referenced_tables
+            .iter()
+            .find(|candidate| {
+                referenced_tables
+                    .iter()
+                    .all(|t| t == *candidate || self.joins.find_path(candidate, t).is_some())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "no single base table can reach all tables {:?} via join graph",
+                    referenced_tables
+                )
+            })?
+            .clone();
+
+        let mut lf = self
+            .get_table(&base_table, &all_needed, &HashMap::new(), false, None)
+            .lazyframe;
+
+        // Filter before projection so filters can reference non-selected columns
+        if let Some(filter_expr) = json_to_expr(&vc.filters) {
+            lf = lf.filter(filter_expr);
+        }
+
+        // Project to requested columns only
+        let select_exprs: Vec<Expr> = vc.columns.iter().map(|c| col(c.as_str())).collect();
+        lf = lf.select(select_exprs);
+
+        if !vc.sorts.is_empty() {
+            let (sort_cols, descs): (Vec<PlSmallStr>, Vec<bool>) = vc
+                .sorts
+                .iter()
+                .map(|(c, d)| (PlSmallStr::from(c.as_str()), d == "desc"))
+                .unzip();
+            let opts = SortMultipleOptions::default().with_order_descending_multi(descs);
+            lf = lf.sort(sort_cols, opts);
+        }
+
+        Ok(lf.slice(vc.offset as i64, vc.limit as u32))
+    }
+
+    #[tracing::instrument(skip(self, vc), fields(columns = ?vc.columns))]
+    pub fn view(&self, vc: &ViewContext, explain: bool) -> Result<DataOutput, String> {
+        let lf = self.build_view_frame(vc)?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let Ok(plan) = lf.clone().explain(true) {
+                debug!(query_plan = %plan, "polars query plan");
+            }
+        }
+        if explain {
+            lf.explain(true)
+                .map(DataOutput::Explanation)
+                .map_err(|e| format!("explain failed: {e}"))
+        } else {
+            lf.collect()
+                .map(DataOutput::Data)
+                .map_err(|e| format!("view execution failed: {e}"))
         }
     }
 
@@ -826,7 +919,7 @@ mod tests {
         )
         .unwrap();
         let df = match dm.query(&qc, false).unwrap() {
-            QueryOutput::Data(df) => df,
+            DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
         assert_eq!(df.height(), 2);
@@ -858,7 +951,7 @@ mod tests {
         )
         .unwrap();
         let df = match dm.query_async(&qc, false).await.unwrap() {
-            QueryOutput::Data(df) => df,
+            DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
         assert_eq!(df.height(), 2);
@@ -889,7 +982,7 @@ mod tests {
         )
         .unwrap();
         let df = match dm.query(&qc, false).unwrap() {
-            QueryOutput::Data(df) => df,
+            DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
         assert_eq!(df.height(), 2);
@@ -970,7 +1063,7 @@ mod tests {
         )
         .unwrap();
         let df = match dm.query(&qc, false).unwrap() {
-            QueryOutput::Data(df) => df,
+            DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
         let amounts: Vec<f64> = df
@@ -1000,7 +1093,7 @@ mod tests {
         )
         .unwrap();
         let df = match dm.query(&qc, false).unwrap() {
-            QueryOutput::Data(df) => df,
+            DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
         let amounts: Vec<f64> = df
@@ -1030,7 +1123,7 @@ mod tests {
         )
         .unwrap();
         let df = match dm.query(&qc, false).unwrap() {
-            QueryOutput::Data(df) => df,
+            DataOutput::Data(df) => df,
             _ => panic!("expected Data"),
         };
         assert_eq!(df.height(), 1);

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use datasubway::column_expressions::column_context::{
     allow, ColumnContext, ColumnInclude, ColumnPattern,
 };
-use datasubway::data_model::{DataModel, QueryOutput};
+use datasubway::data_model::{DataModel, DataOutput};
 use datasubway::model_components::{
     joins::{Join, JoinDirection, JoinGraph, JoinHow},
     measures::Measure,
@@ -203,7 +203,7 @@ fn game_count<'a>(dm: &'a DataModel, qc: &QueryContext) -> LazyFrameRecorder<'a>
 
 fn dm_query(dm: &DataModel, qc: &QueryContext) -> DataFrame {
     match dm.query(qc, false).unwrap() {
-        QueryOutput::Data(df) => df,
+        DataOutput::Data(df) => df,
         _ => panic!("expected Data"),
     }
 }
@@ -640,11 +640,11 @@ fn test_pre_agg_explain_toggle() {
     };
 
     let explain_with = match dm.query(&make_qc(true), true).unwrap() {
-        QueryOutput::Explanation(s) => s,
+        DataOutput::Explanation(s) => s,
         _ => panic!("expected Explanation"),
     };
     let explain_without = match dm.query(&make_qc(false), true).unwrap() {
-        QueryOutput::Explanation(s) => s,
+        DataOutput::Explanation(s) => s,
         _ => panic!("expected Explanation"),
     };
 

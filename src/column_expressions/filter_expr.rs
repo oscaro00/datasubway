@@ -220,6 +220,17 @@ pub fn json_to_expr(filter: &Value) -> Option<Expr> {
     Some(to_expr(parsed))
 }
 
+/// Extract column names from a raw JSON filter value.
+pub fn extract_filter_cols(value: &serde_json::Value) -> Vec<String> {
+    if value.is_null() || value.as_object().map_or(false, |m| m.is_empty()) {
+        return Vec::new();
+    }
+    match serde_json::from_value::<FilterExpr>(value.clone()) {
+        Ok(expr) => collect_col_names(&expr),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Recursively collect all column names referenced in a FilterExpr.
 pub fn collect_col_names(expr: &FilterExpr) -> Vec<String> {
     match expr {
