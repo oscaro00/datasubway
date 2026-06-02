@@ -1,8 +1,9 @@
-use polars::lazy::dsl::{col, lit, Expr};
+use polars::lazy::dsl::{Expr, col, lit};
 
-use crate::column_expressions::filter_expr::{filter_expr_to_polars, FilterExpr};
+use crate::column_expressions::filter_expr::{FilterExpr, filter_expr_to_polars};
+use serde_json::Value as JsonValue;
 
-use super::column::{validate_table_columns, ReturnKind, TableColumn, TableColumnsReturn};
+use super::column::{ReturnKind, TableColumn, TableColumnsReturn, validate_table_columns};
 
 #[derive(Clone, Debug)]
 pub enum ColumnPattern {
@@ -14,7 +15,8 @@ pub enum ColumnPattern {
 pub enum ColumnContext {
     OneString(String),
     MultipleStrings(Vec<String>),
-    Json(FilterExpr),
+    Expr(FilterExpr),
+    Json(JsonValue),
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +76,9 @@ impl IntoPolarsColsExpr for AllowExcludeResult {
         match self.inner {
             ColumnReturn::Strings(cols) => cols.iter().map(|c| col(c.as_str())).collect(),
             ColumnReturn::PolarsExpr(_) => {
-                panic!("IntoPolarsColsExpr requires a string-context AllowExcludeResult (got PolarsExpr)")
+                panic!(
+                    "IntoPolarsColsExpr requires a string-context AllowExcludeResult (got PolarsExpr)"
+                )
             }
         }
     }
@@ -170,7 +174,7 @@ fn context_to_table_columns(context: ColumnContext) -> Vec<TableColumn> {
             v.iter().map(|s| s.as_str()).collect(),
             ReturnKind::TableColumns,
         ),
-        ColumnContext::Json(_) => unreachable!(),
+        ColumnContext::Expr(_) | ColumnContext::Json(_) => unreachable!(),
     };
     match context_return {
         TableColumnsReturn::TableColumns(v) => v,
@@ -193,37 +197,46 @@ pub fn allow(
     };
 
     let normalized_patterns = normalize_column_pattern(pattern);
-
-    if let ColumnContext::Json(filter_expr) = context {
-        let pattern_owned: Vec<String> = normalized_patterns
-            .iter()
-            .map(|tc| tc.table_column())
-            .collect();
-        let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
-        let expr =
-            filter_expr_to_polars(filter_expr, &all_patterns, true).unwrap_or_else(|| lit(true));
-        return AllowExcludeResult {
-            inner: ColumnReturn::PolarsExpr(expr),
-            record,
-        };
-    }
-
-    let mut allowed_columns = include_to_strings(include);
-
-    let context_vec = context_to_table_columns(context);
-    let mut allowed_context: Vec<String> = context_vec
-        .into_iter()
-        .filter(|c| match_context_pattern(c, &normalized_patterns))
-        .map(|c| c.table_column())
+    let pattern_owned: Vec<String> = normalized_patterns
+        .iter()
+        .map(|tc| tc.table_column())
         .collect();
+    let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
 
-    allowed_columns.append(&mut allowed_context);
-    allowed_columns.sort();
-    allowed_columns.dedup();
-
-    AllowExcludeResult {
-        inner: ColumnReturn::Strings(allowed_columns),
-        record,
+    match context {
+        ColumnContext::Expr(filter_expr) => {
+            let expr = filter_expr_to_polars(filter_expr, &all_patterns, true)
+                .unwrap_or_else(|| lit(true));
+            AllowExcludeResult {
+                inner: ColumnReturn::PolarsExpr(expr),
+                record,
+            }
+        }
+        ColumnContext::Json(json_val) => {
+            let expr = serde_json::from_value::<FilterExpr>(json_val)
+                .ok()
+                .and_then(|fe| filter_expr_to_polars(fe, &all_patterns, true))
+                .unwrap_or_else(|| lit(true));
+            AllowExcludeResult {
+                inner: ColumnReturn::PolarsExpr(expr),
+                record,
+            }
+        }
+        string_context => {
+            let mut allowed_columns = include_to_strings(include);
+            let mut allowed_context: Vec<String> = context_to_table_columns(string_context)
+                .into_iter()
+                .filter(|c| match_context_pattern(c, &normalized_patterns))
+                .map(|c| c.table_column())
+                .collect();
+            allowed_columns.append(&mut allowed_context);
+            allowed_columns.sort();
+            allowed_columns.dedup();
+            AllowExcludeResult {
+                inner: ColumnReturn::Strings(allowed_columns),
+                record,
+            }
+        }
     }
 }
 
@@ -240,37 +253,46 @@ pub fn exclude(
     };
 
     let normalized_patterns = normalize_column_pattern(pattern);
-
-    if let ColumnContext::Json(filter_expr) = context {
-        let pattern_owned: Vec<String> = normalized_patterns
-            .iter()
-            .map(|tc| tc.table_column())
-            .collect();
-        let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
-        let expr =
-            filter_expr_to_polars(filter_expr, &all_patterns, false).unwrap_or_else(|| lit(true));
-        return AllowExcludeResult {
-            inner: ColumnReturn::PolarsExpr(expr),
-            record,
-        };
-    }
-
-    let mut allowed_columns = include_to_strings(include);
-
-    let context_vec = context_to_table_columns(context);
-    let mut excluded_context: Vec<String> = context_vec
-        .into_iter()
-        .filter(|c| !match_context_pattern(c, &normalized_patterns))
-        .map(|c| c.table_column())
+    let pattern_owned: Vec<String> = normalized_patterns
+        .iter()
+        .map(|tc| tc.table_column())
         .collect();
+    let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
 
-    allowed_columns.append(&mut excluded_context);
-    allowed_columns.sort();
-    allowed_columns.dedup();
-
-    AllowExcludeResult {
-        inner: ColumnReturn::Strings(allowed_columns),
-        record,
+    match context {
+        ColumnContext::Expr(filter_expr) => {
+            let expr = filter_expr_to_polars(filter_expr, &all_patterns, false)
+                .unwrap_or_else(|| lit(true));
+            AllowExcludeResult {
+                inner: ColumnReturn::PolarsExpr(expr),
+                record,
+            }
+        }
+        ColumnContext::Json(json_val) => {
+            let expr = serde_json::from_value::<FilterExpr>(json_val)
+                .ok()
+                .and_then(|fe| filter_expr_to_polars(fe, &all_patterns, false))
+                .unwrap_or_else(|| lit(true));
+            AllowExcludeResult {
+                inner: ColumnReturn::PolarsExpr(expr),
+                record,
+            }
+        }
+        string_context => {
+            let mut allowed_columns = include_to_strings(include);
+            let mut excluded_context: Vec<String> = context_to_table_columns(string_context)
+                .into_iter()
+                .filter(|c| !match_context_pattern(c, &normalized_patterns))
+                .map(|c| c.table_column())
+                .collect();
+            allowed_columns.append(&mut excluded_context);
+            allowed_columns.sort();
+            allowed_columns.dedup();
+            AllowExcludeResult {
+                inner: ColumnReturn::Strings(allowed_columns),
+                record,
+            }
+        }
     }
 }
 
@@ -307,7 +329,7 @@ mod tests {
 
         let result = allow(
             ColumnPattern::OnePattern("sales.*".into()),
-            ColumnContext::Json(filter_expr),
+            ColumnContext::Expr(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
         );
 
@@ -342,7 +364,7 @@ mod tests {
 
         let result = allow(
             ColumnPattern::OnePattern("*".into()),
-            ColumnContext::Json(filter_expr),
+            ColumnContext::Expr(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
         );
 
@@ -366,7 +388,7 @@ mod tests {
 
         let result = allow(
             ColumnPattern::OnePattern("sales.*".into()),
-            ColumnContext::Json(filter_expr),
+            ColumnContext::Expr(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
         );
 
@@ -439,7 +461,7 @@ mod tests {
 
         let result = exclude(
             ColumnPattern::OnePattern("date.*".into()),
-            ColumnContext::Json(filter_expr),
+            ColumnContext::Expr(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
         );
 
@@ -461,7 +483,7 @@ mod tests {
 
         let result = exclude(
             ColumnPattern::OnePattern("sales.*".into()),
-            ColumnContext::Json(filter_expr),
+            ColumnContext::Expr(filter_expr),
             ColumnInclude::OneString("sales.amount".into()),
         );
 
