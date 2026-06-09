@@ -107,6 +107,8 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 ## TO DO
 
 - More aggregation algorithms like KLL or t-digest for percentiles
+- Docs
+- Tests
 
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files

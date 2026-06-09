@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace};
 
 use polars::prelude::{
-    col, lit, DataFrame, Expr, JoinArgs, JoinType, LazyFrame, PlRefPath, PlSmallStr, Schema,
-    SortMultipleOptions, UniqueKeepStrategy,
+    col, lit, DataFrame, Expr, JoinArgs, JoinCoalesce, JoinType, LazyFrame, PlRefPath, PlSmallStr,
+    Schema, SortMultipleOptions, UniqueKeepStrategy,
 };
 
 use crate::{
@@ -266,7 +266,12 @@ impl DataModel {
             } else {
                 JoinType::Full
             };
-            combined = combined.join(frame, left_on, right_on, JoinArgs::new(join_type));
+            combined = combined.join(
+                frame,
+                left_on,
+                right_on,
+                JoinArgs::new(join_type).with_coalesce(JoinCoalesce::CoalesceColumns),
+            );
         }
 
         if let Some(having_expr) = json_to_expr(&qc.havings) {
