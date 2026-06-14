@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use datasubway::column_expressions::column_context::{
-    allow, ColumnContext, ColumnInclude, ColumnPattern,
+    ColumnContext, ColumnInclude, ColumnPattern, allow,
 };
 use datasubway::data_model::{DataModel, DataOutput, DataQuery};
 use datasubway::model_components::{
@@ -167,31 +167,31 @@ fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
     (dm, tmp)
 }
 
-fn player_goals<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
+fn player_goals(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
     dm.table("player_stats")
         .group_by(allow(
             ColumnPattern::OnePattern("*".into()),
             ColumnContext::MultipleStrings(qc.groups.clone()),
             ColumnInclude::None,
         ))
-        .agg(vec![col("player_stats.goals")
-            .sum()
-            .alias("player_stats.goals")])
+        .agg(vec![
+            col("player_stats.goals").sum().alias("player_stats.goals"),
+        ])
 }
 
-fn team_goals<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
+fn team_goals(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
     dm.table("team_stats")
         .group_by(allow(
             ColumnPattern::OnePattern("*".into()),
             ColumnContext::MultipleStrings(qc.groups.clone()),
             ColumnInclude::None,
         ))
-        .agg(vec![col("team_stats.goals")
-            .sum()
-            .alias("team_stats.goals")])
+        .agg(vec![
+            col("team_stats.goals").sum().alias("team_stats.goals"),
+        ])
 }
 
-fn game_count<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
+fn game_count(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
     dm.table("games")
         .group_by(allow(
             ColumnPattern::OnePattern("*".into()),

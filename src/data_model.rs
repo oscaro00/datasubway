@@ -1,15 +1,16 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tracing::{debug, trace};
 
 use polars::prelude::{
-    col, lit, DataFrame, Expr, JoinArgs, JoinCoalesce, JoinType, LazyFrame, PlRefPath, PlSmallStr,
-    Schema, SortMultipleOptions, UniqueKeepStrategy,
+    DataFrame, Expr, JoinArgs, JoinCoalesce, JoinType, LazyFrame, PlRefPath, PlSmallStr, Schema,
+    SortMultipleOptions, UniqueKeepStrategy, col, lit,
 };
 
 use crate::{
     column_expressions::{
-        column_context::{allow, exclude, AllowExcludeKind, ColumnReturn},
+        column_context::{AllowExcludeKind, ColumnReturn, allow, exclude},
         filter_expr::json_to_expr,
     },
     model_components::{
@@ -17,9 +18,9 @@ use crate::{
         column_values_context::ColumnValuesContext,
         joins::JoinHow,
         measures::{
-            extract_measure_metadata, validate_measure_structure, Measure, MeasureMetadata,
+            Measure, MeasureMetadata, extract_measure_metadata, validate_measure_structure,
         },
-        pre_aggregations::{agg_expansion, component_col_name, PreAggregation},
+        pre_aggregations::{PreAggregation, agg_expansion, component_col_name},
         select_context::SelectContext,
     },
     wrappers::polars::{
@@ -49,7 +50,7 @@ pub enum DataQuery {
     ColumnValues(ColumnValuesContext),
 }
 
-pub struct DataModel {
+struct DataModelInner {
     tables: HashMap<String, LazyFrame>,
     joins: JoinGraph,
     pub(crate) measures: HashMap<String, Measure>,
@@ -58,6 +59,9 @@ pub struct DataModel {
     pre_agg_path: Option<String>,
     table_schemas: HashMap<String, Schema>,
 }
+
+#[derive(Clone)]
+pub struct DataModel(Arc<DataModelInner>);
 
 impl DataModel {
     pub fn new(
@@ -91,7 +95,7 @@ impl DataModel {
             }
         }
 
-        DataModel {
+        DataModel(Arc::new(DataModelInner {
             tables,
             joins,
             measures: HashMap::new(),
@@ -103,7 +107,7 @@ impl DataModel {
             },
             pre_agg_path,
             table_schemas,
-        }
+        }))
     }
 
     fn prefix_columns_if_needed(table_name: &str, mut lf: LazyFrame) -> LazyFrame {
@@ -124,14 +128,14 @@ impl DataModel {
         lf.rename(existing, new_names, false)
     }
 
-    pub fn table(&self, table_name: &str) -> LazyFrameRecorder<'_> {
+    pub fn table(&self, table_name: &str) -> LazyFrameRecorder {
         assert!(
-            self.tables.contains_key(table_name),
+            self.0.tables.contains_key(table_name),
             "table '{table_name}' not found in DataModel"
         );
         LazyFrameRecorder {
             table_name: table_name.to_string(),
-            data_model: self,
+            data_model: self.clone(),
             lazy_ops: Vec::new(),
             non_agg_cols: HashSet::new(),
             agg_cols: HashMap::new(),
@@ -144,44 +148,44 @@ impl DataModel {
 
     /// Returns the schema for a registered table.
     pub fn table_schema(&self, table_name: &str) -> &Schema {
-        self.table_schemas
+        self.0
+            .table_schemas
             .get(table_name)
             .unwrap_or_else(|| panic!("schema for table '{table_name}' not found"))
     }
 
     /// Register a measure with the DataModel. Validates structure at registration time.
     pub fn add_measure(&mut self, measure: Measure) -> Result<(), String> {
-        if self.measures.contains_key(&measure.name) {
+        if self.0.measures.contains_key(&measure.name) {
             return Err(format!("measure '{}' already registered", measure.name));
         }
         let name = measure.name.clone();
         let metadata = self.validate_and_extract_measure(&measure)?;
-        self.measures.insert(name.clone(), measure);
-        self.measure_metadata.insert(name, metadata);
+        let inner = Arc::get_mut(&mut self.0).expect("DataModel cannot be modified while shared");
+        inner.measures.insert(name.clone(), measure);
+        inner.measure_metadata.insert(name, metadata);
         Ok(())
     }
 
     fn validate_and_extract_measure(&self, measure: &Measure) -> Result<MeasureMetadata, String> {
         let stub_qc = AggContext::stub();
-        let recorder = measure.call(self, &stub_qc);
+        let recorder = measure.call(self, &stub_qc); // clones self into recorder; dropped below
         validate_measure_structure(&recorder)?;
         Ok(extract_measure_metadata(&recorder, &measure.name))
+        // recorder dropped here → Arc refcount returns to 1
     }
 
     /// Returns the metadata for a registered measure, if it exists.
     pub fn measure_metadata(&self, name: &str) -> Option<&MeasureMetadata> {
-        self.measure_metadata.get(name)
+        self.0.measure_metadata.get(name)
     }
 
     /// Returns true if `target` is reachable from `base` via the join graph.
     pub fn can_join(&self, base: &str, target: &str) -> bool {
-        self.joins.find_path(base, target).is_some()
+        self.0.joins.find_path(base, target).is_some()
     }
 
-    fn eval_last_allow_exclude(
-        &self,
-        recorder: &LazyFrameRecorder<'_>,
-    ) -> Result<Vec<String>, String> {
+    fn eval_last_allow_exclude(&self, recorder: &LazyFrameRecorder) -> Result<Vec<String>, String> {
         match recorder.allow_exclude_records.last() {
             None => {
                 let mut cols: Vec<String> = recorder
@@ -217,8 +221,9 @@ impl DataModel {
 
     fn build_agg_frame(&self, qc: &AggContext) -> Result<LazyFrame, String> {
         let known_measures: Vec<MeasureMetadata> =
-            self.measure_metadata.values().cloned().collect();
+            self.0.measure_metadata.values().cloned().collect();
         let all_columns: HashSet<String> = self
+            .0
             .table_schemas
             .values()
             .flat_map(|s| s.iter_names().map(|n| n.to_string()))
@@ -229,7 +234,7 @@ impl DataModel {
         let mut expected_cols: Option<Vec<String>> = None;
 
         for m_name in &qc.measures {
-            let measure = self.measures.get(m_name).unwrap();
+            let measure = self.0.measures.get(m_name).unwrap();
             let mut recorder = measure.call(self, qc);
             recorder.use_pre_agg = qc.use_pre_agg;
             recorder.pre_agg_valid_secs = qc.pre_agg_valid_secs;
@@ -340,6 +345,7 @@ impl DataModel {
 
     fn build_select_frame(&self, vc: &SelectContext) -> Result<LazyFrame, String> {
         let all_columns: HashSet<String> = self
+            .0
             .table_schemas
             .values()
             .flat_map(|s| s.iter_names().map(|n| n.to_string()))
@@ -375,7 +381,7 @@ impl DataModel {
             .find(|candidate| {
                 referenced_tables
                     .iter()
-                    .all(|t| t == *candidate || self.joins.find_path(candidate, t).is_some())
+                    .all(|t| t == *candidate || self.0.joins.find_path(candidate, t).is_some())
             })
             .ok_or_else(|| {
                 format!(
@@ -417,6 +423,7 @@ impl DataModel {
     /// then writes `{pre_agg_path}/{name}.parquet` for each.
     pub fn write_pre_aggs(&self, names: &[&str]) -> Result<(), String> {
         let pre_aggs = self
+            .0
             .pre_aggs
             .as_ref()
             .ok_or("no pre-aggregations registered on this DataModel")?;
@@ -432,6 +439,7 @@ impl DataModel {
 
     fn write_pre_agg(&self, pa: &PreAggregation) -> Result<(), String> {
         let path = self
+            .0
             .pre_agg_path
             .as_deref()
             .ok_or("pre_agg_path not set on DataModel")?;
@@ -455,7 +463,7 @@ impl DataModel {
             .find(|candidate| {
                 referenced_tables
                     .iter()
-                    .all(|t| t == *candidate || self.joins.find_path(candidate, t).is_some())
+                    .all(|t| t == *candidate || self.0.joins.find_path(candidate, t).is_some())
             })
             .ok_or_else(|| {
                 format!(
@@ -467,6 +475,7 @@ impl DataModel {
 
         // --- 3. Build joined LazyFrame ---
         let mut lf = self
+            .0
             .tables
             .get(&base_table)
             .ok_or_else(|| format!("table '{base_table}' not found in DataModel"))?
@@ -476,9 +485,10 @@ impl DataModel {
             if other == &base_table {
                 continue;
             }
-            let join_path = self.joins.find_path(&base_table, other).unwrap();
+            let join_path = self.0.joins.find_path(&base_table, other).unwrap();
             for join in join_path {
                 let right_lf = self
+                    .0
                     .tables
                     .get(&join.right)
                     .ok_or_else(|| format!("table '{}' not found in DataModel", join.right))?
@@ -542,7 +552,8 @@ impl DataModel {
         pre_agg_valid_secs: Option<u64>,
     ) -> LazyFrameWrapper {
         if use_pre_agg & !agg_cols.is_empty() {
-            if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, self.pre_agg_path.as_deref()) {
+            if let (Some(pre_aggs), Some(path)) = (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
+            {
                 let non_agg_vec: Vec<String> = non_agg_cols.iter().map(|s| s.to_string()).collect();
 
                 let agg_map: HashMap<String, HashSet<String>> = agg_cols
@@ -605,6 +616,7 @@ impl DataModel {
 
         debug!(table = %table_name, "scanning base table");
         let mut lf = self
+            .0
             .tables
             .get(table_name)
             .unwrap_or_else(|| panic!("table '{table_name}' not found in DataModel"))
@@ -630,12 +642,13 @@ impl DataModel {
 
         let mut joined: HashSet<String> = HashSet::from([table_name.to_string()]);
         for ext in &external_tables {
-            if let Some(path) = self.joins.find_path(table_name, ext) {
+            if let Some(path) = self.0.joins.find_path(table_name, ext) {
                 for join in path {
                     if joined.contains(&join.right) {
                         continue;
                     }
                     let right_lf = self
+                        .0
                         .tables
                         .get(&join.right)
                         .unwrap_or_else(|| panic!("table '{}' not found in DataModel", join.right))
@@ -680,10 +693,10 @@ impl DataModel {
     fn build_column_values_frame(&self, ctx: &ColumnValuesContext) -> Result<LazyFrame, String> {
         let (table_name, _) = ctx.column.split_once('.').unwrap();
 
-        if !self.tables.contains_key(table_name) {
+        if !self.0.tables.contains_key(table_name) {
             return Err(format!("unknown table: '{table_name}'"));
         }
-        let schema = self.table_schemas.get(table_name).unwrap();
+        let schema = self.0.table_schemas.get(table_name).unwrap();
         if !schema
             .iter_names()
             .any(|n| n.as_str() == ctx.column.as_str())
@@ -692,7 +705,8 @@ impl DataModel {
         }
 
         if ctx.use_pre_agg {
-            if let (Some(pre_aggs), Some(path)) = (&self.pre_aggs, self.pre_agg_path.as_deref()) {
+            if let (Some(pre_aggs), Some(path)) = (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
+            {
                 let mut candidates: Vec<&PreAggregation> = pre_aggs
                     .iter()
                     .filter(|pa| pa.group_by.contains(&ctx.column))
@@ -738,7 +752,7 @@ impl DataModel {
         }
 
         debug!(column = %ctx.column, "scanning base table for column values");
-        let lf = self.tables.get(table_name).unwrap().clone();
+        let lf = self.0.tables.get(table_name).unwrap().clone();
         Ok(lf
             .select([col(ctx.column.as_str())])
             .unique(None, UniqueKeepStrategy::Any))
@@ -923,14 +937,14 @@ mod tests {
     use crate::model_components::measures::Measure;
     use crate::wrappers::polars::lazyframe_recorder::LazyFrameRecorder;
 
-    fn revenue_measure<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
+    fn revenue_measure(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
         let group_cols: Vec<Expr> = qc.groups.iter().map(|c| col(c.as_str())).collect();
         dm.table("orders")
             .group_by(group_cols)
             .agg(vec![col("orders.amount").sum()])
     }
 
-    fn order_count_measure<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
+    fn order_count_measure(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
         let group_cols: Vec<Expr> = qc.groups.iter().map(|c| col(c.as_str())).collect();
         dm.table("orders")
             .group_by(group_cols)
@@ -1062,13 +1076,13 @@ mod tests {
             None,
         );
 
-        fn by_region<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
+        fn by_region(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
             dm.table("orders")
                 .group_by(vec![col("orders.region")])
                 .agg(vec![col("orders.amount").sum()])
         }
 
-        fn by_date<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
+        fn by_date(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
             dm.table("orders")
                 .group_by(vec![col("orders.date")])
                 .agg(vec![col("orders.amount").sum()])

@@ -50,11 +50,7 @@ fn prune_filter_by_tables(expr: Expr, base_table: &str, data_model: &DataModel) 
                     None => true,
                 }
             });
-            if all_reachable {
-                Some(other)
-            } else {
-                None
-            }
+            if all_reachable { Some(other) } else { None }
         }
     }
 }
@@ -82,9 +78,9 @@ pub enum LazyOp {
     Slice(i64, u32),
 }
 
-pub struct LazyFrameRecorder<'a> {
+pub struct LazyFrameRecorder {
     pub table_name: String,
-    pub data_model: &'a DataModel,
+    pub data_model: DataModel,
     pub lazy_ops: Vec<LazyOp>,
     pub non_agg_cols: HashSet<PlSmallStr>,
     pub agg_cols: HashMap<PlSmallStr, Vec<String>>,
@@ -94,12 +90,12 @@ pub struct LazyFrameRecorder<'a> {
     pub allow_exclude_records: Vec<AllowExcludeRecord>,
 }
 
-impl<'a> LazyFrameRecorder<'a> {
+impl LazyFrameRecorder {
     pub fn sort(
         mut self,
         by: impl IntoVec<PlSmallStr>,
         sort_options: SortMultipleOptions,
-    ) -> LazyFrameRecorder<'a> {
+    ) -> LazyFrameRecorder {
         let cols = by.into_vec();
         self.non_agg_cols.extend(cols.iter().cloned());
         self.lazy_ops.push(LazyOp::Sort(cols, sort_options));
@@ -110,7 +106,7 @@ impl<'a> LazyFrameRecorder<'a> {
         mut self,
         by: Vec<Expr>,
         sort_options: SortMultipleOptions,
-    ) -> LazyFrameRecorder<'a> {
+    ) -> LazyFrameRecorder {
         for expr in &by {
             self.non_agg_cols.extend(expr.clone().meta().root_names());
         }
@@ -118,9 +114,9 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn remove(mut self, predicate: impl IntoFilterExpr) -> LazyFrameRecorder<'a> {
+    pub fn remove(mut self, predicate: impl IntoFilterExpr) -> LazyFrameRecorder {
         if let Some(pred) = predicate.into_filter(&mut self.allow_exclude_records) {
-            if let Some(pruned) = prune_filter_by_tables(pred, &self.table_name, self.data_model) {
+            if let Some(pruned) = prune_filter_by_tables(pred, &self.table_name, &self.data_model) {
                 let cols = pruned.clone().meta().root_names();
                 self.non_agg_cols.extend(cols);
                 self.lazy_ops.push(LazyOp::Remove(pruned));
@@ -129,7 +125,7 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn reverse(mut self) -> LazyFrameRecorder<'a> {
+    pub fn reverse(mut self) -> LazyFrameRecorder {
         self.lazy_ops.push(LazyOp::Reverse);
         self
     }
@@ -139,7 +135,7 @@ impl<'a> LazyFrameRecorder<'a> {
         k: u32,
         by: Vec<Expr>,
         sort_options: SortMultipleOptions,
-    ) -> LazyFrameRecorder<'a> {
+    ) -> LazyFrameRecorder {
         for expr in &by {
             self.non_agg_cols.extend(expr.clone().meta().root_names());
         }
@@ -152,7 +148,7 @@ impl<'a> LazyFrameRecorder<'a> {
         k: u32,
         by: Vec<Expr>,
         sort_options: SortMultipleOptions,
-    ) -> LazyFrameRecorder<'a> {
+    ) -> LazyFrameRecorder {
         for expr in &by {
             self.non_agg_cols.extend(expr.clone().meta().root_names());
         }
@@ -160,9 +156,9 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn filter(mut self, predicate: impl IntoFilterExpr) -> LazyFrameRecorder<'a> {
+    pub fn filter(mut self, predicate: impl IntoFilterExpr) -> LazyFrameRecorder {
         if let Some(pred) = predicate.into_filter(&mut self.allow_exclude_records) {
-            if let Some(pruned) = prune_filter_by_tables(pred, &self.table_name, self.data_model) {
+            if let Some(pruned) = prune_filter_by_tables(pred, &self.table_name, &self.data_model) {
                 let cols = pruned.clone().meta().root_names();
                 self.non_agg_cols.extend(cols);
                 self.lazy_ops.push(LazyOp::Filter(pruned));
@@ -172,7 +168,7 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn with_column(mut self, expr: Expr) -> LazyFrameRecorder<'a> {
+    pub fn with_column(mut self, expr: Expr) -> LazyFrameRecorder {
         let all_root_names = expr.clone().meta().root_names();
         let agg_pairs = extract_agg_exprs(&expr);
 
@@ -195,7 +191,7 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn with_columns(mut self, exprs: Vec<Expr>) -> LazyFrameRecorder<'a> {
+    pub fn with_columns(mut self, exprs: Vec<Expr>) -> LazyFrameRecorder {
         for expr in &exprs {
             let all_root_names = expr.clone().meta().root_names();
             let agg_pairs = extract_agg_exprs(expr);
@@ -219,7 +215,7 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn group_by(mut self, by: impl IntoPolarsColsExpr) -> LazyFrameRecorder<'a> {
+    pub fn group_by(mut self, by: impl IntoPolarsColsExpr) -> LazyFrameRecorder {
         let exprs = by.into_exprs_with_record(&mut self.allow_exclude_records);
         for expr in &exprs {
             self.non_agg_cols.extend(expr.clone().meta().root_names());
@@ -229,7 +225,7 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn agg(mut self, exprs: Vec<Expr>) -> LazyFrameRecorder<'a> {
+    pub fn agg(mut self, exprs: Vec<Expr>) -> LazyFrameRecorder {
         for expr in &exprs {
             let all_root_names = expr.clone().meta().root_names();
             let agg_pairs = extract_agg_exprs(expr);
@@ -261,7 +257,7 @@ impl<'a> LazyFrameRecorder<'a> {
         index_column: Expr,
         group_by: E,
         options: DynamicGroupOptions,
-    ) -> LazyFrameRecorder<'a>
+    ) -> LazyFrameRecorder
     where
         E: AsRef<[Expr]>,
     {
@@ -282,7 +278,7 @@ impl<'a> LazyFrameRecorder<'a> {
         index_column: Expr,
         group_by: E,
         options: RollingGroupOptions,
-    ) -> LazyFrameRecorder<'a>
+    ) -> LazyFrameRecorder
     where
         E: AsRef<[Expr]>,
     {
@@ -297,12 +293,12 @@ impl<'a> LazyFrameRecorder<'a> {
         self
     }
 
-    pub fn slice(mut self, offset: i64, len: u32) -> LazyFrameRecorder<'a> {
+    pub fn slice(mut self, offset: i64, len: u32) -> LazyFrameRecorder {
         self.lazy_ops.push(LazyOp::Slice(offset, len));
         self
     }
 
-    pub fn limit(mut self, n: u32) -> LazyFrameRecorder<'a> {
+    pub fn limit(mut self, n: u32) -> LazyFrameRecorder {
         self.lazy_ops.push(LazyOp::Limit(n));
         self
     }
@@ -420,7 +416,7 @@ mod tests {
         )
     }
 
-    fn filter_ops(recorder: LazyFrameRecorder<'_>) -> Vec<Expr> {
+    fn filter_ops(recorder: LazyFrameRecorder) -> Vec<Expr> {
         recorder
             .lazy_ops
             .into_iter()

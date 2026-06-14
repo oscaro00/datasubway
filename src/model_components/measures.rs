@@ -11,7 +11,7 @@ pub struct MeasureMetadata {
     pub allow_exclude_calls: Vec<AllowExcludeRecord>,
 }
 
-pub type MeasureFn = for<'a> fn(&'a DataModel, &AggContext) -> LazyFrameRecorder<'a>;
+pub type MeasureFn = fn(&DataModel, &AggContext) -> LazyFrameRecorder;
 
 pub struct Measure {
     pub name: String,
@@ -26,7 +26,7 @@ impl Measure {
         }
     }
 
-    pub(crate) fn call<'a>(&self, dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
+    pub(crate) fn call(&self, dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
         (self.func)(dm, qc)
     }
 }
@@ -62,7 +62,7 @@ pub fn extract_measure_metadata(recorder: &LazyFrameRecorder, name: &str) -> Mea
 mod tests {
     use super::*;
     use crate::column_expressions::column_context::{
-        allow, ColumnContext, ColumnInclude, ColumnPattern,
+        ColumnContext, ColumnInclude, ColumnPattern, allow,
     };
     use crate::model_components::joins::JoinGraph;
     use polars::prelude::*;
@@ -82,7 +82,7 @@ mod tests {
         DataModel::new(tables, joins, vec![], None)
     }
 
-    fn valid_measure<'a>(dm: &'a DataModel, qc: &AggContext) -> LazyFrameRecorder<'a> {
+    fn valid_measure(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
         dm.table("orders")
             .group_by(allow(
                 ColumnPattern::OnePattern("orders.*".into()),
@@ -95,14 +95,15 @@ mod tests {
     #[test]
     fn test_valid_measure_passes_validation() {
         let mut dm = make_dm();
-        assert!(dm
-            .add_measure(Measure::new("revenue", valid_measure))
-            .is_ok());
+        assert!(
+            dm.add_measure(Measure::new("revenue", valid_measure))
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_missing_agg_fails_validation() {
-        fn no_agg<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
+        fn no_agg(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
             dm.table("orders").group_by(vec![col("orders.region")])
         }
         let mut dm = make_dm();
@@ -112,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_wrong_second_to_last_fails_validation() {
-        fn bad_measure<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
+        fn bad_measure(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
             dm.table("orders")
                 .filter(col("orders.amount").gt(lit(0.0f64)))
                 .agg(vec![col("orders.amount").sum()])
@@ -149,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_plain_vec_group_by_has_no_records() {
-        fn plain_measure<'a>(dm: &'a DataModel, _qc: &AggContext) -> LazyFrameRecorder<'a> {
+        fn plain_measure(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
             dm.table("orders")
                 .group_by(vec![col("orders.region")])
                 .agg(vec![col("orders.amount").sum().alias("revenue")])
