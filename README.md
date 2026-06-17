@@ -110,10 +110,16 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 - Docs
 - Tests
 - Figure out logic for:
-  - with_columns()
-  - join()
-  - Ducklake for atomic pre aggregation updates?
-  - Aliases generally
+  - with_columns() - should make a measure ineligible for pre aggregations
+  - join() 
+    - method chains should end in .build() to return a LazyFrame
+    - join() should be a wrapper method like the other wrappers
+    - like with_columns(), a method chain should become ineligible for pre aggregations
+  - Aliases generally - need to construct a tree/map to track column/aliases/agg functions throughout a measure
+    - A map should be enough since expressions merging multiple columns should not be allowed
+  - Expressions in agg() should only be allowed to be col().agg_fn().round()?.alias()?; anything more complex leads to issues (like a case() statement)
+  - Ducklake for atomic pre aggregation updates
+  - Grafeo for join network (validates acyclic, and only one path between tables)
 
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
@@ -121,10 +127,11 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
   - Probably makes sense to expose methods from data_model.py that will print this info (leave the UI to users)
 - Roll based access control?
   - Might make more sense for this to be a user implemented feature because it involves auth
-- Add optional AI dependency to get chat bot functionality working
+- Add optional AI dependency to get chat bot functionality working (Cersei?)
 
 ## Known Issues
 
 - Introducing new columns or aliasing existing columns to a new name in a measure can cause pre agg covers() logic to fail
   - Ignoring column names that don't exist in the data model seems like a solution, but you might need to know how aggregations used on the new column are saved with the root column(s)
   - Are the root columns of the new column agg columns or non agg columns?
+  - The real solution is building a map/tree to track columns, aliases, and aggregation functions
