@@ -119,6 +119,7 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
     - A map should be enough since expressions merging multiple columns should not be allowed
   - Expressions in agg() should only be allowed to be col().agg_fn().round()?.alias()?; anything more complex leads to issues (like a case() statement)
   - Ducklake for atomic pre aggregation updates
+    - This avoids the situation where a pre aggregation is being updated while another API thread reads from it
   - Grafeo for join network (validates acyclic, and only one path between tables)
 
 - Benchmark system
