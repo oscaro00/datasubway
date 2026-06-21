@@ -1,6 +1,6 @@
-use polars::lazy::dsl::{Expr, col, lit};
+use datafusion::prelude::{Expr, col, lit};
 
-use crate::column_expressions::filter_expr::{FilterExpr, filter_expr_to_polars};
+use crate::column_expressions::filter_expr::{FilterExpr, filter_expr_to_df};
 use serde_json::Value as JsonValue;
 
 use super::column::{ReturnKind, TableColumn, TableColumnsReturn, validate_table_columns};
@@ -28,7 +28,7 @@ pub enum ColumnInclude {
 
 pub enum ColumnReturn {
     Strings(Vec<String>),
-    PolarsExpr(Expr),
+    Expr(Expr),
 }
 
 // ── AllowExclude metadata ─────────────────────────────────────────────────────
@@ -57,28 +57,26 @@ pub struct AllowExcludeResult {
 
 // ── Traits for generic recorder methods ──────────────────────────────────────
 
-/// Implemented by types that can supply multiple Polars column expressions,
+/// Implemented by types that can supply multiple DataFusion column expressions,
 /// optionally pushing an `AllowExcludeRecord` onto the recorder's log.
-/// Used by `LazyFrameRecorder::group_by()` and similar multi-column methods.
-pub trait IntoPolarsColsExpr {
+/// Used by group_by and similar multi-column methods.
+pub trait IntoColsExpr {
     fn into_exprs_with_record(self, records: &mut Vec<AllowExcludeRecord>) -> Vec<Expr>;
 }
 
-impl IntoPolarsColsExpr for Vec<Expr> {
+impl IntoColsExpr for Vec<Expr> {
     fn into_exprs_with_record(self, _records: &mut Vec<AllowExcludeRecord>) -> Vec<Expr> {
         self
     }
 }
 
-impl IntoPolarsColsExpr for AllowExcludeResult {
+impl IntoColsExpr for AllowExcludeResult {
     fn into_exprs_with_record(self, records: &mut Vec<AllowExcludeRecord>) -> Vec<Expr> {
         records.push(self.record);
         match self.inner {
             ColumnReturn::Strings(cols) => cols.iter().map(|c| col(c.as_str())).collect(),
-            ColumnReturn::PolarsExpr(_) => {
-                panic!(
-                    "IntoPolarsColsExpr requires a string-context AllowExcludeResult (got PolarsExpr)"
-                )
+            ColumnReturn::Expr(_) => {
+                panic!("IntoColsExpr requires a string-context AllowExcludeResult (got Expr)")
             }
         }
     }
@@ -107,7 +105,7 @@ impl IntoFilterExpr for AllowExcludeResult {
     fn into_filter(self, records: &mut Vec<AllowExcludeRecord>) -> Option<Expr> {
         records.push(self.record);
         match self.inner {
-            ColumnReturn::PolarsExpr(e) => Some(e),
+            ColumnReturn::Expr(e) => Some(e),
             ColumnReturn::Strings(_) => {
                 panic!("IntoFilterExpr requires a JSON-context AllowExcludeResult (got Strings)")
             }
@@ -205,20 +203,20 @@ pub fn allow(
 
     match context {
         ColumnContext::Expr(filter_expr) => {
-            let expr = filter_expr_to_polars(filter_expr, &all_patterns, true)
-                .unwrap_or_else(|| lit(true));
+            let expr =
+                filter_expr_to_df(filter_expr, &all_patterns, true).unwrap_or_else(|| lit(true));
             AllowExcludeResult {
-                inner: ColumnReturn::PolarsExpr(expr),
+                inner: ColumnReturn::Expr(expr),
                 record,
             }
         }
         ColumnContext::Json(json_val) => {
             let expr = serde_json::from_value::<FilterExpr>(json_val)
                 .ok()
-                .and_then(|fe| filter_expr_to_polars(fe, &all_patterns, true))
+                .and_then(|fe| filter_expr_to_df(fe, &all_patterns, true))
                 .unwrap_or_else(|| lit(true));
             AllowExcludeResult {
-                inner: ColumnReturn::PolarsExpr(expr),
+                inner: ColumnReturn::Expr(expr),
                 record,
             }
         }
@@ -261,20 +259,20 @@ pub fn exclude(
 
     match context {
         ColumnContext::Expr(filter_expr) => {
-            let expr = filter_expr_to_polars(filter_expr, &all_patterns, false)
-                .unwrap_or_else(|| lit(true));
+            let expr =
+                filter_expr_to_df(filter_expr, &all_patterns, false).unwrap_or_else(|| lit(true));
             AllowExcludeResult {
-                inner: ColumnReturn::PolarsExpr(expr),
+                inner: ColumnReturn::Expr(expr),
                 record,
             }
         }
         ColumnContext::Json(json_val) => {
             let expr = serde_json::from_value::<FilterExpr>(json_val)
                 .ok()
-                .and_then(|fe| filter_expr_to_polars(fe, &all_patterns, false))
+                .and_then(|fe| filter_expr_to_df(fe, &all_patterns, false))
                 .unwrap_or_else(|| lit(true));
             AllowExcludeResult {
-                inner: ColumnReturn::PolarsExpr(expr),
+                inner: ColumnReturn::Expr(expr),
                 record,
             }
         }
@@ -301,7 +299,7 @@ pub fn exclude(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polars::lazy::dsl::{col, lit};
+    use datafusion::prelude::{col, lit};
     #[test]
     fn test_json_context_prunes_non_matching_columns() {
         let filter_expr = FilterExpr::And {
@@ -334,7 +332,7 @@ mod tests {
         );
 
         let expected = col("sales.amount").gt(lit(0i64));
-        assert!(matches!(result.inner, ColumnReturn::PolarsExpr(ref e) if e == &expected));
+        assert!(matches!(result.inner, ColumnReturn::Expr(ref e) if e == &expected));
     }
 
     #[test]
@@ -371,7 +369,7 @@ mod tests {
         let expected = col("sales.amount")
             .gt(lit(0i64))
             .and(col("date.year").gt(lit(2020i64)));
-        assert!(matches!(result.inner, ColumnReturn::PolarsExpr(ref e) if e == &expected));
+        assert!(matches!(result.inner, ColumnReturn::Expr(ref e) if e == &expected));
     }
 
     #[test]
@@ -392,7 +390,7 @@ mod tests {
             ColumnInclude::OneString("sales.amount".into()),
         );
 
-        assert!(matches!(result.inner, ColumnReturn::PolarsExpr(ref e) if e == &lit(true)));
+        assert!(matches!(result.inner, ColumnReturn::Expr(ref e) if e == &lit(true)));
     }
 
     #[test]
@@ -466,7 +464,7 @@ mod tests {
         );
 
         let expected = col("sales.amount").gt(lit(0i64));
-        assert!(matches!(result.inner, ColumnReturn::PolarsExpr(ref e) if e == &expected));
+        assert!(matches!(result.inner, ColumnReturn::Expr(ref e) if e == &expected));
     }
 
     #[test]
@@ -487,6 +485,6 @@ mod tests {
             ColumnInclude::OneString("sales.amount".into()),
         );
 
-        assert!(matches!(result.inner, ColumnReturn::PolarsExpr(ref e) if e == &lit(true)));
+        assert!(matches!(result.inner, ColumnReturn::Expr(ref e) if e == &lit(true)));
     }
 }

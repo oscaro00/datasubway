@@ -7,9 +7,7 @@ use super::super::super::data_model::DataModel;
 use super::agg_expr_parser::extract_agg_exprs;
 use super::lazyframe_wrapper::LazyFrameWrapper;
 use super::lazygroupby_wrapper::LazyGroupByWrapper;
-use crate::column_expressions::column_context::{
-    AllowExcludeRecord, IntoFilterExpr, IntoPolarsColsExpr,
-};
+use crate::column_expressions::column_context::{AllowExcludeRecord, IntoColsExpr, IntoFilterExpr};
 
 fn prune_filter_by_tables(expr: Expr, base_table: &str, data_model: &DataModel) -> Option<Expr> {
     match expr {
@@ -215,7 +213,7 @@ impl LazyFrameRecorder {
         self
     }
 
-    pub fn group_by(mut self, by: impl IntoPolarsColsExpr) -> LazyFrameRecorder {
+    pub fn group_by(mut self, by: impl IntoColsExpr) -> LazyFrameRecorder {
         let exprs = by.into_exprs_with_record(&mut self.allow_exclude_records);
         for expr in &exprs {
             self.non_agg_cols.extend(expr.clone().meta().root_names());

@@ -3,8 +3,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-use polars::lazy::dsl::{col, lit, Expr};
-use polars::prelude::{NamedFrom, Series};
+use datafusion::prelude::{Expr, col, in_list, lit};
 
 use super::column::TableColumn;
 use super::column_context::{match_context_pattern, parse_column_pattern};
@@ -83,11 +82,7 @@ fn col_is_valid(col_name: &str, patterns: &[&str], keep_matching: bool) -> bool 
         .filter_map(|p| parse_column_pattern(p))
         .collect();
     let matches = match_context_pattern(&col_tc, &pattern_tcs);
-    if keep_matching {
-        matches
-    } else {
-        !matches
-    }
+    if keep_matching { matches } else { !matches }
 }
 
 fn prune(expr: FilterExpr, patterns: &[&str], keep_matching: bool) -> Option<FilterExpr> {
@@ -101,11 +96,7 @@ fn prune(expr: FilterExpr, patterns: &[&str], keep_matching: bool) -> Option<Fil
                 Operand::Col { col: name } => col_is_valid(name, patterns, keep_matching),
                 Operand::Lit { .. } => true,
             });
-            if cols_valid {
-                Some(expr)
-            } else {
-                None
-            }
+            if cols_valid { Some(expr) } else { None }
         }
         FilterExpr::And { and } => {
             let children: Vec<_> = and
@@ -132,7 +123,7 @@ fn prune(expr: FilterExpr, patterns: &[&str], keep_matching: bool) -> Option<Fil
     }
 }
 
-fn value_to_lit(value: Value) -> Expr {
+fn value_to_lit_scalar(value: Value) -> Expr {
     match value {
         Value::Bool(b) => lit(b),
         Value::Number(n) => {
@@ -143,29 +134,18 @@ fn value_to_lit(value: Value) -> Expr {
             }
         }
         Value::String(s) => lit(s),
-        Value::Array(arr) if !arr.is_empty() && arr[0].is_string() => {
-            let v: Vec<String> = arr
-                .into_iter()
-                .filter_map(|x| x.as_str().map(str::to_owned))
-                .collect();
-            lit(Series::new("".into(), v))
-        }
-        Value::Array(arr) if !arr.is_empty() && arr[0].as_i64().is_some() => {
-            let v: Vec<i64> = arr.into_iter().filter_map(|x| x.as_i64()).collect();
-            lit(Series::new("".into(), v))
-        }
-        Value::Array(arr) if !arr.is_empty() && arr[0].is_number() => {
-            let v: Vec<f64> = arr.into_iter().filter_map(|x| x.as_f64()).collect();
-            lit(Series::new("".into(), v))
-        }
         _ => lit(false),
     }
+}
+
+fn value_to_lit_list(arr: Vec<Value>) -> Vec<Expr> {
+    arr.into_iter().map(value_to_lit_scalar).collect()
 }
 
 fn operand_to_expr(op: Operand) -> Expr {
     match op {
         Operand::Col { col: name } => col(&name),
-        Operand::Lit { lit: value } => value_to_lit(value),
+        Operand::Lit { lit: value } => value_to_lit_scalar(value),
     }
 }
 
@@ -173,16 +153,31 @@ fn to_expr(expr: FilterExpr) -> Expr {
     match expr {
         FilterExpr::Comparison { left, op, right } => {
             let l = operand_to_expr(left);
-            let r = operand_to_expr(right);
             match op {
-                CompareOp::Eq => l.eq(r),
-                CompareOp::Ne => l.neq(r),
-                CompareOp::Gt => l.gt(r),
-                CompareOp::Gte => l.gt_eq(r),
-                CompareOp::Lt => l.lt(r),
-                CompareOp::Lte => l.lt_eq(r),
-                CompareOp::In => l.is_in(r, false),
-                CompareOp::NotIn => l.is_in(r, false).eq(lit(false)),
+                CompareOp::Eq => l.eq(operand_to_expr(right)),
+                CompareOp::Ne => l.not_eq(operand_to_expr(right)),
+                CompareOp::Gt => l.gt(operand_to_expr(right)),
+                CompareOp::Gte => l.gt_eq(operand_to_expr(right)),
+                CompareOp::Lt => l.lt(operand_to_expr(right)),
+                CompareOp::Lte => l.lt_eq(operand_to_expr(right)),
+                CompareOp::In => {
+                    let list = match right {
+                        Operand::Lit {
+                            lit: Value::Array(arr),
+                        } => value_to_lit_list(arr),
+                        other => vec![operand_to_expr(other)],
+                    };
+                    in_list(l, list, false)
+                }
+                CompareOp::NotIn => {
+                    let list = match right {
+                        Operand::Lit {
+                            lit: Value::Array(arr),
+                        } => value_to_lit_list(arr),
+                        other => vec![operand_to_expr(other)],
+                    };
+                    in_list(l, list, true)
+                }
             }
         }
         FilterExpr::And { and } => and
@@ -194,7 +189,7 @@ fn to_expr(expr: FilterExpr) -> Expr {
     }
 }
 
-pub(crate) fn filter_expr_to_polars(
+pub(crate) fn filter_expr_to_df(
     expr: FilterExpr,
     patterns: &[&str],
     keep_matching: bool,
@@ -209,7 +204,7 @@ pub fn filter_to_expr(filter: &Value, patterns: &[&str]) -> Option<Expr> {
     Some(to_expr(pruned))
 }
 
-/// Convert a JSON filter value directly to a polars Expr without schema-based pruning.
+/// Convert a JSON filter value directly to a DataFusion Expr without schema-based pruning.
 /// Use this for post-aggregation filters (havings) where columns may not exist in any
 /// table schema (e.g. measure output column aliases).
 pub fn json_to_expr(filter: &Value) -> Option<Expr> {
@@ -249,8 +244,7 @@ pub fn collect_col_names(expr: &FilterExpr) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polars::lazy::dsl::{col, lit};
-    use polars::prelude::{NamedFrom, Series};
+    use datafusion::prelude::{col, in_list, lit};
     use serde_json::json;
 
     #[test]
@@ -274,14 +268,7 @@ mod tests {
         let patterns = &["geography.*", "date.year", "sales.*"];
         let result = filter_to_expr(&filter, patterns);
 
-        let expected = col("geography.state")
-            .is_in(
-                lit(Series::new(
-                    "".into(),
-                    vec!["MN".to_string(), "WI".to_string()],
-                )),
-                false,
-            )
+        let expected = in_list(col("geography.state"), vec![lit("MN"), lit("WI")], false)
             .and(col("date.year").gt(lit(2024i64)))
             .and(col("sales.ty_sales").lt_eq(col("sales.ly_sales")));
 
@@ -300,7 +287,6 @@ mod tests {
         let patterns = &["sales.*"];
         let result = filter_to_expr(&filter, patterns);
 
-        // "unknown.col" doesn't match "sales.*" so it's pruned
         let expected = col("sales.ty_sales").gt(lit(0i64));
         assert_eq!(result, Some(expected));
     }
