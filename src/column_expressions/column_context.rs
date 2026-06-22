@@ -1,17 +1,18 @@
 use datafusion::prelude::{Expr, col, lit};
+use serde::{Deserialize, Serialize};
 
 use crate::column_expressions::filter_expr::{FilterExpr, filter_expr_to_df};
 use serde_json::Value as JsonValue;
 
 use super::column::{ReturnKind, TableColumn, TableColumnsReturn, validate_table_columns};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ColumnPattern {
     OnePattern(String),
     MultiplePatterns(Vec<String>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ColumnContext {
     OneString(String),
     MultipleStrings(Vec<String>),
@@ -19,7 +20,7 @@ pub enum ColumnContext {
     Json(JsonValue),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ColumnInclude {
     None,
     OneString(String),
@@ -33,14 +34,14 @@ pub enum ColumnReturn {
 
 // ── AllowExclude metadata ─────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AllowExcludeKind {
     Allow,
     Exclude,
 }
 
 /// Stores the arguments passed to `allow()` or `exclude()` (schema excluded).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AllowExcludeRecord {
     pub kind: AllowExcludeKind,
     pub pattern: ColumnPattern,

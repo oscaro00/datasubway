@@ -1,7 +1,12 @@
-use crate::column_expressions::column_context::AllowExcludeRecord;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::prelude::{DataFrame, Expr};
+
+use crate::column_expressions::column_context::{
+    AllowExcludeKind, AllowExcludeRecord, ColumnReturn, allow, exclude,
+};
 use crate::data_model::DataModel;
 use crate::model_components::agg_context::AggContext;
-use crate::wrappers::polars::lazyframe_recorder::{LazyFrameRecorder, LazyOp};
+use crate::wrappers::datafusion::aggregate_with_metadata::AggregateWithMetadata;
 
 #[derive(Debug, Clone)]
 pub struct MeasureMetadata {
@@ -11,154 +16,149 @@ pub struct MeasureMetadata {
     pub allow_exclude_calls: Vec<AllowExcludeRecord>,
 }
 
-pub type MeasureFn = fn(&DataModel, &AggContext) -> LazyFrameRecorder;
+// ── DataFusion measure types ──────────────────────────────────────────────────
+//
+// The new measure API: user functions return a `DataFrame` (built via
+// `DataFrameRecorder::build()`). Validation and metadata extraction work
+// directly from the logical plan rather than inspecting recorder state.
 
-pub struct Measure {
+/// Measure function returning a DataFusion DataFrame. The function body should
+/// end with `.build(base)` on a `DataFrameRecorder` chain, and that chain must
+/// include exactly one `.aggregate()` call as its terminal operation.
+pub type DfMeasureFn = fn(&DataModel, &AggContext) -> datafusion::common::Result<DataFrame>;
+
+pub struct DfMeasure {
     pub name: String,
-    func: MeasureFn,
+    func: DfMeasureFn,
 }
 
-impl Measure {
-    pub fn new(name: &str, func: MeasureFn) -> Self {
-        Measure {
+impl DfMeasure {
+    pub fn new(name: &str, func: DfMeasureFn) -> Self {
+        DfMeasure {
             name: name.to_string(),
             func,
         }
     }
 
-    pub(crate) fn call(&self, dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
+    pub fn call(&self, dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
         (self.func)(dm, qc)
     }
 }
 
-pub fn validate_measure_structure(recorder: &LazyFrameRecorder) -> Result<(), String> {
-    let ops = &recorder.lazy_ops;
-    if ops.len() < 2 {
-        return Err("measure must contain at least group_by + agg".into());
-    }
-    if !matches!(ops.last(), Some(LazyOp::Agg(_))) {
-        return Err("measure must end with agg()".into());
-    }
-    match &ops[ops.len() - 2] {
-        LazyOp::GroupBy(_) => Ok(()),
-        #[cfg(feature = "dynamic_group_by")]
-        LazyOp::GroupByDynamic(_, _, _) | LazyOp::Rolling(_, _, _) => Ok(()),
+/// A measure is valid iff its logical plan root is an `AggregateWithMetadata`
+/// node — i.e. the chain ended with `.aggregate()`.
+pub fn validate_df_measure_structure(df: &DataFrame) -> Result<(), String> {
+    match df.logical_plan() {
+        LogicalPlan::Extension(e)
+            if e.node
+                .as_any()
+                .downcast_ref::<AggregateWithMetadata>()
+                .is_some() =>
+        {
+            Ok(())
+        }
         _ => Err(
-            "second-to-last operation must be group_by(), group_by_dynamic(), or rolling()".into(),
+            "measure must end with aggregate() (no AggregateWithMetadata node at plan root)".into(),
         ),
     }
 }
 
-pub fn extract_measure_metadata(recorder: &LazyFrameRecorder, name: &str) -> MeasureMetadata {
-    MeasureMetadata {
-        name: name.into(),
-        output_columns: recorder.agg_cols.keys().map(|k| k.to_string()).collect(),
-        aggregate_columns: recorder.agg_cols.keys().map(|k| k.to_string()).collect(),
-        allow_exclude_calls: recorder.allow_exclude_records.clone(),
+/// Extract `MeasureMetadata` by reading the `AggregateWithMetadata` node from
+/// the DataFrame's logical plan. The `allow_exclude` key in the node metadata
+/// holds a JSON-serialized `Vec<AllowExcludeRecord>`.
+pub fn extract_df_measure_metadata(df: &DataFrame, name: &str) -> Result<MeasureMetadata, String> {
+    match df.logical_plan() {
+        LogicalPlan::Extension(e) => {
+            let node = e
+                .node
+                .as_any()
+                .downcast_ref::<AggregateWithMetadata>()
+                .ok_or("plan root is not AggregateWithMetadata")?;
+
+            let allow_exclude_records: Vec<AllowExcludeRecord> = node
+                .metadata
+                .get("allow_exclude")
+                .map(|s| serde_json::from_str(s).unwrap_or_default())
+                .unwrap_or_default();
+
+            let output_columns: Vec<String> = node
+                .aggr_expr
+                .iter()
+                .filter_map(|e| {
+                    if let Expr::Alias(a) = e {
+                        Some(a.name.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            Ok(MeasureMetadata {
+                name: name.into(),
+                output_columns: output_columns.clone(),
+                aggregate_columns: output_columns,
+                allow_exclude_calls: allow_exclude_records,
+            })
+        }
+        _ => Err("expected AggregateWithMetadata at plan root".into()),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::column_expressions::column_context::{
-        ColumnContext, ColumnInclude, ColumnPattern, allow,
+/// Resolve the group-by column names from a freshly-built measure DataFrame.
+/// Reads the `allow_exclude` records embedded in the `AggregateWithMetadata` node
+/// and re-evaluates the last one; falls back to the literal `group_expr` column
+/// names if no allow/exclude calls were recorded.
+pub fn resolve_group_by_cols(df: &DataFrame) -> Result<Vec<String>, String> {
+    let LogicalPlan::Extension(e) = df.logical_plan() else {
+        return Err("measure must end with aggregate()".into());
     };
-    use crate::model_components::joins::JoinGraph;
-    use polars::prelude::*;
-    use std::collections::HashMap;
+    let node = e
+        .node
+        .as_any()
+        .downcast_ref::<AggregateWithMetadata>()
+        .ok_or("expected AggregateWithMetadata at plan root")?;
 
-    fn make_dm() -> DataModel {
-        let orders = df![
-            "orders.id"     => [1i64, 2, 3],
-            "orders.amount" => [100.0f64, 200.0, 150.0],
-            "orders.region" => ["US", "EU", "US"],
-        ]
-        .unwrap()
-        .lazy();
+    let records: Vec<AllowExcludeRecord> = node
+        .metadata
+        .get("allow_exclude")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
 
-        let tables = HashMap::from([("orders".to_string(), orders)]);
-        let joins = JoinGraph::new(&[]).unwrap();
-        DataModel::new(tables, joins, vec![], None)
-    }
-
-    fn valid_measure(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
-        dm.table("orders")
-            .group_by(allow(
-                ColumnPattern::OnePattern("orders.*".into()),
-                ColumnContext::MultipleStrings(qc.groups.clone()),
-                ColumnInclude::OneString("orders.amount".into()),
-            ))
-            .agg(vec![col("orders.amount").sum().alias("revenue")])
-    }
-
-    #[test]
-    fn test_valid_measure_passes_validation() {
-        let mut dm = make_dm();
-        assert!(
-            dm.add_measure(Measure::new("revenue", valid_measure))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_missing_agg_fails_validation() {
-        fn no_agg(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
-            dm.table("orders").group_by(vec![col("orders.region")])
+    match records.last() {
+        None => {
+            let mut cols: Vec<String> = node
+                .group_expr
+                .iter()
+                .filter_map(|e| {
+                    if let Expr::Column(c) = e {
+                        Some(c.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            cols.sort();
+            Ok(cols)
         }
-        let mut dm = make_dm();
-        let err = dm.add_measure(Measure::new("bad", no_agg)).unwrap_err();
-        assert!(err.contains("agg"), "expected agg error, got: {err}");
-    }
-
-    #[test]
-    fn test_wrong_second_to_last_fails_validation() {
-        fn bad_measure(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
-            dm.table("orders")
-                .filter(col("orders.amount").gt(lit(0.0f64)))
-                .agg(vec![col("orders.amount").sum()])
+        Some(record) => {
+            let result = match record.kind {
+                AllowExcludeKind::Allow => allow(
+                    record.pattern.clone(),
+                    record.context.clone(),
+                    record.include.clone(),
+                ),
+                AllowExcludeKind::Exclude => exclude(
+                    record.pattern.clone(),
+                    record.context.clone(),
+                    record.include.clone(),
+                ),
+            };
+            match result.inner {
+                ColumnReturn::Strings(cols) => Ok(cols),
+                ColumnReturn::Expr(_) => {
+                    Err("JSON-context allow/exclude cannot produce group-by column names".into())
+                }
+            }
         }
-        let dm = make_dm();
-        let stub_qc = AggContext::stub();
-        let recorder = bad_measure(&dm, &stub_qc);
-        let err = validate_measure_structure(&recorder).unwrap_err();
-        assert!(
-            err.contains("group_by"),
-            "expected group_by error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_duplicate_name_fails() {
-        let mut dm = make_dm();
-        dm.add_measure(Measure::new("revenue", valid_measure))
-            .unwrap();
-        let err = dm
-            .add_measure(Measure::new("revenue", valid_measure))
-            .unwrap_err();
-        assert!(err.contains("already registered"));
-    }
-
-    #[test]
-    fn test_allow_in_group_by_populates_records() {
-        let mut dm = make_dm();
-        dm.add_measure(Measure::new("revenue", valid_measure))
-            .unwrap();
-        let meta = dm.measure_metadata("revenue").unwrap();
-        assert!(!meta.allow_exclude_calls.is_empty());
-    }
-
-    #[test]
-    fn test_plain_vec_group_by_has_no_records() {
-        fn plain_measure(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
-            dm.table("orders")
-                .group_by(vec![col("orders.region")])
-                .agg(vec![col("orders.amount").sum().alias("revenue")])
-        }
-        let mut dm = make_dm();
-        dm.add_measure(Measure::new("plain", plain_measure))
-            .unwrap();
-        let meta = dm.measure_metadata("plain").unwrap();
-        assert!(meta.allow_exclude_calls.is_empty());
     }
 }

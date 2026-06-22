@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use datafusion::prelude::{Expr, col, in_list, lit};
@@ -8,7 +8,7 @@ use datafusion::prelude::{Expr, col, in_list, lit};
 use super::column::TableColumn;
 use super::column_context::{match_context_pattern, parse_column_pattern};
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum FilterExpr {
     And {
@@ -24,7 +24,7 @@ pub enum FilterExpr {
     },
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum Operand {
     Col { col: String },
@@ -41,6 +41,22 @@ pub enum CompareOp {
     Lte,
     In,
     NotIn,
+}
+
+impl Serialize for CompareOp {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let str_val = match self {
+            CompareOp::Eq => "eq",
+            CompareOp::Ne => "ne",
+            CompareOp::Gt => "gt",
+            CompareOp::Gte => "gte",
+            CompareOp::Lt => "lt",
+            CompareOp::Lte => "lte",
+            CompareOp::In => "in",
+            CompareOp::NotIn => "not_in",
+        };
+        s.serialize_str(str_val)
+    }
 }
 
 impl<'de> Deserialize<'de> for CompareOp {

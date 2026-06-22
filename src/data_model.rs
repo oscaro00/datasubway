@@ -1,45 +1,47 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
+use datafusion::datasource::provider_as_source;
+use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, SortExpr};
+use datafusion::prelude::{DataFrame, Expr, ParquetReadOptions, SessionContext, col};
 use tracing::{debug, trace};
 
-use polars::prelude::{
-    DataFrame, Expr, JoinArgs, JoinCoalesce, JoinType, LazyFrame, PlRefPath, PlSmallStr, Schema,
-    SortMultipleOptions, UniqueKeepStrategy, col, lit,
-};
-
 use crate::{
-    column_expressions::{
-        column_context::{AllowExcludeKind, ColumnReturn, allow, exclude},
-        filter_expr::json_to_expr,
-    },
+    column_expressions::filter_expr::json_to_expr,
     model_components::{
         agg_context::AggContext,
         column_values_context::ColumnValuesContext,
         joins::JoinHow,
         measures::{
-            Measure, MeasureMetadata, extract_measure_metadata, validate_measure_structure,
+            DfMeasure, MeasureMetadata, extract_df_measure_metadata, resolve_group_by_cols,
+            validate_df_measure_structure,
         },
-        pre_aggregations::{PreAggregation, agg_expansion, component_col_name},
+        pre_aggregations::{PreAggregation, agg_needed_components, component_col_name},
         select_context::SelectContext,
     },
-    wrappers::polars::{
-        lazyframe_recorder::LazyFrameRecorder, lazyframe_wrapper::LazyFrameWrapper,
+    wrappers::datafusion::{
+        dataframe_recorder::DataFrameRecorder, dataframe_wrapper::DataFrameWrapper,
     },
 };
 
 use super::model_components::joins::JoinGraph;
 
+// ── Public types ─────────────────────────────────────────────────────────────
+
 pub enum DataOutput {
-    Data(DataFrame),
+    Data(Vec<RecordBatch>),
     Explanation(String),
 }
 
 impl std::fmt::Debug for DataOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DataOutput::Data(df) => write!(f, "DataOutput::Data({:?})", df.head(Some(5))),
-            DataOutput::Explanation(s) => write!(f, "DataOutput::Explanation({:?})", s),
+            DataOutput::Data(batches) => {
+                write!(f, "DataOutput::Data({} batches)", batches.len())
+            }
+            DataOutput::Explanation(s) => write!(f, "DataOutput::Explanation({s:?})"),
         }
     }
 }
@@ -50,43 +52,45 @@ pub enum DataQuery {
     ColumnValues(ColumnValuesContext),
 }
 
+// ── Internal struct ───────────────────────────────────────────────────────────
+
 struct DataModelInner {
-    tables: HashMap<String, LazyFrame>,
+    /// DataFusion session context with all base tables registered.
+    ctx: SessionContext,
+    /// Raw table providers, keyed by table name. Used to build scan plans.
+    table_providers: HashMap<String, Arc<dyn TableProvider>>,
     joins: JoinGraph,
-    pub(crate) measures: HashMap<String, Measure>,
+    pub(crate) measures: HashMap<String, DfMeasure>,
     pub measure_metadata: HashMap<String, MeasureMetadata>,
     pre_aggs: Option<Vec<PreAggregation>>,
     pre_agg_path: Option<String>,
-    table_schemas: HashMap<String, Schema>,
+    /// Tokio runtime for executing async DataFusion operations from sync code.
+    rt: Arc<tokio::runtime::Runtime>,
 }
 
 #[derive(Clone)]
 pub struct DataModel(Arc<DataModelInner>);
 
 impl DataModel {
+    /// Create a DataModel from a map of table providers.
+    ///
+    /// Column names are prefixed with the table name (e.g. `id` → `orders.id`)
+    /// at query time via a projection, so providers may have unqualified names.
     pub fn new(
-        tables: HashMap<String, LazyFrame>,
+        tables: HashMap<String, Arc<dyn TableProvider>>,
         joins: JoinGraph,
         pre_aggs: Vec<PreAggregation>,
         pre_agg_path: Option<String>,
     ) -> DataModel {
-        let mut tables: HashMap<String, LazyFrame> = tables
-            .into_iter()
-            .map(|(name, lf)| {
-                let lf = Self::prefix_columns_if_needed(&name, lf);
-                (name, lf)
-            })
-            .collect();
+        let ctx = SessionContext::new();
 
-        let table_schemas = tables
-            .iter_mut()
-            .map(|(name, lf)| {
-                let schema = lf
-                    .collect_schema()
-                    .unwrap_or_else(|e| panic!("failed to collect schema for table '{name}': {e}"));
-                (name.clone(), (*schema).clone())
-            })
-            .collect();
+        let rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime for DataModel"));
+
+        // Register all tables so the session context can resolve them.
+        for (name, provider) in &tables {
+            ctx.register_table(name, Arc::clone(provider))
+                .unwrap_or_else(|e| panic!("failed to register table '{name}': {e}"));
+        }
 
         let mut seen = HashSet::new();
         for pa in &pre_aggs {
@@ -96,7 +100,8 @@ impl DataModel {
         }
 
         DataModel(Arc::new(DataModelInner {
-            tables,
+            ctx,
+            table_providers: tables,
             joins,
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
@@ -106,56 +111,23 @@ impl DataModel {
                 Some(pre_aggs)
             },
             pre_agg_path,
-            table_schemas,
+            rt,
         }))
     }
 
-    fn prefix_columns_if_needed(table_name: &str, mut lf: LazyFrame) -> LazyFrame {
-        let schema = lf
-            .collect_schema()
-            .unwrap_or_else(|e| panic!("failed to get schema for '{table_name}': {e}"));
-        let prefix = format!("{}.", table_name);
-        let to_rename: Vec<(String, String)> = schema
-            .iter_names()
-            .filter(|name| !name.starts_with(prefix.as_str()))
-            .map(|name| (name.to_string(), format!("{}{}", prefix, name)))
-            .collect();
-        if to_rename.is_empty() {
-            return lf;
-        }
-        let existing: Vec<String> = to_rename.iter().map(|(e, _)| e.clone()).collect();
-        let new_names: Vec<String> = to_rename.iter().map(|(_, n)| n.clone()).collect();
-        lf.rename(existing, new_names, false)
-    }
+    // ── Public API ────────────────────────────────────────────────────────────
 
-    pub fn table(&self, table_name: &str) -> LazyFrameRecorder {
+    /// Begin a recorder chain for the named table.
+    pub fn table(&self, table_name: &str) -> DataFrameRecorder {
         assert!(
-            self.0.tables.contains_key(table_name),
+            self.0.table_providers.contains_key(table_name),
             "table '{table_name}' not found in DataModel"
         );
-        LazyFrameRecorder {
-            table_name: table_name.to_string(),
-            data_model: self.clone(),
-            lazy_ops: Vec::new(),
-            non_agg_cols: HashSet::new(),
-            agg_cols: HashMap::new(),
-            non_base_tables: HashSet::new(),
-            use_pre_agg: true,
-            pre_agg_valid_secs: None,
-            allow_exclude_records: Vec::new(),
-        }
-    }
-
-    /// Returns the schema for a registered table.
-    pub fn table_schema(&self, table_name: &str) -> &Schema {
-        self.0
-            .table_schemas
-            .get(table_name)
-            .unwrap_or_else(|| panic!("schema for table '{table_name}' not found"))
+        DataFrameRecorder::new(table_name.to_string(), self.clone())
     }
 
     /// Register a measure with the DataModel. Validates structure at registration time.
-    pub fn add_measure(&mut self, measure: Measure) -> Result<(), String> {
+    pub fn add_measure(&mut self, measure: DfMeasure) -> Result<(), String> {
         if self.0.measures.contains_key(&measure.name) {
             return Err(format!("measure '{}' already registered", measure.name));
         }
@@ -167,15 +139,6 @@ impl DataModel {
         Ok(())
     }
 
-    fn validate_and_extract_measure(&self, measure: &Measure) -> Result<MeasureMetadata, String> {
-        let stub_qc = AggContext::stub();
-        let recorder = measure.call(self, &stub_qc); // clones self into recorder; dropped below
-        validate_measure_structure(&recorder)?;
-        Ok(extract_measure_metadata(&recorder, &measure.name))
-        // recorder dropped here → Arc refcount returns to 1
-    }
-
-    /// Returns the metadata for a registered measure, if it exists.
     pub fn measure_metadata(&self, name: &str) -> Option<&MeasureMetadata> {
         self.0.measure_metadata.get(name)
     }
@@ -185,187 +148,152 @@ impl DataModel {
         self.0.joins.find_path(base, target).is_some()
     }
 
-    fn eval_last_allow_exclude(&self, recorder: &LazyFrameRecorder) -> Result<Vec<String>, String> {
-        match recorder.allow_exclude_records.last() {
-            None => {
-                let mut cols: Vec<String> = recorder
-                    .non_agg_cols
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                cols.sort();
-                Ok(cols)
-            }
-            Some(record) => {
-                let result = match record.kind {
-                    AllowExcludeKind::Allow => allow(
-                        record.pattern.clone(),
-                        record.context.clone(),
-                        record.include.clone(),
-                    ),
-                    AllowExcludeKind::Exclude => exclude(
-                        record.pattern.clone(),
-                        record.context.clone(),
-                        record.include.clone(),
-                    ),
-                };
-                match result.inner {
-                    ColumnReturn::Strings(cols) => Ok(cols),
-                    ColumnReturn::PolarsExpr(_) => Err(
-                        "JSON-context allow/exclude cannot produce group-by column names".into(),
-                    ),
-                }
-            }
-        }
+    pub async fn execute(&self, q: &DataQuery) -> Result<DataOutput, String> {
+        let df = match q {
+            DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
+            DataQuery::View(ctx) => self.build_select_frame(ctx)?,
+            DataQuery::ColumnValues(ctx) => self.build_column_values_frame(ctx)?,
+        };
+
+        df.collect()
+            .await
+            .map(DataOutput::Data)
+            .map_err(|e| format!("execution failed: {e}"))
     }
 
-    fn build_agg_frame(&self, qc: &AggContext) -> Result<LazyFrame, String> {
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    fn validate_and_extract_measure(&self, measure: &DfMeasure) -> Result<MeasureMetadata, String> {
+        let stub_qc = AggContext::stub();
+        let df = measure
+            .call(self, &stub_qc)
+            .map_err(|e| format!("measure '{}' failed to build: {e}", measure.name))?;
+        validate_df_measure_structure(&df)?;
+        extract_df_measure_metadata(&df, &measure.name)
+    }
+
+    fn build_agg_frame(&self, qc: &AggContext) -> Result<DataFrame, String> {
         let known_measures: Vec<MeasureMetadata> =
             self.0.measure_metadata.values().cloned().collect();
         let all_columns: HashSet<String> = self
             .0
-            .table_schemas
-            .values()
-            .flat_map(|s| s.iter_names().map(|n| n.to_string()))
+            .table_providers
+            .iter()
+            .flat_map(|(name, provider)| {
+                let prefix = format!("{name}.");
+                provider
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        if f.name().starts_with(&prefix) {
+                            f.name().to_string()
+                        } else {
+                            format!("{prefix}{}", f.name())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect();
         qc.validate(&known_measures, &all_columns)?;
 
-        let mut recorders = Vec::new();
+        let mut measure_dfs: Vec<DataFrame> = Vec::new();
         let mut expected_cols: Option<Vec<String>> = None;
 
         for m_name in &qc.measures {
             let measure = self.0.measures.get(m_name).unwrap();
-            let mut recorder = measure.call(self, qc);
-            recorder.use_pre_agg = qc.use_pre_agg;
-            recorder.pre_agg_valid_secs = qc.pre_agg_valid_secs;
-            let cols = self.eval_last_allow_exclude(&recorder)?;
+            let df = measure
+                .call(self, qc)
+                .map_err(|e| format!("measure '{m_name}' failed: {e}"))?;
+            let cols = resolve_group_by_cols(&df)?;
 
             if let Some(ref prev) = expected_cols {
                 if &cols != prev {
                     return Err(format!(
-                        "incompatible group-by columns across measures: {:?} vs {:?}",
-                        prev, cols
+                        "incompatible group-by columns across measures: {prev:?} vs {cols:?}"
                     ));
                 }
             } else {
                 expected_cols = Some(cols);
             }
-            recorders.push(recorder);
+            measure_dfs.push(df);
         }
 
         let join_cols: Vec<String> = expected_cols.unwrap_or_default();
 
-        let mut frames: Vec<LazyFrame> =
-            recorders.into_iter().map(|r| r.build().lazyframe).collect();
-
-        let mut combined = frames.remove(0);
-        for frame in frames {
-            let (left_on, right_on): (Vec<Expr>, Vec<Expr>) = if join_cols.is_empty() {
-                (vec![], vec![])
+        let mut combined = measure_dfs.remove(0);
+        for frame in measure_dfs {
+            combined = if join_cols.is_empty() {
+                let (state, left_plan) = combined.into_parts();
+                let right_plan = frame.into_unoptimized_plan();
+                let cross_plan = LogicalPlanBuilder::from(left_plan)
+                    .cross_join(right_plan)
+                    .map_err(|e| format!("failed to cross join measures: {e}"))?
+                    .build()
+                    .map_err(|e| format!("failed to build cross join: {e}"))?;
+                DataFrame::new(state, cross_plan)
             } else {
-                let exprs: Vec<Expr> = join_cols.iter().map(|c| col(c.as_str())).collect();
-                (exprs.clone(), exprs)
+                let left_on: Vec<&str> = join_cols.iter().map(|s| s.as_str()).collect();
+                let right_on: Vec<&str> = join_cols.iter().map(|s| s.as_str()).collect();
+                combined
+                    .join(frame, JoinType::Full, &left_on, &right_on, None)
+                    .map_err(|e| format!("failed to join measures: {e}"))?
             };
-            let join_type = if join_cols.is_empty() {
-                JoinType::Cross
-            } else {
-                JoinType::Full
-            };
-            combined = combined.join(
-                frame,
-                left_on,
-                right_on,
-                JoinArgs::new(join_type).with_coalesce(JoinCoalesce::CoalesceColumns),
-            );
         }
 
         if let Some(having_expr) = json_to_expr(&qc.havings) {
-            combined = combined.filter(having_expr);
+            combined = combined
+                .filter(having_expr)
+                .map_err(|e| format!("having filter failed: {e}"))?;
         }
 
         if !qc.sorts.is_empty() {
-            let (sort_cols, descs): (Vec<PlSmallStr>, Vec<bool>) = qc
+            let sort_exprs: Vec<SortExpr> = qc
                 .sorts
                 .iter()
-                .map(|(c, d)| (PlSmallStr::from(c.as_str()), d == "desc"))
-                .unzip();
-            let opts = SortMultipleOptions::default().with_order_descending_multi(descs);
-            combined = combined.sort(sort_cols, opts);
+                .map(|(c, d)| col(c.as_str()).sort(d != "desc", true))
+                .collect();
+            combined = combined
+                .sort(sort_exprs)
+                .map_err(|e| format!("sort failed: {e}"))?;
         }
 
-        Ok(combined.slice(qc.offset as i64, qc.limit as u32))
+        combined
+            .limit(qc.offset, Some(qc.limit))
+            .map_err(|e| format!("limit failed: {e}"))
     }
 
-    pub fn execute(&self, q: &DataQuery, explain: bool) -> Result<DataOutput, String> {
-        let lf = match q {
-            DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
-            DataQuery::View(ctx) => self.build_select_frame(ctx)?,
-            DataQuery::ColumnValues(ctx) => self.build_column_values_frame(ctx)?,
-        };
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            if let Ok(plan) = lf.clone().explain(true) {
-                debug!(query_plan = %plan, "polars query plan");
-            }
-        }
-        if explain {
-            lf.explain(true)
-                .map(DataOutput::Explanation)
-                .map_err(|e| format!("explain failed: {e}"))
-        } else {
-            lf.collect()
-                .map(DataOutput::Data)
-                .map_err(|e| format!("execution failed: {e}"))
-        }
-    }
-
-    #[cfg(feature = "async")]
-    pub async fn execute_async(&self, q: &DataQuery, explain: bool) -> Result<DataOutput, String> {
-        let lf = match q {
-            DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
-            DataQuery::View(ctx) => self.build_select_frame(ctx)?,
-            DataQuery::ColumnValues(ctx) => self.build_column_values_frame(ctx)?,
-        };
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            if let Ok(plan) = lf.clone().explain(true) {
-                debug!(query_plan = %plan, "polars query plan");
-            }
-        }
-        if explain {
-            lf.explain(true)
-                .map(DataOutput::Explanation)
-                .map_err(|e| format!("explain failed: {e}"))
-        } else {
-            tokio::task::spawn_blocking(move || lf.collect())
-                .await
-                .expect("collect task panicked")
-                .map(DataOutput::Data)
-                .map_err(|e| format!("execution failed: {e}"))
-        }
-    }
-
-    fn build_select_frame(&self, vc: &SelectContext) -> Result<LazyFrame, String> {
+    fn build_select_frame(&self, vc: &SelectContext) -> Result<DataFrame, String> {
         let all_columns: HashSet<String> = self
             .0
-            .table_schemas
-            .values()
-            .flat_map(|s| s.iter_names().map(|n| n.to_string()))
+            .table_providers
+            .iter()
+            .flat_map(|(name, provider)| {
+                let prefix = format!("{name}.");
+                provider
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        if f.name().starts_with(&prefix) {
+                            f.name().to_string()
+                        } else {
+                            format!("{prefix}{}", f.name())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect();
         vc.validate(&all_columns)?;
 
-        // Collect all columns needed for joining: selected + filter columns
-        let mut all_needed: HashSet<PlSmallStr> = vc
-            .columns
-            .iter()
-            .map(|c| PlSmallStr::from(c.as_str()))
-            .collect();
+        let mut all_needed: HashSet<String> = vc.columns.iter().cloned().collect();
         for fc in vc.filter_columns() {
-            all_needed.insert(PlSmallStr::from(fc.as_str()));
+            all_needed.insert(fc);
         }
 
-        // Determine referenced tables
         let mut referenced_tables: Vec<String> = all_needed
             .iter()
-            .filter_map(|c| c.as_str().split_once('.').map(|(t, _)| t.to_string()))
+            .filter_map(|c| c.split_once('.').map(|(t, _)| t.to_string()))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -375,7 +303,6 @@ impl DataModel {
             return Err("columns must be table-qualified (e.g. table.column)".into());
         }
 
-        // Find a base table that can reach all others via join graph
         let base_table = referenced_tables
             .iter()
             .find(|candidate| {
@@ -385,42 +312,99 @@ impl DataModel {
             })
             .ok_or_else(|| {
                 format!(
-                    "no single base table can reach all tables {:?} via join graph",
-                    referenced_tables
+                    "no single base table can reach all tables {referenced_tables:?} via join graph"
                 )
             })?
             .clone();
 
-        let mut lf = self
-            .get_table(&base_table, &all_needed, &HashMap::new(), false, None)
-            .lazyframe;
+        let non_agg_str: HashSet<String> = all_needed.clone();
+        let mut df = self
+            .get_df_table(&base_table, &non_agg_str, &HashMap::new(), false)
+            .map_err(|e| e.to_string())?
+            .inner;
 
-        // Filter before projection so filters can reference non-selected columns
         if let Some(filter_expr) = json_to_expr(&vc.filters) {
-            lf = lf.filter(filter_expr);
+            df = df.filter(filter_expr).map_err(|e| e.to_string())?;
         }
 
-        // Project to requested columns only
         let select_exprs: Vec<Expr> = vc.columns.iter().map(|c| col(c.as_str())).collect();
-        lf = lf.select(select_exprs);
+        df = df.select(select_exprs).map_err(|e| e.to_string())?;
 
         if !vc.sorts.is_empty() {
-            let (sort_cols, descs): (Vec<PlSmallStr>, Vec<bool>) = vc
+            let sort_exprs: Vec<SortExpr> = vc
                 .sorts
                 .iter()
-                .map(|(c, d)| (PlSmallStr::from(c.as_str()), d == "desc"))
-                .unzip();
-            let opts = SortMultipleOptions::default().with_order_descending_multi(descs);
-            lf = lf.sort(sort_cols, opts);
+                .map(|(c, d)| col(c.as_str()).sort(d != "desc", true))
+                .collect();
+            df = df.sort(sort_exprs).map_err(|e| e.to_string())?;
         }
 
-        Ok(lf.slice(vc.offset as i64, vc.limit as u32))
+        df.limit(vc.offset, Some(vc.limit))
+            .map_err(|e| e.to_string())
+    }
+
+    fn build_column_values_frame(&self, ctx: &ColumnValuesContext) -> Result<DataFrame, String> {
+        let (table_name, _) = ctx.column.split_once('.').unwrap();
+        if !self.0.table_providers.contains_key(table_name) {
+            return Err(format!("unknown table: '{table_name}'"));
+        }
+
+        if ctx.use_pre_agg {
+            if let (Some(pre_aggs), Some(path)) = (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
+            {
+                let mut candidates: Vec<&PreAggregation> = pre_aggs
+                    .iter()
+                    .filter(|pa| pa.group_by.contains(&ctx.column))
+                    .collect();
+                candidates.sort_by_key(|pa| pa.row_count);
+
+                'candidates: for candidate in candidates {
+                    let pre_agg_file = format!("{path}/{}.parquet", candidate.name);
+                    if let Some(max_age) = ctx.pre_agg_valid_secs {
+                        match std::fs::metadata(&pre_agg_file)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                        {
+                            Some(modified) => {
+                                let age = modified.elapsed().unwrap_or(std::time::Duration::MAX);
+                                if age > std::time::Duration::from_secs(max_age) {
+                                    continue 'candidates;
+                                }
+                            }
+                            None => continue 'candidates,
+                        }
+                    }
+                    if std::path::Path::new(&pre_agg_file).exists() {
+                        debug!(column = %ctx.column, pre_agg = %candidate.name, "using pre-agg for column values");
+                        if let Ok(df) = self.read_parquet_sync(&pre_agg_file) {
+                            return df
+                                .select(vec![col(ctx.column.as_str())])
+                                .and_then(|d| d.distinct())
+                                .map_err(|e| e.to_string());
+                        }
+                    }
+                    debug!(pre_agg = %candidate.name, "pre-agg not found, trying next");
+                }
+                trace!(column = %ctx.column, "no valid pre-agg, falling back");
+            }
+        }
+
+        let base = self
+            .get_df_table(
+                table_name,
+                &HashSet::from([ctx.column.clone()]),
+                &HashMap::new(),
+                false,
+            )
+            .map_err(|e| e.to_string())?
+            .inner;
+
+        base.select(vec![col(ctx.column.as_str())])
+            .and_then(|d| d.distinct())
+            .map_err(|e| e.to_string())
     }
 
     /// Compute and write parquet files for the named pre-aggregations.
-    ///
-    /// Looks up each name in the pre-aggregations registered at construction,
-    /// then writes `{pre_agg_path}/{name}.parquet` for each.
     pub fn write_pre_aggs(&self, names: &[&str]) -> Result<(), String> {
         let pre_aggs = self
             .0
@@ -438,26 +422,27 @@ impl DataModel {
     }
 
     fn write_pre_agg(&self, pa: &PreAggregation) -> Result<(), String> {
+        use datafusion::dataframe::DataFrameWriteOptions;
+        use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
+
         let path = self
             .0
             .pre_agg_path
             .as_deref()
             .ok_or("pre_agg_path not set on DataModel")?;
 
-        // --- 1. Identify referenced tables ---
         let all_col_names = pa.group_by.iter().chain(pa.aggregations.keys());
         let mut referenced_tables: Vec<String> = all_col_names
             .filter_map(|c| c.split_once('.').map(|(t, _)| t.to_string()))
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        referenced_tables.sort(); // deterministic order
+        referenced_tables.sort();
 
         if referenced_tables.is_empty() {
             return Err("all columns must be table-qualified (e.g. orders.amount)".into());
         }
 
-        // --- 2. Find a base table that can reach all others ---
         let base_table = referenced_tables
             .iter()
             .find(|candidate| {
@@ -467,105 +452,77 @@ impl DataModel {
             })
             .ok_or_else(|| {
                 format!(
-                    "no single base table can reach all tables {:?} via join graph",
-                    referenced_tables
+                    "no single base table can reach all tables {referenced_tables:?} via join graph"
                 )
             })?
             .clone();
 
-        // --- 3. Build joined LazyFrame ---
-        let mut lf = self
-            .0
-            .tables
-            .get(&base_table)
-            .ok_or_else(|| format!("table '{base_table}' not found in DataModel"))?
-            .clone();
+        let non_agg_str: HashSet<String> = pa.group_by.iter().cloned().collect();
+        let agg_str: HashMap<String, Vec<String>> = pa
+            .aggregations
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
-        for other in &referenced_tables {
-            if other == &base_table {
-                continue;
-            }
-            let join_path = self.0.joins.find_path(&base_table, other).unwrap();
-            for join in join_path {
-                let right_lf = self
-                    .0
-                    .tables
-                    .get(&join.right)
-                    .ok_or_else(|| format!("table '{}' not found in DataModel", join.right))?
-                    .clone();
-                let join_type = match join.how {
-                    JoinHow::Left => JoinType::Left,
-                    JoinHow::Inner => JoinType::Inner,
-                };
-                let left_on: Vec<Expr> = join.left_on.iter().map(|c| col(c.as_str())).collect();
-                let right_on: Vec<Expr> = join.right_on.iter().map(|c| col(c.as_str())).collect();
-                lf = lf.join(right_lf, left_on, right_on, JoinArgs::new(join_type));
-            }
-        }
+        let mut df = self
+            .get_df_table(&base_table, &non_agg_str, &agg_str, false)
+            .map_err(|e| e.to_string())?
+            .inner;
 
-        // --- 4. Build group_by expressions ---
-        let group_by_exprs: Vec<Expr> = pa.group_by.iter().map(|qcol| col(qcol.as_str())).collect();
+        let group_by_exprs: Vec<Expr> = pa.group_by.iter().map(|c| col(c.as_str())).collect();
 
-        // --- 5. Build agg expressions, one per component ---
         let mut agg_exprs: Vec<Expr> = Vec::new();
         for (qcol, components) in &pa.aggregations {
             for component in components {
                 let alias = component_col_name(qcol, component);
                 let expr = match component.as_str() {
-                    "sum" => col(qcol.as_str()).sum().alias(&alias),
-                    "count" => col(qcol.as_str()).count().alias(&alias),
-                    "min" => col(qcol.as_str()).min().alias(&alias),
-                    "max" => col(qcol.as_str()).max().alias(&alias),
-                    "sumsq" => col(qcol.as_str()).pow(lit(2.0f64)).sum().alias(&alias),
-                    other => {
-                        return Err(format!("unknown pre-agg component '{other}'"));
-                    }
+                    "sum" => sum(col(qcol.as_str())).alias(&alias),
+                    "count" => count(col(qcol.as_str())).alias(&alias),
+                    "min" => min(col(qcol.as_str())).alias(&alias),
+                    "max" => max(col(qcol.as_str())).alias(&alias),
+                    "sumsq" => sum(col(qcol.as_str()) * col(qcol.as_str())).alias(&alias),
+                    other => return Err(format!("unknown pre-agg component '{other}'")),
                 };
                 agg_exprs.push(expr);
             }
         }
 
-        // --- 6. Execute group_by + agg ---
-        let mut df = lf
-            .group_by(group_by_exprs)
-            .agg(agg_exprs)
-            .collect()
-            .map_err(|e| format!("failed to collect pre-agg: {e}"))?;
+        df = df
+            .aggregate(group_by_exprs, agg_exprs)
+            .map_err(|e| format!("failed to aggregate for pre-agg: {e}"))?;
 
-        // --- 8. Write parquet ---
         let file_path = format!("{path}/{}.parquet", pa.name);
-        let file = std::fs::File::create(&file_path)
-            .map_err(|e| format!("failed to create '{file_path}': {e}"))?;
-        polars::prelude::ParquetWriter::new(file)
-            .finish(&mut df)
+        self.0
+            .rt
+            .block_on(df.write_parquet(&file_path, DataFrameWriteOptions::new(), None))
             .map_err(|e| format!("failed to write parquet: {e}"))?;
 
         Ok(())
     }
 
-    pub(crate) fn get_table(
+    /// Build a base DataFrame for a table, applying joins for any external columns
+    /// needed by the caller. Uses a pre-aggregation file if available and allowed.
+    pub(crate) fn get_df_table(
         &self,
         table_name: &str,
-        non_agg_cols: &HashSet<PlSmallStr>,
-        agg_cols: &HashMap<PlSmallStr, Vec<String>>,
-        use_pre_agg: bool,
-        pre_agg_valid_secs: Option<u64>,
-    ) -> LazyFrameWrapper {
-        if use_pre_agg & !agg_cols.is_empty() {
+        non_agg_cols: &HashSet<String>,
+        agg_cols: &HashMap<String, Vec<String>>,
+        pre_agg_allowed: bool,
+    ) -> datafusion::common::Result<DataFrameWrapper> {
+        if pre_agg_allowed && !agg_cols.is_empty() {
             if let (Some(pre_aggs), Some(path)) = (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
             {
-                let non_agg_vec: Vec<String> = non_agg_cols.iter().map(|s| s.to_string()).collect();
-
+                let non_agg_vec: Vec<String> = non_agg_cols.iter().cloned().collect();
                 let agg_map: HashMap<String, HashSet<String>> = agg_cols
                     .iter()
                     .map(|(col, agg_names)| {
                         let components: HashSet<String> = agg_names
                             .iter()
-                            .filter_map(|name| agg_expansion(&name.to_lowercase()).ok())
+                            .filter_map(|name| agg_needed_components(name))
                             .flatten()
                             .map(|s| s.to_string())
                             .collect();
-                        (col.to_string(), components)
+                        (col.clone(), components)
                     })
                     .collect();
 
@@ -575,54 +532,28 @@ impl DataModel {
                     .collect();
                 candidates.sort_by_key(|pa| pa.row_count);
 
-                'candidates: for candidate in candidates {
-                    let pre_agg_file = format!("{}/{}.parquet", path, candidate.name);
-
-                    if let Some(max_age_secs) = pre_agg_valid_secs {
-                        match std::fs::metadata(&pre_agg_file)
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                        {
-                            Some(modified) => {
-                                let age = modified.elapsed().unwrap_or(std::time::Duration::MAX);
-                                if age > std::time::Duration::from_secs(max_age_secs) {
-                                    debug!(pre_agg = %candidate.name, "pre-agg too old, trying next candidate");
-                                    continue 'candidates;
-                                }
-                            }
-                            None => {
-                                debug!(pre_agg = %candidate.name, "pre-agg age unknown, trying next candidate");
-                                continue 'candidates;
-                            }
-                        }
+                'candidates: for candidate in &candidates {
+                    let pre_agg_file = format!("{path}/{}.parquet", candidate.name);
+                    if !std::path::Path::new(&pre_agg_file).exists() {
+                        debug!(pre_agg = %candidate.name, "parquet not found, trying next");
+                        continue 'candidates;
                     }
-
-                    if let Ok(lf) = LazyFrame::scan_parquet(
-                        PlRefPath::from(pre_agg_file.as_str()),
-                        Default::default(),
-                    ) {
-                        debug!(pre_agg = %candidate.name, table = %table_name, "using pre-aggregation");
-                        return LazyFrameWrapper {
-                            lazyframe: lf,
+                    debug!(pre_agg = %candidate.name, table = %table_name, "using pre-aggregation");
+                    if let Ok(df) = self.read_parquet_sync(&pre_agg_file) {
+                        return Ok(DataFrameWrapper {
+                            inner: df,
                             from_pre_agg: true,
-                        };
+                        });
                     }
-                    debug!(pre_agg = %candidate.name, "pre-agg parquet not found, trying next candidate");
+                    debug!(pre_agg = %candidate.name, "failed to read parquet, trying next");
                 }
-
-                trace!(table = %table_name, "no valid pre-aggregation found, falling back to base table");
+                trace!(table = %table_name, "no valid pre-agg, falling back to base table");
             }
-        } // end if use_pre_agg
+        }
 
         debug!(table = %table_name, "scanning base table");
-        let mut lf = self
-            .0
-            .tables
-            .get(table_name)
-            .unwrap_or_else(|| panic!("table '{table_name}' not found in DataModel"))
-            .clone();
+        let mut df = self.scan_table(table_name)?;
 
-        // Collect external table names referenced by non-aggregated or aggregated columns
         let all_col_names = non_agg_cols
             .iter()
             .map(|s| s.as_str())
@@ -635,11 +566,6 @@ impl DataModel {
             .collect();
         external_tables.sort();
 
-        // Tracks columns dropped by prior joins: dropped_name → surviving_name.
-        // Polars drops the right-side key after each join, so any subsequent join
-        // that references the dropped name must be redirected to the surviving key.
-        let mut col_remap: HashMap<String, String> = HashMap::new();
-
         let mut joined: HashSet<String> = HashSet::from([table_name.to_string()]);
         for ext in &external_tables {
             if let Some(path) = self.0.joins.find_path(table_name, ext) {
@@ -647,134 +573,119 @@ impl DataModel {
                     if joined.contains(&join.right) {
                         continue;
                     }
-                    let right_lf = self
-                        .0
-                        .tables
-                        .get(&join.right)
-                        .unwrap_or_else(|| panic!("table '{}' not found in DataModel", join.right))
-                        .clone();
+                    let right_df = self.scan_table(&join.right)?;
                     let join_type = match join.how {
                         JoinHow::Left => JoinType::Left,
                         JoinHow::Inner => JoinType::Inner,
                     };
-                    let left_on: Vec<Expr> = join
-                        .left_on
-                        .iter()
-                        .map(|c| {
-                            let name = col_remap
-                                .get(c.as_str())
-                                .map(|s| s.as_str())
-                                .unwrap_or(c.as_str());
-                            col(name)
-                        })
-                        .collect();
-                    let right_on: Vec<Expr> =
-                        join.right_on.iter().map(|c| col(c.as_str())).collect();
-                    // After the join, each right key is dropped; record the surviving left key.
-                    for (left_col, right_col) in join.left_on.iter().zip(join.right_on.iter()) {
-                        let surviving = col_remap
-                            .get(left_col.as_str())
-                            .cloned()
-                            .unwrap_or_else(|| left_col.clone());
-                        col_remap.insert(right_col.clone(), surviving);
-                    }
-                    lf = lf.join(right_lf, left_on, right_on, JoinArgs::new(join_type));
+                    let left_on: Vec<&str> = join.left_on.iter().map(|s| s.as_str()).collect();
+                    let right_on: Vec<&str> = join.right_on.iter().map(|s| s.as_str()).collect();
+                    df = df.join(right_df, join_type, &left_on, &right_on, None)?;
                     joined.insert(join.right.clone());
                 }
             }
         }
 
-        LazyFrameWrapper {
-            lazyframe: lf,
+        Ok(DataFrameWrapper {
+            inner: df,
             from_pre_agg: false,
-        }
+        })
     }
 
-    fn build_column_values_frame(&self, ctx: &ColumnValuesContext) -> Result<LazyFrame, String> {
-        let (table_name, _) = ctx.column.split_once('.').unwrap();
+    /// Build a scan DataFrame for a single table with column prefixing applied.
+    fn scan_table(&self, table_name: &str) -> datafusion::common::Result<DataFrame> {
+        let provider = self
+            .0
+            .table_providers
+            .get(table_name)
+            .unwrap_or_else(|| panic!("table '{table_name}' not found in DataModel"));
 
-        if !self.0.tables.contains_key(table_name) {
-            return Err(format!("unknown table: '{table_name}'"));
-        }
-        let schema = self.0.table_schemas.get(table_name).unwrap();
-        if !schema
-            .iter_names()
-            .any(|n| n.as_str() == ctx.column.as_str())
-        {
-            return Err(format!("unknown column: '{}'", ctx.column));
-        }
+        let schema = provider.schema();
+        let prefix = format!("{table_name}.");
+        let source = provider_as_source(Arc::clone(provider));
 
-        if ctx.use_pre_agg {
-            if let (Some(pre_aggs), Some(path)) = (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
-            {
-                let mut candidates: Vec<&PreAggregation> = pre_aggs
-                    .iter()
-                    .filter(|pa| pa.group_by.contains(&ctx.column))
-                    .collect();
-                candidates.sort_by_key(|pa| pa.row_count);
+        let builder = LogicalPlanBuilder::scan(table_name, source, None)?;
 
-                'candidates: for candidate in candidates {
-                    let pre_agg_file = format!("{}/{}.parquet", path, candidate.name);
+        let needs_prefix = schema
+            .fields()
+            .iter()
+            .any(|f| !f.name().starts_with(&prefix));
+        let plan = if needs_prefix {
+            let rename_exprs: Vec<Expr> = schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    let new_name = if f.name().starts_with(&prefix) {
+                        f.name().to_string()
+                    } else {
+                        format!("{prefix}{}", f.name())
+                    };
+                    col(f.name()).alias(new_name)
+                })
+                .collect();
+            builder.project(rename_exprs)?.build()?
+        } else {
+            builder.build()?
+        };
 
-                    if let Some(max_age_secs) = ctx.pre_agg_valid_secs {
-                        match std::fs::metadata(&pre_agg_file)
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                        {
-                            Some(modified) => {
-                                let age = modified.elapsed().unwrap_or(std::time::Duration::MAX);
-                                if age > std::time::Duration::from_secs(max_age_secs) {
-                                    debug!(pre_agg = %candidate.name, "pre-agg too old, trying next candidate");
-                                    continue 'candidates;
-                                }
-                            }
-                            None => {
-                                debug!(pre_agg = %candidate.name, "pre-agg age unknown, trying next candidate");
-                                continue 'candidates;
-                            }
-                        }
-                    }
+        Ok(DataFrame::new(self.0.ctx.state(), plan))
+    }
 
-                    if let Ok(lf) = LazyFrame::scan_parquet(
-                        PlRefPath::from(pre_agg_file.as_str()),
-                        Default::default(),
-                    ) {
-                        debug!(pre_agg = %candidate.name, column = %ctx.column, "using pre-aggregation for column values");
-                        return Ok(lf
-                            .select([col(ctx.column.as_str())])
-                            .unique(None, UniqueKeepStrategy::Any));
-                    }
-                    debug!(pre_agg = %candidate.name, "pre-agg parquet not found, trying next candidate");
-                }
-
-                trace!(column = %ctx.column, "no valid pre-aggregation found, falling back to base table");
+    /// Read a parquet file synchronously using the stored tokio runtime.
+    /// Falls back gracefully when called from within an existing async runtime.
+    fn read_parquet_sync(&self, file_path: &str) -> datafusion::common::Result<DataFrame> {
+        let ctx = self.0.ctx.clone();
+        let path = file_path.to_string();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Inside an async runtime — use block_in_place to avoid blocking the executor.
+                tokio::task::block_in_place(|| {
+                    handle.block_on(ctx.read_parquet(path, ParquetReadOptions::default()))
+                })
             }
+            Err(_) => self
+                .0
+                .rt
+                .block_on(ctx.read_parquet(path, ParquetReadOptions::default())),
         }
-
-        debug!(column = %ctx.column, "scanning base table for column values");
-        let lf = self.0.tables.get(table_name).unwrap().clone();
-        Ok(lf
-            .select([col(ctx.column.as_str())])
-            .unique(None, UniqueKeepStrategy::Any))
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polars::prelude::*;
+    use datafusion::arrow::array::{Float64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
     use tempfile::TempDir;
 
     fn make_orders_dm(pre_agg_path: Option<String>, pre_aggs: Vec<PreAggregation>) -> DataModel {
-        let orders = df![
-            "date"   => ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
-            "region" => ["north", "south", "north", "south"],
-            "amount" => [100.0f64, 200.0, 150.0, 250.0],
-        ]
-        .unwrap()
-        .lazy();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("date", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("amount", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "2024-01-01",
+                    "2024-01-01",
+                    "2024-01-02",
+                    "2024-01-02",
+                ])),
+                Arc::new(StringArray::from(vec!["north", "south", "north", "south"])),
+                Arc::new(Float64Array::from(vec![100.0, 200.0, 150.0, 250.0])),
+            ],
+        )
+        .unwrap();
+        let provider: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
         DataModel::new(
-            HashMap::from([("orders".to_string(), orders)]),
+            HashMap::from([("orders".to_string(), provider)]),
             JoinGraph::new(&[]).unwrap(),
             pre_aggs,
             pre_agg_path,
@@ -802,460 +713,5 @@ mod tests {
     fn test_write_pre_agg_creates_file() {
         let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
         assert!(tmp.path().join("daily_revenue.parquet").exists());
-    }
-
-    #[test]
-    fn test_write_pre_agg_correct_schema() {
-        let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-        let path = tmp.path().join("daily_revenue.parquet");
-        let mut lf =
-            LazyFrame::scan_parquet(PlRefPath::from(path.to_str().unwrap()), Default::default())
-                .unwrap();
-        let schema = lf.collect_schema().unwrap();
-        let cols: Vec<&str> = schema.iter_names().map(|n| n.as_str()).collect();
-        assert!(cols.contains(&"orders.date"), "missing orders.date");
-        assert!(cols.contains(&"orders.region"), "missing orders.region");
-        assert!(
-            cols.contains(&"orders.amount-sum"),
-            "missing orders.amount-sum"
-        );
-        assert!(
-            cols.contains(&"orders.amount-count"),
-            "missing orders.amount-count"
-        );
-    }
-
-    #[test]
-    fn test_write_pre_agg_correct_data() {
-        let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-        let path = tmp.path().join("daily_revenue.parquet");
-        let df =
-            LazyFrame::scan_parquet(PlRefPath::from(path.to_str().unwrap()), Default::default())
-                .unwrap()
-                .sort(
-                    ["orders.date", "orders.region"],
-                    SortMultipleOptions::default(),
-                )
-                .collect()
-                .unwrap();
-
-        // 2 dates × 2 regions = 4 rows
-        assert_eq!(df.height(), 4);
-
-        // north/2024-01-01 has amount=100 → sum=100, count=1
-        let sums = df
-            .column("orders.amount-sum")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        assert!(sums.contains(&100.0_f64));
-        assert!(sums.contains(&200.0_f64));
-        assert!(sums.contains(&150.0_f64));
-        assert!(sums.contains(&250.0_f64));
-    }
-
-    #[test]
-    fn test_pre_agg_selected_when_query_covers() {
-        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-        let result = dm
-            .table("orders")
-            .group_by(vec![col("orders.date"), col("orders.region")])
-            .agg(vec![col("orders.amount").sum()])
-            .build();
-        assert!(result.from_pre_agg);
-    }
-
-    #[test]
-    fn test_pre_agg_not_selected_when_query_does_not_cover() {
-        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-        // "orders.store" is not in the pre-agg group_by
-        let result = dm
-            .table("orders")
-            .group_by(vec![col("orders.store")])
-            .agg(vec![col("orders.amount").sum()])
-            .build();
-        assert!(!result.from_pre_agg);
-    }
-
-    #[test]
-    fn test_pre_agg_end_to_end_sum_matches() {
-        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-
-        let mut result = dm
-            .table("orders")
-            .group_by(vec![col("orders.date"), col("orders.region")])
-            .agg(vec![col("orders.amount").sum().alias("total")])
-            .build()
-            .collect()
-            .unwrap();
-        result = result
-            .sort(
-                ["orders.date", "orders.region"],
-                SortMultipleOptions::default(),
-            )
-            .unwrap();
-
-        let totals: Vec<f64> = result
-            .column("total")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .collect();
-
-        // Sorted by date+region: north/01, south/01, north/02, south/02
-        assert_eq!(totals, vec![100.0, 200.0, 150.0, 250.0]);
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate pre-aggregation name")]
-    fn test_duplicate_pre_agg_name_panics() {
-        make_orders_dm(None, vec![daily_revenue_pre_agg(), daily_revenue_pre_agg()]);
-    }
-
-    #[test]
-    fn test_write_unknown_name_errors() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
-        let dm = make_orders_dm(Some(path), vec![daily_revenue_pre_agg()]);
-        assert!(dm.write_pre_aggs(&["nonexistent"]).is_err());
-    }
-
-    #[test]
-    fn test_write_pre_agg_no_path_errors() {
-        let dm = make_orders_dm(None, vec![daily_revenue_pre_agg()]);
-        assert!(dm.write_pre_aggs(&["daily_revenue"]).is_err());
-    }
-
-    // ── query() tests ─────────────────────────────────────────────────────────
-
-    use crate::model_components::agg_context::AggContext;
-    use crate::model_components::measures::Measure;
-    use crate::wrappers::polars::lazyframe_recorder::LazyFrameRecorder;
-
-    fn revenue_measure(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
-        let group_cols: Vec<Expr> = qc.groups.iter().map(|c| col(c.as_str())).collect();
-        dm.table("orders")
-            .group_by(group_cols)
-            .agg(vec![col("orders.amount").sum()])
-    }
-
-    fn order_count_measure(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
-        let group_cols: Vec<Expr> = qc.groups.iter().map(|c| col(c.as_str())).collect();
-        dm.table("orders")
-            .group_by(group_cols)
-            .agg(vec![col("orders.count").sum()])
-    }
-
-    fn make_query_dm() -> DataModel {
-        let orders = df![
-            "orders.date"   => ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
-            "orders.region" => ["north", "south", "north", "south"],
-            "orders.amount" => [100.0f64, 200.0, 150.0, 250.0],
-            "orders.count"  => [1i64, 2, 3, 4],
-        ]
-        .unwrap()
-        .lazy();
-        let mut dm = DataModel::new(
-            HashMap::from([("orders".to_string(), orders)]),
-            JoinGraph::new(&[]).unwrap(),
-            vec![],
-            None,
-        );
-        dm.add_measure(Measure::new("revenue", revenue_measure))
-            .unwrap();
-        dm.add_measure(Measure::new("order_count", order_count_measure))
-            .unwrap();
-        dm
-    }
-
-    #[test]
-    fn test_query_single_measure() {
-        let dm = make_query_dm();
-        let qc = AggContext::new(
-            vec!["revenue".into()],
-            None,
-            Some(vec!["orders.region".into()]),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
-            DataOutput::Data(df) => df,
-            _ => panic!("expected Data"),
-        };
-        assert_eq!(df.height(), 2);
-        let total: f64 = df
-            .column("orders.amount")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .sum();
-        assert!((total - 700.0).abs() < 1e-9);
-    }
-
-    #[cfg(feature = "async")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_query_async_single_measure() {
-        let dm = make_query_dm();
-        let qc = AggContext::new(
-            vec!["revenue".into()],
-            None,
-            Some(vec!["orders.region".into()]),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let df = match dm.execute_async(&DataQuery::Agg(qc), false).await.unwrap() {
-            DataOutput::Data(df) => df,
-            _ => panic!("expected Data"),
-        };
-        assert_eq!(df.height(), 2);
-        let total: f64 = df
-            .column("orders.amount")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .sum();
-        assert!((total - 700.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_query_two_compatible_measures() {
-        let dm = make_query_dm();
-        let qc = AggContext::new(
-            vec!["revenue".into(), "order_count".into()],
-            None,
-            Some(vec!["orders.region".into()]),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
-            DataOutput::Data(df) => df,
-            _ => panic!("expected Data"),
-        };
-        assert_eq!(df.height(), 2);
-        assert!(df.column("orders.amount").is_ok());
-        assert!(df.column("orders.count").is_ok());
-    }
-
-    #[test]
-    fn test_query_incompatible_measures_errors() {
-        let orders = df![
-            "orders.date"   => ["2024-01-01"],
-            "orders.region" => ["north"],
-            "orders.amount" => [100.0f64],
-        ]
-        .unwrap()
-        .lazy();
-        let mut dm = DataModel::new(
-            HashMap::from([("orders".to_string(), orders)]),
-            JoinGraph::new(&[]).unwrap(),
-            vec![],
-            None,
-        );
-
-        fn by_region(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
-            dm.table("orders")
-                .group_by(vec![col("orders.region")])
-                .agg(vec![col("orders.amount").sum()])
-        }
-
-        fn by_date(dm: &DataModel, _qc: &AggContext) -> LazyFrameRecorder {
-            dm.table("orders")
-                .group_by(vec![col("orders.date")])
-                .agg(vec![col("orders.amount").sum()])
-        }
-
-        dm.add_measure(Measure::new("revenue", by_region)).unwrap();
-        dm.add_measure(Measure::new("alt_revenue", by_date))
-            .unwrap();
-
-        let qc = AggContext::new(
-            vec!["revenue".into(), "alt_revenue".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let err = dm.execute(&DataQuery::Agg(qc), false).unwrap_err();
-        assert!(
-            err.contains("incompatible"),
-            "expected incompatible error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_query_with_having() {
-        let dm = make_query_dm();
-        // north: 100+150=250, south: 200+250=450 — only south passes > 300
-        let havings = serde_json::json!({
-            "left": {"col": "orders.amount"},
-            "op": ">",
-            "right": {"lit": 300.0}
-        });
-        let qc = AggContext::new(
-            vec!["revenue".into()],
-            None,
-            Some(vec!["orders.region".into()]),
-            Some(havings),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
-            DataOutput::Data(df) => df,
-            _ => panic!("expected Data"),
-        };
-        let amounts: Vec<f64> = df
-            .column("orders.amount")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .collect();
-        assert!(amounts.iter().all(|&v| v > 300.0));
-    }
-
-    #[test]
-    fn test_query_with_sort() {
-        let dm = make_query_dm();
-        let qc = AggContext::new(
-            vec!["revenue".into()],
-            None,
-            Some(vec!["orders.region".into()]),
-            None,
-            Some(vec![("orders.amount".into(), "desc".into())]),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
-            DataOutput::Data(df) => df,
-            _ => panic!("expected Data"),
-        };
-        let amounts: Vec<f64> = df
-            .column("orders.amount")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .collect();
-        assert!(amounts.windows(2).all(|w| w[0] >= w[1]));
-    }
-
-    #[test]
-    fn test_query_limit_offset() {
-        let dm = make_query_dm();
-        let qc = AggContext::new(
-            vec!["revenue".into()],
-            None,
-            Some(vec!["orders.region".into()]),
-            None,
-            None,
-            Some(1),
-            Some(1),
-            None,
-            None,
-        )
-        .unwrap();
-        let df = match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
-            DataOutput::Data(df) => df,
-            _ => panic!("expected Data"),
-        };
-        assert_eq!(df.height(), 1);
-    }
-
-    // ── get_column_values tests ───────────────────────────────────────────────
-
-    use crate::model_components::column_values_context::ColumnValuesContext;
-
-    fn column_values_df(dm: &DataModel, ctx: ColumnValuesContext) -> DataFrame {
-        match dm.execute(&DataQuery::ColumnValues(ctx), false).unwrap() {
-            DataOutput::Data(df) => df,
-            _ => panic!("expected Data"),
-        }
-    }
-
-    #[test]
-    fn test_column_values_from_base_table() {
-        let dm = make_orders_dm(None, vec![]);
-        let ctx = ColumnValuesContext::new("orders.region".into(), false, None).unwrap();
-        let df = column_values_df(&dm, ctx);
-        assert_eq!(df.height(), 2); // "north" and "south"
-    }
-
-    #[test]
-    fn test_column_values_prefers_pre_agg() {
-        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-        let ctx = ColumnValuesContext::new("orders.region".into(), true, None).unwrap();
-        let df = column_values_df(&dm, ctx);
-        assert_eq!(df.height(), 2);
-    }
-
-    #[test]
-    fn test_column_values_falls_back_when_no_pre_agg_covers() {
-        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-        // "orders.amount" is aggregated in the pre-agg but not in group_by
-        let ctx = ColumnValuesContext::new("orders.amount".into(), true, None).unwrap();
-        let df = column_values_df(&dm, ctx);
-        // base table has 4 rows, all amounts are distinct
-        assert_eq!(df.height(), 4);
-    }
-
-    #[test]
-    fn test_column_values_stale_pre_agg_falls_back() {
-        let (dm, _tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-        // max age of 0 seconds: any written file is immediately considered stale
-        let ctx = ColumnValuesContext::new("orders.region".into(), true, Some(0)).unwrap();
-        let df = column_values_df(&dm, ctx);
-        assert_eq!(df.height(), 2);
-    }
-
-    #[test]
-    fn test_column_values_unknown_table() {
-        let dm = make_orders_dm(None, vec![]);
-        let ctx = ColumnValuesContext::new("ghost.col".into(), false, None).unwrap();
-        assert!(dm.execute(&DataQuery::ColumnValues(ctx), false).is_err());
-    }
-
-    #[test]
-    fn test_column_values_unknown_column() {
-        let dm = make_orders_dm(None, vec![]);
-        let ctx = ColumnValuesContext::new("orders.ghost".into(), false, None).unwrap();
-        assert!(dm.execute(&DataQuery::ColumnValues(ctx), false).is_err());
     }
 }

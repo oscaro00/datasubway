@@ -109,6 +109,7 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 - More aggregation algorithms like KLL or t-digest for percentiles
 - Docs
 - Tests
+- Logic to rewrite similar queries if their only difference is the aggregate column
 - Figure out logic for:
   - with_columns()
   - join()
