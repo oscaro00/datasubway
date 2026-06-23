@@ -25,6 +25,19 @@ pub fn component_col_name(col: &str, component: &str) -> String {
     format!("{col}-{component}")
 }
 
+/// Convert a qualified column name to a parquet-safe dunder name.
+/// Replaces `.` with `__` to avoid clashing with DataFusion's `table.column` separator.
+/// e.g. "players.player_name" → "players__player_name"
+pub fn to_pre_agg_col_name(qualified: &str) -> String {
+    qualified.replace('.', "__")
+}
+
+/// Generate the parquet column name for a pre-agg component column.
+/// e.g. ("player_stats.goals", "sum") → "player_stats__goals__sum"
+pub fn pre_agg_component_col_name(qualified_col: &str, component: &str) -> String {
+    format!("{}__{component}", to_pre_agg_col_name(qualified_col))
+}
+
 /// Maps a DataFusion aggregate function name to the pre-agg components it requires.
 pub fn agg_needed_components(agg_fn_name: &str) -> Option<Vec<&'static str>> {
     match agg_fn_name {
@@ -184,8 +197,7 @@ impl DataModel {
             })?
             .clone();
 
-        let non_agg_str: std::collections::HashSet<String> =
-            pa.group_by.iter().cloned().collect();
+        let non_agg_str: std::collections::HashSet<String> = pa.group_by.iter().cloned().collect();
         let agg_str: HashMap<String, Vec<String>> = pa
             .aggregations
             .iter()
@@ -200,13 +212,13 @@ impl DataModel {
         let group_by_exprs: Vec<Expr> = pa
             .group_by
             .iter()
-            .map(|c| col(c.as_str()).alias(c.as_str()))
+            .map(|c| col(c.as_str()).alias(to_pre_agg_col_name(c).as_str()))
             .collect();
 
         let mut agg_exprs: Vec<Expr> = Vec::new();
         for (qcol, components) in &pa.aggregations {
             for component in components {
-                let alias = component_col_name(qcol, component);
+                let alias = pre_agg_component_col_name(qcol, component);
                 let qcol_expr = || col(qcol.as_str());
                 let expr = match component.as_str() {
                     "sum" => sum(qcol_expr()).alias(&alias),
@@ -227,9 +239,7 @@ impl DataModel {
         let file_path = format!("{path}/{}.parquet", pa.name);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(
-                    df.write_parquet(&file_path, DataFrameWriteOptions::new(), None),
-                )
+                handle.block_on(df.write_parquet(&file_path, DataFrameWriteOptions::new(), None))
             }),
             Err(_) => tokio::runtime::Builder::new_current_thread()
                 .enable_all()

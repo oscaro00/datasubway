@@ -5,7 +5,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::logical_expr::{JoinType, LogicalPlanBuilder};
+use datafusion::logical_expr::ExplainOption;
+use datafusion::logical_expr::{JoinType, LogicalPlan, LogicalPlanBuilder, SubqueryAlias};
 use datafusion::prelude::{DataFrame, ParquetReadOptions, SessionContext};
 use tracing::debug;
 
@@ -13,14 +14,15 @@ use crate::model_components::{
     agg_context::AggContext,
     column_values_context::ColumnValuesContext,
     joins::{JoinGraph, JoinHow},
-    measures::{DfMeasure, MeasureMetadata, extract_df_measure_metadata, validate_df_measure_structure},
+    measures::{
+        DfMeasure, MeasureMetadata, extract_df_measure_metadata, validate_df_measure_structure,
+    },
     pre_aggregations::{PreAggregation, agg_needed_components},
     select_context::SelectContext,
 };
 use crate::wrappers::datafusion::{
-    aggregate_with_metadata::AggregateWithMetadataPlanner,
+    aggregate_with_metadata::AggregateWithMetadataPlanner, dataframe_recorder::DataFrameRecorder,
     dataframe_wrapper::DataFrameWrapper,
-    dataframe_recorder::DataFrameRecorder,
 };
 
 mod agg_builder;
@@ -99,7 +101,11 @@ impl DataModel {
             joins,
             measures: HashMap::new(),
             measure_metadata: HashMap::new(),
-            pre_aggs: if pre_aggs.is_empty() { None } else { Some(pre_aggs) },
+            pre_aggs: if pre_aggs.is_empty() {
+                None
+            } else {
+                Some(pre_aggs)
+            },
             pre_agg_path,
         }))
     }
@@ -147,6 +153,25 @@ impl DataModel {
             .map_err(|e| format!("execution failed: {e}"))
     }
 
+    pub fn explain(&self, q: &DataQuery, options: ExplainOption) -> Result<DataFrame, String> {
+        let df = match q {
+            DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
+            DataQuery::View(ctx) => self.build_select_frame(ctx)?,
+            DataQuery::ColumnValues(ctx) => self.build_column_values_frame(ctx)?,
+        };
+        df.explain_with_options(options)
+            .map_err(|e| format!("explain failed: {e}"))
+    }
+
+    pub fn display_graphviz(&self, q: &DataQuery) -> Result<String, String> {
+        let df = match q {
+            DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
+            DataQuery::View(ctx) => self.build_select_frame(ctx)?,
+            DataQuery::ColumnValues(ctx) => self.build_column_values_frame(ctx)?,
+        };
+        Ok(df.into_unoptimized_plan().display_graphviz().to_string())
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     fn validate_and_extract_measure(&self, measure: &DfMeasure) -> Result<MeasureMetadata, String> {
@@ -168,8 +193,7 @@ impl DataModel {
         pre_agg_allowed: bool,
     ) -> datafusion::common::Result<DataFrameWrapper> {
         if pre_agg_allowed && !agg_cols.is_empty() {
-            if let (Some(pre_aggs), Some(path)) =
-                (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
+            if let (Some(pre_aggs), Some(path)) = (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
             {
                 let non_agg_vec: Vec<String> = non_agg_cols.iter().cloned().collect();
                 let agg_map: HashMap<String, HashSet<String>> = agg_cols
@@ -198,8 +222,26 @@ impl DataModel {
                         continue 'candidates;
                     }
                     debug!(pre_agg = %candidate.name, table = %table_name, "using pre-aggregation");
-                    if let Ok(df) = self.read_parquet_sync(&pre_agg_file) {
-                        return Ok(DataFrameWrapper { inner: df, from_pre_agg: true });
+                    if let Ok(raw_df) = self.read_parquet_sync(&pre_agg_file) {
+                        match SubqueryAlias::try_new(
+                            Arc::new(raw_df.into_unoptimized_plan()),
+                            candidate.name.as_str(),
+                        ) {
+                            Ok(alias) => {
+                                let df = DataFrame::new(
+                                    self.0.ctx.state(),
+                                    LogicalPlan::SubqueryAlias(alias),
+                                );
+                                return Ok(DataFrameWrapper {
+                                    inner: df,
+                                    from_pre_agg: true,
+                                    pre_agg_name: Some(candidate.name.clone()),
+                                });
+                            }
+                            Err(e) => {
+                                debug!(pre_agg = %candidate.name, err = %e, "SubqueryAlias failed, trying next");
+                            }
+                        }
                     }
                     debug!(pre_agg = %candidate.name, "failed to read parquet, trying next");
                 }
@@ -241,7 +283,11 @@ impl DataModel {
             }
         }
 
-        Ok(DataFrameWrapper { inner: df, from_pre_agg: false })
+        Ok(DataFrameWrapper {
+            inner: df,
+            from_pre_agg: false,
+            pre_agg_name: None,
+        })
     }
 
     pub(crate) fn scan_table(&self, table_name: &str) -> datafusion::common::Result<DataFrame> {

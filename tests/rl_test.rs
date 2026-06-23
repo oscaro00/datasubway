@@ -223,6 +223,16 @@ async fn shared_dm() -> &'static DataModel {
     SHARED_DM.get_or_init(|| async { build_dm().await }).await
 }
 
+static SHARED_PRE_AGG_DM: tokio::sync::OnceCell<(DataModel, TempDir)> =
+    tokio::sync::OnceCell::const_new();
+
+async fn shared_pre_agg_dm() -> &'static DataModel {
+    &SHARED_PRE_AGG_DM
+        .get_or_init(|| async { build_dm_with_pre_agg().await })
+        .await
+        .0
+}
+
 async fn dm_query(dm: &DataModel, qc: AggContext) -> Vec<RecordBatch> {
     match dm.execute(&DataQuery::Agg(qc)).await.unwrap() {
         DataOutput::Data(batches) => batches,
@@ -236,7 +246,10 @@ fn sorted_select(batches: Vec<RecordBatch>, sort_col: &str, cols: &[&str]) -> St
     let schema = batches[0].schema();
     let combined = concat_batches(&schema, &batches).unwrap();
 
-    let sort_opts = Some(SortOptions { descending: false, nulls_first: true });
+    let sort_opts = Some(SortOptions {
+        descending: false,
+        nulls_first: true,
+    });
     let sort_idx = schema.index_of(sort_col).unwrap();
     // Primary: sort_col. Secondary: each selected column in order — stabilizes ties
     // (e.g. two rows with NULL primary key produced by different sides of a FULL JOIN).
@@ -247,7 +260,10 @@ fn sorted_select(batches: Vec<RecordBatch>, sort_col: &str, cols: &[&str]) -> St
     for &c in cols {
         let i = schema.index_of(c).unwrap();
         if i != sort_idx {
-            sort_columns.push(SortColumn { values: Arc::clone(combined.column(i)), options: sort_opts });
+            sort_columns.push(SortColumn {
+                values: Arc::clone(combined.column(i)),
+                options: sort_opts,
+            });
         }
     }
     let indices = lexsort_to_indices(&sort_columns, None).unwrap();
@@ -271,7 +287,7 @@ fn sorted_select(batches: Vec<RecordBatch>, sort_col: &str, cols: &[&str]) -> St
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_player_goals_by_player_name() {
-    let dm = shared_dm().await;
+    let dm = shared_pre_agg_dm().await;
     let qc = AggContext::new(
         vec!["player_goals".to_string()],
         None,
@@ -280,10 +296,17 @@ async fn test_player_goals_by_player_name() {
         None,
         None,
         None,
-        None,
+        Some(true),
         None,
     )
     .unwrap();
+    let qc_clone = qc.clone();
+    let plan = dm.display_graphviz(&DataQuery::Agg(qc_clone)).unwrap();
+    println!("{plan}");
+    assert!(
+        plan.contains("player_goals_by_player"),
+        "use_pre_agg=true: expected pre-agg table in plan, got:\n{plan}"
+    );
     let actual = dm_query(&dm, qc).await;
 
     let ctx = shared_ctx().await;
@@ -487,6 +510,11 @@ async fn test_multi_measure_join() {
         None,
     )
     .unwrap();
+    let qc_clone = qc.clone();
+    println!(
+        "{}",
+        dm.display_graphviz(&DataQuery::Agg(qc_clone)).unwrap()
+    );
     let actual = dm_query(&dm, qc).await;
 
     let ctx = shared_ctx().await;

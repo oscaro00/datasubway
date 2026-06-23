@@ -172,6 +172,7 @@ impl DataFrameRecorder {
         )?;
 
         let from_pre_agg = base.from_pre_agg;
+        let pre_agg_name = base.pre_agg_name.clone().unwrap_or_default();
         let alias_map = self.alias_map.clone();
         let allow_exclude_records = self.allow_exclude_records.clone();
 
@@ -200,12 +201,9 @@ impl DataFrameRecorder {
                     aggr_expr,
                 } => {
                     let final_group = if from_pre_agg {
-                        // Pre-agg parquet stores columns with flat dot-names (relation=None).
-                        // Convert qualified refs like col("players.player_name") to
-                        // Column::from_name("players.player_name") so they resolve correctly.
                         group_expr
                             .into_iter()
-                            .map(rewrite_group_for_pre_agg)
+                            .map(|e| rewrite_group_for_pre_agg(e, &pre_agg_name))
                             .collect()
                     } else {
                         group_expr
@@ -213,7 +211,7 @@ impl DataFrameRecorder {
                     let final_aggr = if from_pre_agg {
                         aggr_expr
                             .into_iter()
-                            .map(|e| rewrite_for_pre_agg(e, &alias_map))
+                            .map(|e| rewrite_for_pre_agg(e, &alias_map, &pre_agg_name))
                             .collect()
                     } else {
                         aggr_expr

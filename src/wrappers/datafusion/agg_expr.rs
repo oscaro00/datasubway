@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
-use datafusion::common::Column;
 use datafusion::logical_expr::expr::AggregateFunction;
-use datafusion::prelude::Expr;
+use datafusion::prelude::{Expr, col};
 
-use crate::model_components::pre_aggregations::component_col_name;
+use crate::model_components::pre_aggregations::{pre_agg_component_col_name, to_pre_agg_col_name};
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
@@ -64,16 +63,23 @@ pub fn resolve_source_col(name: &str, alias_map: &HashMap<String, String>) -> St
 
 // ── Rewriting ─────────────────────────────────────────────────────────────────
 
-/// Rewrite a group-by column expression to use an unqualified `Column::from_name`
-/// reference — matching the flat field names written into pre-aggregation parquet files.
-pub fn rewrite_group_for_pre_agg(expr: Expr) -> Expr {
+/// Rewrite a group-by column expression to reference the pre-aggregation table.
+///
+/// References the dunder column in the aliased pre-agg table and aliases the result
+/// back to the original qualified name. This keeps the aggregate output schema
+/// consistent with the non-pre-agg path so `flatten_df` needs no special handling.
+///
+/// e.g. `col("players.player_name")` →
+///      `col("player_goals_by_player.players__player_name").alias("players.player_name")`
+pub fn rewrite_group_for_pre_agg(expr: Expr, pre_agg_name: &str) -> Expr {
     match expr {
         Expr::Column(c) => {
             let flat = match &c.relation {
                 Some(rel) => format!("{rel}.{}", c.name),
                 None => c.name.clone(),
             };
-            Expr::Column(Column::from_name(&flat))
+            col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&flat)).as_str())
+                .alias(flat.as_str())
         }
         other => other,
     }
@@ -85,10 +91,14 @@ pub fn rewrite_group_for_pre_agg(expr: Expr) -> Expr {
 /// Only single-agg expressions (possibly wrapped in an alias) are rewritten.
 /// Complex binary expressions are recursed into, but the pre-agg formula for
 /// each leaf agg is substituted independently.
-pub fn rewrite_for_pre_agg(expr: Expr, alias_map: &HashMap<String, String>) -> Expr {
+pub fn rewrite_for_pre_agg(
+    expr: Expr,
+    alias_map: &HashMap<String, String>,
+    pre_agg_name: &str,
+) -> Expr {
     match expr {
         Expr::Alias(a) => {
-            let rewritten = rewrite_for_pre_agg(*a.expr, alias_map);
+            let rewritten = rewrite_for_pre_agg(*a.expr, alias_map, pre_agg_name);
             rewritten.alias(a.name.as_str())
         }
         Expr::AggregateFunction(ref agg) => {
@@ -99,28 +109,31 @@ pub fn rewrite_for_pre_agg(expr: Expr, alias_map: &HashMap<String, String>) -> E
                 .first()
                 .and_then(|a| extract_col_name(a).map(|n| resolve_source_col(&n, alias_map)));
             match col_name {
-                Some(c) => build_pre_agg_expr(&c, &agg_name).unwrap_or(expr),
+                Some(c) => build_pre_agg_expr(&c, &agg_name, pre_agg_name).unwrap_or(expr),
                 None => expr,
             }
         }
         Expr::BinaryExpr(b) => {
-            let left = rewrite_for_pre_agg(*b.left, alias_map);
-            let right = rewrite_for_pre_agg(*b.right, alias_map);
-            left + right // reconstruct; operator preserved via BinaryExpr
-            // Note: we rebuild generically; for correctness we'd need to
-            // pass the operator through — but pre-agg rewriting only applies
-            // to single-agg leaf expressions, so binary agg combinations
-            // are left unchanged by the None branch above.
+            let left = rewrite_for_pre_agg(*b.left, alias_map, pre_agg_name);
+            let right = rewrite_for_pre_agg(*b.right, alias_map, pre_agg_name);
+            left + right
         }
         other => other,
     }
 }
 
-fn build_pre_agg_expr(col_name: &str, agg_name: &str) -> Option<Expr> {
+fn build_pre_agg_expr(col_name: &str, agg_name: &str, pre_agg_name: &str) -> Option<Expr> {
     use datafusion::functions_aggregate::expr_fn::{max, min, sum};
 
-    let c =
-        |component: &str| Expr::Column(Column::from_name(component_col_name(col_name, component)));
+    // col("pre_agg_name.table__col__component") — DataFusion splits at the first dot,
+    // yielding Column{relation: Some(pre_agg_name), name: "table__col__component"}.
+    let c = |component: &str| {
+        col(format!(
+            "{pre_agg_name}.{}",
+            pre_agg_component_col_name(col_name, component)
+        )
+        .as_str())
+    };
 
     Some(match agg_name {
         "sum" => sum(c("sum")),
