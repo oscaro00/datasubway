@@ -1,6 +1,5 @@
-use grafeo::{GrafeoDB, Session, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::trace;
 
 /// Whether the join is inner or left.
@@ -30,54 +29,26 @@ pub struct Join {
     pub direction: JoinDirection,
 }
 
-/// LPG-backed join graph stored in an in-memory grafeo database.
+/// Join graph with O(1) path lookup.
 /// Validates no 3+ cycles and no multiple paths between tables at construction.
-/// Paths are pre-computed into a lookup map for O(1) retrieval.
 pub struct JoinGraph {
-    db: GrafeoDB,
     lookup: HashMap<String, HashMap<String, Vec<Join>>>,
     tables: HashSet<String>,
 }
 
 impl JoinGraph {
     pub fn new(joins: &[Join]) -> Result<Self, String> {
-        let db = GrafeoDB::new_in_memory();
-        let session = db.session();
         let mut tables = HashSet::new();
-
         for join in joins {
             tables.insert(join.left.clone());
             tables.insert(join.right.clone());
         }
 
-        for table in &tables {
-            let mut params = HashMap::new();
-            params.insert("name".to_string(), Value::String(table.as_str().into()));
-            session
-                .execute_with_params("INSERT (:Table {name: $name})", params)
-                .map_err(|e| e.to_string())?;
-        }
-
-        for join in joins {
-            insert_edge(&session, join)?;
-            if join.direction == JoinDirection::Both {
-                let reverse = Join {
-                    left: join.right.clone(),
-                    right: join.left.clone(),
-                    left_on: join.right_on.clone(),
-                    right_on: join.left_on.clone(),
-                    how: join.how.clone(),
-                    direction: join.direction.clone(),
-                };
-                insert_edge(&session, &reverse)?;
-            }
-        }
-
-        validate_no_long_cycles(&session)?;
-        let lookup = compute_lookup(&session, &tables)?;
+        validate_no_long_cycles(joins)?;
+        let lookup = compute_lookup(joins, &tables)?;
 
         trace!(tables = tables.len(), "join graph built");
-        Ok(JoinGraph { db, lookup, tables })
+        Ok(JoinGraph { lookup, tables })
     }
 
     /// Returns the pre-computed join path from `start` to `end`, or None if unreachable.
@@ -88,47 +59,19 @@ impl JoinGraph {
         self.lookup.get(start)?.get(end).cloned()
     }
 
-    /// Returns the minimal, deduplicated ordered set of joins needed to reach all
-    /// `targets` from `base`. Uses a grafeo path query so shared intermediate hops
-    /// are not duplicated across multiple target paths.
+    /// Returns the minimal, deduplicated set of joins needed to reach all `targets` from `base`.
+    /// Shared intermediate hops are not duplicated across multiple target paths.
     pub fn find_joins_for_tables(&self, base: &str, targets: &[&str]) -> Vec<Join> {
         if targets.is_empty() {
             return vec![];
         }
-        let session = self.db.session();
-        let target_list = targets
-            .iter()
-            .map(|t| format!("'{t}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query = format!(
-            "MATCH p = (b:Table {{name: $base}})-[:JOIN*1..100]->(t:Table) \
-             WHERE t.name IN [{target_list}] \
-             RETURN p ORDER BY length(p)"
-        );
-        let mut params = HashMap::new();
-        params.insert("base".to_string(), Value::String(base.into()));
-
-        let result = match session.execute_with_params(&query, params) {
-            Ok(r) => r,
-            Err(e) => {
-                trace!(error = %e, "find_joins_for_tables query failed");
-                return vec![];
-            }
-        };
-
         let mut seen: HashSet<(String, String)> = HashSet::new();
         let mut joins = Vec::new();
-
-        for row in result.rows() {
-            if let Some(Value::Path { nodes, edges }) = row.first() {
-                for (i, edge_val) in edges.iter().enumerate() {
-                    let left = node_name(&nodes[i]);
-                    let right = node_name(&nodes[i + 1]);
-                    if seen.insert((left.clone(), right.clone())) {
-                        if let Some(join) = join_from_edge(edge_val, left, right) {
-                            joins.push(join);
-                        }
+        for &target in targets {
+            if let Some(path) = self.find_path(base, target) {
+                for join in path {
+                    if seen.insert((join.left.clone(), join.right.clone())) {
+                        joins.push(join);
                     }
                 }
             }
@@ -146,134 +89,135 @@ impl JoinGraph {
 }
 
 // ---------------------------------------------------------------------------
-// Graph construction helpers
-// ---------------------------------------------------------------------------
-
-fn insert_edge(session: &Session, join: &Join) -> Result<(), String> {
-    let left_on: Vec<Value> = join
-        .left_on
-        .iter()
-        .map(|s| Value::String(s.as_str().into()))
-        .collect();
-    let right_on: Vec<Value> = join
-        .right_on
-        .iter()
-        .map(|s| Value::String(s.as_str().into()))
-        .collect();
-    let how_str = match join.how {
-        JoinHow::Left => "left",
-        JoinHow::Inner => "inner",
-    };
-    let dir_str = match join.direction {
-        JoinDirection::Both => "both",
-        JoinDirection::RightOnLeft => "rightonleft",
-    };
-
-    let mut params: HashMap<String, Value> = HashMap::new();
-    params.insert("left".to_string(), Value::String(join.left.as_str().into()));
-    params.insert(
-        "right".to_string(),
-        Value::String(join.right.as_str().into()),
-    );
-    params.insert("left_on".to_string(), Value::List(left_on.into()));
-    params.insert("right_on".to_string(), Value::List(right_on.into()));
-    params.insert("how".to_string(), Value::String(how_str.into()));
-    params.insert("direction".to_string(), Value::String(dir_str.into()));
-
-    session
-        .execute_with_params(
-            "MATCH (l:Table {name: $left}), (r:Table {name: $right}) \
-             INSERT (l)-[:JOIN {left_on: $left_on, right_on: $right_on, \
-                               how: $how, direction: $direction}]->(r)",
-            params,
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
-/// Detects any directed cycle of 3 or more hops. Two-node cycles from
-/// bidirectional edges (A→B→A) are allowed and not flagged.
-fn validate_no_long_cycles(session: &Session) -> Result<(), String> {
-    let result = session
-        .execute(
-            "MATCH (a:Table)-[:JOIN*3..100]->(b:Table) \
-             WHERE a.name = b.name \
-             RETURN a.name LIMIT 1",
-        )
-        .map_err(|e| e.to_string())?;
+/// Detects any directed simple cycle involving 3 or more distinct tables.
+/// Two-table cycles from bidirectional edges (A↔B) are allowed.
+fn validate_no_long_cycles(joins: &[Join]) -> Result<(), String> {
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut all_nodes: HashSet<&str> = HashSet::new();
+    for join in joins {
+        let l = join.left.as_str();
+        let r = join.right.as_str();
+        all_nodes.insert(l);
+        all_nodes.insert(r);
+        adj.entry(l).or_default().push(r);
+        if join.direction == JoinDirection::Both {
+            adj.entry(r).or_default().push(l);
+        }
+    }
 
-    if let Some(row) = result.rows().first() {
-        if let Value::String(name) = &row[0] {
+    for &start in &all_nodes {
+        if has_long_cycle_from(&adj, start) {
             return Err(format!(
-                "Cycle of length >= 3 detected involving table '{name}'"
+                "Cycle of length >= 3 detected involving table '{start}'"
             ));
         }
     }
     Ok(())
 }
 
+/// Returns true if there is a simple path from `start` back to `start` passing through
+/// at least 2 other distinct nodes (i.e., a simple directed cycle of length ≥ 3).
+fn has_long_cycle_from(adj: &HashMap<&str, Vec<&str>>, start: &str) -> bool {
+    // Iterative DFS tracking the current path.
+    // path: (node, next-neighbor-index). in_path: nodes on the current path.
+    let mut path: Vec<(&str, usize)> = vec![(start, 0)];
+    let mut in_path: HashSet<&str> = HashSet::from([start]);
+
+    loop {
+        let (current, i) = match path.last() {
+            Some(&top) => top,
+            None => break,
+        };
+        let neighbors = adj.get(current).map(|v| v.as_slice()).unwrap_or(&[]);
+        if i < neighbors.len() {
+            path.last_mut().unwrap().1 += 1;
+            let neighbor = neighbors[i];
+            if neighbor == start {
+                // Back-edge to start: cycle length = path.len() nodes (path includes start).
+                // path.len() >= 3 means start + ≥2 intermediates → 3+ distinct nodes.
+                if path.len() >= 3 {
+                    return true;
+                }
+            } else if !in_path.contains(neighbor) {
+                in_path.insert(neighbor);
+                path.push((neighbor, 0));
+            }
+        } else {
+            path.pop();
+            in_path.remove(current);
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Path pre-computation
 // ---------------------------------------------------------------------------
 
-/// For every start table, validates unique paths and pre-computes the lookup.
-///
-/// Uses `MATCH SIMPLE` (no repeated nodes) to count paths per end node —
-/// this prevents false positives from bidirectional edges re-entering the
-/// start node. Then uses `ANY SHORTEST` to retrieve the canonical path.
+/// BFS from each table to pre-compute all reachable paths.
+/// Also validates that each (start, end) pair has at most one simple path.
 fn compute_lookup(
-    session: &Session,
+    joins: &[Join],
     tables: &HashSet<String>,
 ) -> Result<HashMap<String, HashMap<String, Vec<Join>>>, String> {
-    let mut lookup = HashMap::new();
+    // Build adjacency list including reverse edges for bidirectional joins.
+    let mut adj: HashMap<&str, Vec<(&str, Join)>> = HashMap::new();
+    for join in joins {
+        adj.entry(join.left.as_str())
+            .or_default()
+            .push((join.right.as_str(), join.clone()));
+        if join.direction == JoinDirection::Both {
+            let reverse = Join {
+                left: join.right.clone(),
+                right: join.left.clone(),
+                left_on: join.right_on.clone(),
+                right_on: join.left_on.clone(),
+                how: join.how.clone(),
+                direction: join.direction.clone(),
+            };
+            adj.entry(join.right.as_str())
+                .or_default()
+                .push((join.left.as_str(), reverse));
+        }
+    }
+
+    let mut lookup: HashMap<String, HashMap<String, Vec<Join>>> = HashMap::new();
 
     for start in tables {
-        let mut params = HashMap::new();
-        params.insert("start".to_string(), Value::String(start.as_str().into()));
-
-        // Validate: at most one simple path to each reachable table.
-        let count_result = session
-            .execute_with_params(
-                "MATCH SIMPLE (a:Table {name: $start})-[:JOIN*1..100]->(b:Table) \
-                 RETURN b.name AS target, COUNT(*) AS cnt",
-                params.clone(),
-            )
-            .map_err(|e| e.to_string())?;
-
-        for row in count_result.rows() {
-            let target = match &row[0] {
-                Value::String(s) => s.to_string(),
-                _ => continue,
-            };
-            let cnt = match &row[1] {
-                Value::Int64(n) => *n,
-                _ => continue,
-            };
-            if cnt > 1 {
-                return Err(format!(
-                    "Multiple paths from '{start}' to '{target}' detected"
-                ));
-            }
-        }
-
-        // Retrieve the canonical (shortest) path to each reachable table.
-        let path_result = session
-            .execute_with_params(
-                "MATCH p = ANY SHORTEST (a:Table {name: $start})-[:JOIN*1..100]->(b:Table) \
-                 RETURN p",
-                params,
-            )
-            .map_err(|e| e.to_string())?;
-
+        let start_str = start.as_str();
         let mut inner: HashMap<String, Vec<Join>> = HashMap::new();
-        for row in path_result.rows() {
-            if let Some(Value::Path { nodes, edges }) = row.first() {
-                let end = node_name(&nodes[nodes.len() - 1]);
-                inner.insert(end, extract_path_joins(nodes, edges));
+        let mut visited: HashSet<&str> = HashSet::from([start_str]);
+        // BFS parent map: parent[v] = the node that first discovered v.
+        let mut parent: HashMap<&str, &str> = HashMap::new();
+        let mut queue: VecDeque<(&str, Vec<Join>)> = VecDeque::new();
+        queue.push_back((start_str, vec![]));
+
+        while let Some((current, path)) = queue.pop_front() {
+            for (neighbor, join_edge) in adj.get(current).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if *neighbor == start_str {
+                    continue; // Skip back-edges to start.
+                }
+                if visited.contains(*neighbor) {
+                    // Cross-edge to a non-start visited node is only allowed when it is the
+                    // reverse of the bidirectional tree edge that brought us to `current`.
+                    let is_bidi_reverse = join_edge.direction == JoinDirection::Both
+                        && parent.get(current).copied() == Some(*neighbor);
+                    if !is_bidi_reverse {
+                        return Err(format!(
+                            "Multiple paths from '{start}' to '{neighbor}' detected"
+                        ));
+                    }
+                    continue;
+                }
+                visited.insert(neighbor);
+                parent.insert(neighbor, current);
+                let mut new_path = path.clone();
+                new_path.push(join_edge.clone());
+                inner.insert(neighbor.to_string(), new_path.clone());
+                queue.push_back((neighbor, new_path));
             }
         }
 
@@ -282,70 +226,6 @@ fn compute_lookup(
     }
 
     Ok(lookup)
-}
-
-fn extract_path_joins(nodes: &[Value], edges: &[Value]) -> Vec<Join> {
-    edges
-        .iter()
-        .enumerate()
-        .filter_map(|(i, edge_val)| {
-            join_from_edge(edge_val, node_name(&nodes[i]), node_name(&nodes[i + 1]))
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Value extraction helpers
-// ---------------------------------------------------------------------------
-
-fn string_list(val: &Value) -> Vec<String> {
-    match val {
-        Value::List(items) => items
-            .iter()
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s.to_string()),
-                _ => None,
-            })
-            .collect(),
-        _ => vec![],
-    }
-}
-
-/// Extracts the `name` property from a node value in a path.
-fn node_name(node_val: &Value) -> String {
-    match node_val {
-        Value::Map(map) => match map.get("name") {
-            Some(Value::String(s)) => s.to_string(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    }
-}
-
-/// Reconstructs a Join from an edge value in a path.
-fn join_from_edge(edge_val: &Value, left: String, right: String) -> Option<Join> {
-    let map = match edge_val {
-        Value::Map(m) => m,
-        _ => return None,
-    };
-    let left_on = string_list(map.get("left_on").unwrap_or(&Value::Null));
-    let right_on = string_list(map.get("right_on").unwrap_or(&Value::Null));
-    let how = match map.get("how") {
-        Some(Value::String(s)) if s.as_str() == "inner" => JoinHow::Inner,
-        _ => JoinHow::Left,
-    };
-    let direction = match map.get("direction") {
-        Some(Value::String(s)) if s.as_str() == "both" => JoinDirection::Both,
-        _ => JoinDirection::RightOnLeft,
-    };
-    Some(Join {
-        left,
-        right,
-        left_on,
-        right_on,
-        how,
-        direction,
-    })
 }
 
 #[cfg(test)]

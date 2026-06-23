@@ -131,7 +131,11 @@ pub fn resolve_group_by_cols(df: &DataFrame) -> Result<Vec<String>, String> {
                 .iter()
                 .filter_map(|e| {
                     if let Expr::Column(c) = e {
-                        Some(c.name.clone())
+                        let name = match &c.relation {
+                            Some(r) => format!("{r}.{}", c.name),
+                            None => c.name.clone(),
+                        };
+                        Some(name)
                     } else {
                         None
                     }

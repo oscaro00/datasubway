@@ -1,6 +1,12 @@
+use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchemaRef, Result};
-use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion::execution::context::{QueryPlanner, SessionState};
+use datafusion::logical_expr::{
+    Aggregate, Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::{DataFrame, Expr};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -92,6 +98,56 @@ impl UserDefinedLogicalNodeCore for AggregateWithMetadata {
             schema: self.schema.clone(),
             metadata: self.metadata.clone(),
         })
+    }
+}
+
+// ── Physical planner ─────────────────────────────────────────────────────────
+
+struct AggregateWithMetadataExtensionPlanner;
+
+#[async_trait]
+impl ExtensionPlanner for AggregateWithMetadataExtensionPlanner {
+    async fn plan_extension(
+        &self,
+        planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        _logical_inputs: &[&LogicalPlan],
+        _physical_inputs: &[Arc<dyn ExecutionPlan>],
+        session_state: &SessionState,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(agg) = node.as_any().downcast_ref::<AggregateWithMetadata>() else {
+            return Ok(None);
+        };
+        let logical_agg = LogicalPlan::Aggregate(Aggregate::try_new(
+            agg.input.clone(),
+            agg.group_expr.clone(),
+            agg.aggr_expr.clone(),
+        )?);
+        let physical = planner
+            .create_physical_plan(&logical_agg, session_state)
+            .await?;
+        Ok(Some(physical))
+    }
+}
+
+/// A `QueryPlanner` that wraps `DefaultPhysicalPlanner` with support for
+/// `AggregateWithMetadata` extension nodes. Register this on the session
+/// state so `AggregateWithMetadata` nodes can be executed.
+#[derive(Debug)]
+pub struct AggregateWithMetadataPlanner;
+
+#[async_trait]
+impl QueryPlanner for AggregateWithMetadataPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &SessionState,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+            AggregateWithMetadataExtensionPlanner,
+        )])
+        .create_physical_plan(logical_plan, session_state)
+        .await
     }
 }
 

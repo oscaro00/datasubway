@@ -1,11 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
+use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::provider_as_source;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::functions_aggregate::expr_fn::max;
 use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, SortExpr};
-use datafusion::prelude::{DataFrame, Expr, ParquetReadOptions, SessionContext, col};
+use datafusion::prelude::{DataFrame, Expr, ParquetReadOptions, SessionContext, col, lit};
 use tracing::{debug, trace};
 
 use crate::{
@@ -22,6 +26,7 @@ use crate::{
         select_context::SelectContext,
     },
     wrappers::datafusion::{
+        aggregate_with_metadata::AggregateWithMetadataPlanner,
         dataframe_recorder::DataFrameRecorder, dataframe_wrapper::DataFrameWrapper,
     },
 };
@@ -64,8 +69,6 @@ struct DataModelInner {
     pub measure_metadata: HashMap<String, MeasureMetadata>,
     pre_aggs: Option<Vec<PreAggregation>>,
     pre_agg_path: Option<String>,
-    /// Tokio runtime for executing async DataFusion operations from sync code.
-    rt: Arc<tokio::runtime::Runtime>,
 }
 
 #[derive(Clone)]
@@ -82,9 +85,10 @@ impl DataModel {
         pre_aggs: Vec<PreAggregation>,
         pre_agg_path: Option<String>,
     ) -> DataModel {
-        let ctx = SessionContext::new();
-
-        let rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime for DataModel"));
+        let state = SessionStateBuilder::new_with_default_features()
+            .with_query_planner(Arc::new(AggregateWithMetadataPlanner))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
 
         // Register all tables so the session context can resolve them.
         for (name, provider) in &tables {
@@ -111,7 +115,6 @@ impl DataModel {
                 Some(pre_aggs)
             },
             pre_agg_path,
-            rt,
         }))
     }
 
@@ -216,30 +219,28 @@ impl DataModel {
             } else {
                 expected_cols = Some(cols);
             }
+            // Do NOT normalize here — keep DataFusion's qualified column relations
+            // so the inter-measure join below can resolve column names naturally.
             measure_dfs.push(df);
         }
 
         let join_cols: Vec<String> = expected_cols.unwrap_or_default();
 
-        let mut combined = measure_dfs.remove(0);
-        for frame in measure_dfs {
-            combined = if join_cols.is_empty() {
-                let (state, left_plan) = combined.into_parts();
-                let right_plan = frame.into_unoptimized_plan();
-                let cross_plan = LogicalPlanBuilder::from(left_plan)
-                    .cross_join(right_plan)
-                    .map_err(|e| format!("failed to cross join measures: {e}"))?
-                    .build()
-                    .map_err(|e| format!("failed to build cross join: {e}"))?;
-                DataFrame::new(state, cross_plan)
-            } else {
-                let left_on: Vec<&str> = join_cols.iter().map(|s| s.as_str()).collect();
-                let right_on: Vec<&str> = join_cols.iter().map(|s| s.as_str()).collect();
-                combined
-                    .join(frame, JoinType::Full, &left_on, &right_on, None)
-                    .map_err(|e| format!("failed to join measures: {e}"))?
-            };
-        }
+        // Normalize each measure DF to unqualified flat-named fields, then combine.
+        // For a single measure this is just a pass-through normalize. For multiple
+        // measures we use UNION ALL + GROUP BY MAX, which avoids the DataFusion
+        // "duplicate qualified field name" error that occurs with a Full join when
+        // both sides carry the same qualified group column.
+        let normalized: Vec<DataFrame> = measure_dfs
+            .into_iter()
+            .map(normalize_schema)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut combined = if normalized.len() == 1 {
+            normalized.into_iter().next().unwrap()
+        } else {
+            combine_measures(normalized, &join_cols)?
+        };
 
         if let Some(having_expr) = json_to_expr(&qc.havings) {
             combined = combined
@@ -251,7 +252,7 @@ impl DataModel {
             let sort_exprs: Vec<SortExpr> = qc
                 .sorts
                 .iter()
-                .map(|(c, d)| col(c.as_str()).sort(d != "desc", true))
+                .map(|(c, d)| Expr::Column(Column::from_name(c.as_str())).sort(d != "desc", true))
                 .collect();
             combined = combined
                 .sort(sort_exprs)
@@ -327,14 +328,18 @@ impl DataModel {
             df = df.filter(filter_expr).map_err(|e| e.to_string())?;
         }
 
-        let select_exprs: Vec<Expr> = vc.columns.iter().map(|c| col(c.as_str())).collect();
+        let select_exprs: Vec<Expr> = vc
+            .columns
+            .iter()
+            .map(|c| col(c.as_str()).alias(c.as_str()))
+            .collect();
         df = df.select(select_exprs).map_err(|e| e.to_string())?;
 
         if !vc.sorts.is_empty() {
             let sort_exprs: Vec<SortExpr> = vc
                 .sorts
                 .iter()
-                .map(|(c, d)| col(c.as_str()).sort(d != "desc", true))
+                .map(|(c, d)| Expr::Column(Column::from_name(c.as_str())).sort(d != "desc", true))
                 .collect();
             df = df.sort(sort_exprs).map_err(|e| e.to_string())?;
         }
@@ -378,7 +383,7 @@ impl DataModel {
                         debug!(column = %ctx.column, pre_agg = %candidate.name, "using pre-agg for column values");
                         if let Ok(df) = self.read_parquet_sync(&pre_agg_file) {
                             return df
-                                .select(vec![col(ctx.column.as_str())])
+                                .select(vec![Expr::Column(Column::from_name(ctx.column.as_str()))])
                                 .and_then(|d| d.distinct())
                                 .map_err(|e| e.to_string());
                         }
@@ -399,7 +404,7 @@ impl DataModel {
             .map_err(|e| e.to_string())?
             .inner;
 
-        base.select(vec![col(ctx.column.as_str())])
+        base.select(vec![col(ctx.column.as_str()).alias(ctx.column.as_str())])
             .and_then(|d| d.distinct())
             .map_err(|e| e.to_string())
     }
@@ -469,18 +474,23 @@ impl DataModel {
             .map_err(|e| e.to_string())?
             .inner;
 
-        let group_by_exprs: Vec<Expr> = pa.group_by.iter().map(|c| col(c.as_str())).collect();
+        let group_by_exprs: Vec<Expr> = pa
+            .group_by
+            .iter()
+            .map(|c| col(c.as_str()).alias(c.as_str()))
+            .collect();
 
         let mut agg_exprs: Vec<Expr> = Vec::new();
         for (qcol, components) in &pa.aggregations {
             for component in components {
                 let alias = component_col_name(qcol, component);
+                let qcol_expr = || col(qcol.as_str());
                 let expr = match component.as_str() {
-                    "sum" => sum(col(qcol.as_str())).alias(&alias),
-                    "count" => count(col(qcol.as_str())).alias(&alias),
-                    "min" => min(col(qcol.as_str())).alias(&alias),
-                    "max" => max(col(qcol.as_str())).alias(&alias),
-                    "sumsq" => sum(col(qcol.as_str()) * col(qcol.as_str())).alias(&alias),
+                    "sum" => sum(qcol_expr()).alias(&alias),
+                    "count" => count(qcol_expr()).alias(&alias),
+                    "min" => min(qcol_expr()).alias(&alias),
+                    "max" => max(qcol_expr()).alias(&alias),
+                    "sumsq" => sum(qcol_expr() * qcol_expr()).alias(&alias),
                     other => return Err(format!("unknown pre-agg component '{other}'")),
                 };
                 agg_exprs.push(expr);
@@ -492,10 +502,17 @@ impl DataModel {
             .map_err(|e| format!("failed to aggregate for pre-agg: {e}"))?;
 
         let file_path = format!("{path}/{}.parquet", pa.name);
-        self.0
-            .rt
-            .block_on(df.write_parquet(&file_path, DataFrameWriteOptions::new(), None))
-            .map_err(|e| format!("failed to write parquet: {e}"))?;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(df.write_parquet(&file_path, DataFrameWriteOptions::new(), None))
+            }),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(df.write_parquet(&file_path, DataFrameWriteOptions::new(), None)),
+        }
+        .map_err(|e| format!("failed to write parquet: {e}"))?;
 
         Ok(())
     }
@@ -592,7 +609,9 @@ impl DataModel {
         })
     }
 
-    /// Build a scan DataFrame for a single table with column prefixing applied.
+    /// Build a scan DataFrame for a single table. DataFusion automatically
+    /// qualifies all columns with the table name, so `col("player_stats.goals")`
+    /// resolves as `Column{relation:"player_stats", name:"goals"}`.
     fn scan_table(&self, table_name: &str) -> datafusion::common::Result<DataFrame> {
         let provider = self
             .0
@@ -600,34 +619,8 @@ impl DataModel {
             .get(table_name)
             .unwrap_or_else(|| panic!("table '{table_name}' not found in DataModel"));
 
-        let schema = provider.schema();
-        let prefix = format!("{table_name}.");
         let source = provider_as_source(Arc::clone(provider));
-
-        let builder = LogicalPlanBuilder::scan(table_name, source, None)?;
-
-        let needs_prefix = schema
-            .fields()
-            .iter()
-            .any(|f| !f.name().starts_with(&prefix));
-        let plan = if needs_prefix {
-            let rename_exprs: Vec<Expr> = schema
-                .fields()
-                .iter()
-                .map(|f| {
-                    let new_name = if f.name().starts_with(&prefix) {
-                        f.name().to_string()
-                    } else {
-                        format!("{prefix}{}", f.name())
-                    };
-                    col(f.name()).alias(new_name)
-                })
-                .collect();
-            builder.project(rename_exprs)?.build()?
-        } else {
-            builder.build()?
-        };
-
+        let plan = LogicalPlanBuilder::scan(table_name, source, None)?.build()?;
         Ok(DataFrame::new(self.0.ctx.state(), plan))
     }
 
@@ -643,12 +636,128 @@ impl DataModel {
                     handle.block_on(ctx.read_parquet(path, ParquetReadOptions::default()))
                 })
             }
-            Err(_) => self
-                .0
-                .rt
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
                 .block_on(ctx.read_parquet(path, ParquetReadOptions::default())),
         }
     }
+}
+
+// ── Module-level helpers ─────────────────────────────────────────────────────
+
+/// Combine multiple already-normalized measure DataFrames into one using
+/// UNION ALL + GROUP BY MAX. This is semantically equivalent to a Full outer
+/// join across all measures but avoids DataFusion's "duplicate qualified field
+/// name" error that occurs when both sides of a Full join share the same
+/// qualified group column.
+///
+/// Each DF must already be normalized (all columns unqualified flat-names).
+/// Missing measure columns in a DF are padded with typed NULL literals so
+/// the UNION schemas match; MAX then picks the single non-NULL value per group.
+fn combine_measures(
+    normalized_dfs: Vec<DataFrame>,
+    join_cols: &[String],
+) -> Result<DataFrame, String> {
+    let group_col_set: HashSet<&str> = join_cols.iter().map(|s| s.as_str()).collect();
+
+    // Collect (df, measure_cols, col_types) for each measure.
+    let dfs_with_info: Vec<(DataFrame, Vec<String>, HashMap<String, DataType>)> = normalized_dfs
+        .into_iter()
+        .map(|df| {
+            let mut measure_cols = Vec::new();
+            let mut col_types = HashMap::new();
+            for (_, field) in df.schema().iter() {
+                let name = field.name().clone();
+                if !group_col_set.contains(name.as_str()) {
+                    col_types.insert(name.clone(), field.data_type().clone());
+                    measure_cols.push(name);
+                }
+            }
+            (df, measure_cols, col_types)
+        })
+        .collect();
+
+    // Union of all measure column names (sorted for consistent UNION schema ordering).
+    let mut all_measure_cols: Vec<String> = Vec::new();
+    let mut all_col_types: HashMap<String, DataType> = HashMap::new();
+    for (_, measure_cols, col_types) in &dfs_with_info {
+        for m in measure_cols {
+            if !all_col_types.contains_key(m) {
+                all_measure_cols.push(m.clone());
+                all_col_types.insert(m.clone(), col_types[m].clone());
+            }
+        }
+    }
+    all_measure_cols.sort();
+
+    // Project each DF to the full schema: [group_cols..., all_measure_cols...].
+    // Missing measure columns become typed NULL literals so schemas match for UNION.
+    let mut projected_iter = dfs_with_info.into_iter().map(|(df, measure_cols, _)| {
+        let measure_col_set: HashSet<&str> = measure_cols.iter().map(|s| s.as_str()).collect();
+        let mut exprs: Vec<Expr> = Vec::new();
+        for k in join_cols {
+            exprs.push(Expr::Column(Column::from_name(k.as_str())));
+        }
+        for m in &all_measure_cols {
+            if measure_col_set.contains(m.as_str()) {
+                exprs.push(Expr::Column(Column::from_name(m.as_str())));
+            } else {
+                let null_val =
+                    ScalarValue::try_from(&all_col_types[m]).unwrap_or(ScalarValue::Null);
+                exprs.push(lit(null_val).alias(m.as_str()));
+            }
+        }
+        df.select(exprs)
+    });
+
+    let first = projected_iter
+        .next()
+        .ok_or("no measure DFs to combine")?
+        .map_err(|e| format!("measure projection failed: {e}"))?;
+    let mut combined = first;
+    for projected in projected_iter {
+        let df = projected.map_err(|e| format!("measure projection failed: {e}"))?;
+        combined = combined
+            .union(df)
+            .map_err(|e| format!("union failed: {e}"))?;
+    }
+
+    // GROUP BY group cols + MAX(measure col): picks the single non-NULL value per group.
+    let group_exprs: Vec<Expr> = join_cols
+        .iter()
+        .map(|k| Expr::Column(Column::from_name(k.as_str())))
+        .collect();
+    let agg_exprs: Vec<Expr> = all_measure_cols
+        .iter()
+        .map(|m| max(Expr::Column(Column::from_name(m.as_str()))).alias(m.as_str()))
+        .collect();
+
+    combined
+        .aggregate(group_exprs, agg_exprs)
+        .map_err(|e| format!("combine aggregate failed: {e}"))
+}
+
+/// After aggregation, group-by columns retain their DataFusion relation qualifier
+/// (e.g. `Column{relation:"players", name:"player_name"}`), while aggregate alias
+/// columns are already flat. This projection flattens all qualified fields to
+/// "table.column" alias strings so downstream join/sort/having code can use
+/// `Column::from_name` uniformly.
+pub fn normalize_schema(df: DataFrame) -> Result<DataFrame, String> {
+    let exprs: Vec<Expr> = df
+        .schema()
+        .iter()
+        .map(|(qualifier, field)| match qualifier {
+            Some(q) => {
+                let name = format!("{}.{}", q, field.name());
+                col(name.as_str()).alias(name.as_str())
+            }
+            None => Expr::Column(Column::from_name(field.name())),
+        })
+        .collect();
+    df.select(exprs)
+        .map_err(|e| format!("schema normalization failed: {e}"))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

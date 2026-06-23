@@ -1,88 +1,112 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use datafusion::arrow::compute::{
+    SortColumn, SortOptions, concat_batches, lexsort_to_indices, take,
+};
+use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::catalog::TableProvider;
+use datafusion::common::Column;
+use datafusion::functions_aggregate::expr_fn::{count, sum};
+use datafusion::prelude::*;
+use tempfile::TempDir;
 
 use datasubway::column_expressions::column_context::{
     ColumnContext, ColumnInclude, ColumnPattern, allow,
 };
-use datasubway::data_model::{DataModel, DataOutput, DataQuery};
+use datasubway::data_model::{DataModel, DataOutput, DataQuery, normalize_schema};
 use datasubway::model_components::{
     agg_context::AggContext,
     joins::{Join, JoinDirection, JoinGraph, JoinHow},
-    measures::Measure,
+    measures::DfMeasure,
     pre_aggregations::PreAggregation,
 };
-use datasubway::wrappers::polars::lazyframe_recorder::LazyFrameRecorder;
-use polars::prelude::*;
-use tempfile::TempDir;
 
-fn make_tables() -> HashMap<String, LazyFrame> {
-    HashMap::from([
-        (
-            "players".to_string(),
-            LazyFrame::scan_parquet(
-                "tests/data_files/players.parquet".into(),
-                Default::default(),
-            )
-            .unwrap(),
-        ),
-        (
-            "games".to_string(),
-            LazyFrame::scan_parquet("tests/data_files/games.parquet".into(), Default::default())
-                .unwrap(),
-        ),
-        (
-            "player_stats".to_string(),
-            LazyFrame::scan_parquet(
-                "tests/data_files/player_stats.parquet".into(),
-                Default::default(),
-            )
-            .unwrap(),
-        ),
-        (
-            "team_stats".to_string(),
-            LazyFrame::scan_parquet(
-                "tests/data_files/team_stats.parquet".into(),
-                Default::default(),
-            )
-            .unwrap(),
-        ),
-        (
-            "teams".to_string(),
-            LazyFrame::scan_parquet("tests/data_files/teams.parquet".into(), Default::default())
-                .unwrap(),
-        ),
-        (
-            "groups".to_string(),
-            LazyFrame::scan_parquet("tests/data_files/groups.parquet".into(), Default::default())
-                .unwrap(),
-        ),
-        (
-            "groups_bridge".to_string(),
-            LazyFrame::scan_parquet(
-                "tests/data_files/groups_bridge.parquet".into(),
-                Default::default(),
-            )
-            .unwrap(),
-        ),
-    ])
+static SHARED_CTX: tokio::sync::OnceCell<SessionContext> = tokio::sync::OnceCell::const_new();
+
+async fn shared_ctx() -> &'static SessionContext {
+    SHARED_CTX
+        .get_or_init(|| async {
+            let ctx = SessionContext::new();
+            for name in [
+                "players",
+                "games",
+                "player_stats",
+                "team_stats",
+                "teams",
+                "groups",
+                "groups_bridge",
+            ] {
+                ctx.register_parquet(
+                    name,
+                    &format!("tests/data_files/{name}.parquet"),
+                    ParquetReadOptions::default(),
+                )
+                .await
+                .unwrap();
+            }
+            ctx
+        })
+        .await
+}
+
+async fn make_tables() -> HashMap<String, Arc<dyn TableProvider>> {
+    let ctx = shared_ctx().await;
+    let names = [
+        "players",
+        "games",
+        "player_stats",
+        "team_stats",
+        "teams",
+        "groups",
+        "groups_bridge",
+    ];
+    let mut tables = HashMap::new();
+    for name in names {
+        tables.insert(name.to_string(), ctx.table_provider(name).await.unwrap());
+    }
+    tables
 }
 
 fn make_joins() -> Vec<Join> {
     vec![
+        // player_stats is the central fact table
         Join {
-            left: "games".into(),
-            right: "player_stats".into(),
-            left_on: vec!["games.game_id".into()],
-            right_on: vec!["player_stats.game_id".into()],
+            left: "player_stats".into(),
+            right: "games".into(),
+            left_on: vec!["player_stats.game_id".into()],
+            right_on: vec!["games.game_id".into()],
             how: JoinHow::Left,
             direction: JoinDirection::Both,
         },
         Join {
-            left: "games".into(),
-            right: "team_stats".into(),
-            left_on: vec!["games.game_id".into()],
-            right_on: vec!["team_stats.game_id".into()],
+            left: "player_stats".into(),
+            right: "players".into(),
+            left_on: vec!["player_stats.player_id".into()],
+            right_on: vec!["players.player_id".into()],
             how: JoinHow::Left,
-            direction: JoinDirection::Both,
+            direction: JoinDirection::RightOnLeft,
+        },
+        Join {
+            left: "player_stats".into(),
+            right: "team_stats".into(),
+            left_on: vec![
+                "player_stats.game_id".into(),
+                "player_stats.team_name".into(),
+            ],
+            right_on: vec!["team_stats.game_id".into(), "team_stats.team_name".into()],
+            how: JoinHow::Left,
+            direction: JoinDirection::RightOnLeft,
+        },
+        Join {
+            left: "team_stats".into(),
+            right: "teams".into(),
+            left_on: vec!["team_stats.team_name".into()],
+            right_on: vec!["teams.team_name".into()],
+            how: JoinHow::Left,
+            direction: JoinDirection::RightOnLeft,
         },
         Join {
             left: "games".into(),
@@ -100,43 +124,26 @@ fn make_joins() -> Vec<Join> {
             how: JoinHow::Left,
             direction: JoinDirection::Both,
         },
-        Join {
-            left: "player_stats".into(),
-            right: "players".into(),
-            left_on: vec!["player_stats.player_id".into()],
-            right_on: vec!["players.player_id".into()],
-            how: JoinHow::Left,
-            direction: JoinDirection::RightOnLeft,
-        },
-        Join {
-            left: "team_stats".into(),
-            right: "teams".into(),
-            left_on: vec!["team_stats.team_name".into()],
-            right_on: vec!["teams.team_name".into()],
-            how: JoinHow::Left,
-            direction: JoinDirection::RightOnLeft,
-        },
     ]
 }
 
-fn build_dm() -> DataModel {
+async fn build_dm() -> DataModel {
     let mut dm = DataModel::new(
-        make_tables(),
+        make_tables().await,
         JoinGraph::new(&make_joins()).unwrap(),
         vec![],
         None,
     );
-    dm.add_measure(Measure::new("player_goals", player_goals))
+    dm.add_measure(DfMeasure::new("player_goals", player_goals))
         .unwrap();
-    dm.add_measure(Measure::new("team_goals", team_goals))
+    dm.add_measure(DfMeasure::new("team_goals", team_goals))
         .unwrap();
-    dm.add_measure(Measure::new("game_count", game_count))
+    dm.add_measure(DfMeasure::new("game_count", game_count))
         .unwrap();
     dm
 }
 
-/// Pre-aggregation for player_goals grouped by player_id — covers any query
-/// that groups only by players.player_name and sums player_stats.goals.
+/// Pre-aggregation for player_goals grouped by player_name.
 fn player_goals_pre_agg() -> PreAggregation {
     PreAggregation::new(
         "player_goals_by_player".into(),
@@ -146,85 +153,122 @@ fn player_goals_pre_agg() -> PreAggregation {
     .unwrap()
 }
 
-/// Returns a DataModel with the player_goals pre-agg written to a temp dir,
-/// plus the TempDir handle (dropping it removes the files).
-fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
+async fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
     let mut dm = DataModel::new(
-        make_tables(),
+        make_tables().await,
         JoinGraph::new(&make_joins()).unwrap(),
         vec![player_goals_pre_agg()],
         Some(path),
     );
-    dm.add_measure(Measure::new("player_goals", player_goals))
+    dm.add_measure(DfMeasure::new("player_goals", player_goals))
         .unwrap();
-    dm.add_measure(Measure::new("team_goals", team_goals))
+    dm.add_measure(DfMeasure::new("team_goals", team_goals))
         .unwrap();
-    dm.add_measure(Measure::new("game_count", game_count))
+    dm.add_measure(DfMeasure::new("game_count", game_count))
         .unwrap();
     dm.write_pre_aggs(&["player_goals_by_player"]).unwrap();
     (dm, tmp)
 }
 
-fn player_goals(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
-    dm.table("player_stats")
-        .group_by(allow(
-            ColumnPattern::OnePattern("*".into()),
-            ColumnContext::MultipleStrings(qc.groups.clone()),
-            ColumnInclude::None,
-        ))
-        .agg(vec![
-            col("player_stats.goals").sum().alias("player_stats.goals"),
-        ])
+fn player_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
+    let mut recorder = dm.table("player_stats");
+    recorder.pre_agg_allowed = qc.use_pre_agg;
+    recorder
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![sum(col("player_stats.goals")).alias("player_stats.goals")],
+        )
+        .build()
 }
 
-fn team_goals(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
-    dm.table("team_stats")
-        .group_by(allow(
-            ColumnPattern::OnePattern("*".into()),
-            ColumnContext::MultipleStrings(qc.groups.clone()),
-            ColumnInclude::None,
-        ))
-        .agg(vec![
-            col("team_stats.goals").sum().alias("team_stats.goals"),
-        ])
+fn team_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
+    let mut recorder = dm.table("team_stats");
+    recorder.pre_agg_allowed = qc.use_pre_agg;
+    recorder
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![sum(col("team_stats.goals")).alias("team_stats.goals")],
+        )
+        .build()
 }
 
-fn game_count(dm: &DataModel, qc: &AggContext) -> LazyFrameRecorder {
-    dm.table("games")
-        .group_by(allow(
-            ColumnPattern::OnePattern("*".into()),
-            ColumnContext::MultipleStrings(qc.groups.clone()),
-            ColumnInclude::None,
-        ))
-        .agg(vec![col("games.game_id").count().alias("games.game_count")])
+fn game_count(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
+    let mut recorder = dm.table("games");
+    recorder.pre_agg_allowed = qc.use_pre_agg;
+    recorder
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![count(col("games.game_id")).alias("games.game_count")],
+        )
+        .build()
 }
 
-fn dm_query(dm: &DataModel, qc: AggContext) -> DataFrame {
-    match dm.execute(&DataQuery::Agg(qc), false).unwrap() {
-        DataOutput::Data(df) => df,
+static SHARED_DM: tokio::sync::OnceCell<DataModel> = tokio::sync::OnceCell::const_new();
+
+async fn shared_dm() -> &'static DataModel {
+    SHARED_DM.get_or_init(|| async { build_dm().await }).await
+}
+
+async fn dm_query(dm: &DataModel, qc: AggContext) -> Vec<RecordBatch> {
+    match dm.execute(&DataQuery::Agg(qc)).await.unwrap() {
+        DataOutput::Data(batches) => batches,
         _ => panic!("expected Data"),
     }
 }
 
-fn scan(path: &str) -> LazyFrame {
-    LazyFrame::scan_parquet(path.into(), Default::default()).unwrap()
+/// Sort `batches` by `sort_col`, select `cols`, and return as a formatted string.
+/// Uses Arrow compute directly — no SessionContext overhead.
+fn sorted_select(batches: Vec<RecordBatch>, sort_col: &str, cols: &[&str]) -> String {
+    let schema = batches[0].schema();
+    let combined = concat_batches(&schema, &batches).unwrap();
+
+    let sort_idx = schema.index_of(sort_col).unwrap();
+    let indices = lexsort_to_indices(
+        &[SortColumn {
+            values: Arc::clone(combined.column(sort_idx)),
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: true,
+            }),
+        }],
+        None,
+    )
+    .unwrap();
+
+    let out_schema = Arc::new(Schema::new(
+        cols.iter()
+            .map(|&c| schema.field_with_name(c).unwrap().clone())
+            .collect::<Vec<_>>(),
+    ));
+    let selected_cols: Vec<datafusion::arrow::array::ArrayRef> = cols
+        .iter()
+        .map(|&c| {
+            let i = schema.index_of(c).unwrap();
+            take(combined.column(i).as_ref(), &indices, None).unwrap()
+        })
+        .collect();
+
+    let out = RecordBatch::try_new(out_schema, selected_cols).unwrap();
+    pretty_format_batches(&[out]).unwrap().to_string()
 }
 
-fn sorted_select(df: DataFrame, sort_by: &str, cols: &[&str]) -> DataFrame {
-    df.select(cols)
-        .unwrap()
-        .sort(
-            [sort_by],
-            SortMultipleOptions::default().with_nulls_last(true),
-        )
-        .unwrap()
-}
-
-#[test]
-fn test_player_goals_by_player_name() {
-    let dm = build_dm();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_player_goals_by_player_name() {
+    let dm = shared_dm().await;
     let qc = AggContext::new(
         vec!["player_goals".to_string()],
         None,
@@ -237,42 +281,45 @@ fn test_player_goals_by_player_name() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc);
+    let actual = dm_query(&dm, qc).await;
 
-    let ps = scan("tests/data_files/player_stats.parquet").select([
-        col("player_id").alias("player_stats.player_id"),
-        col("goals").alias("player_stats.goals"),
-    ]);
-    let pl = scan("tests/data_files/players.parquet").select([
-        col("player_id").alias("players.player_id"),
-        col("player_name").alias("players.player_name"),
-    ]);
-    let expected = ps
-        .join(
-            pl,
-            [col("player_stats.player_id")],
-            [col("players.player_id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .group_by([col("players.player_name")])
-        .agg([col("player_stats.goals").sum().alias("player_stats.goals")])
-        .collect()
-        .unwrap();
+    let ctx = shared_ctx().await;
+    // Join raw scans (DataFusion qualifies columns automatically), aggregate, then
+    // normalize_schema once at the end — matching the DataModel's own pipeline.
+    let expected = normalize_schema(
+        ctx.table("player_stats")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("players").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.player_id"],
+                &["players.player_id"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("players.player_name")],
+                vec![sum(col("player_stats.goals")).alias("player_stats.goals")],
+            )
+            .unwrap(),
+    )
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
 
     let cols = &["players.player_name", "player_stats.goals"];
-    assert!(
-        sorted_select(actual, "players.player_name", cols).equals_missing(&sorted_select(
-            expected,
-            "players.player_name",
-            cols
-        )),
+    assert_eq!(
+        sorted_select(actual, "players.player_name", cols),
+        sorted_select(expected, "players.player_name", cols),
         "player_goals by player_name mismatch"
     );
 }
 
-#[test]
-fn test_team_goals_by_team_name() {
-    let dm = build_dm();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_team_goals_by_team_name() {
+    let dm = shared_dm().await;
     let qc = AggContext::new(
         vec!["team_goals".to_string()],
         None,
@@ -285,32 +332,40 @@ fn test_team_goals_by_team_name() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc);
+    let actual = dm_query(&dm, qc).await;
 
-    let expected = scan("tests/data_files/team_stats.parquet")
-        .select([
+    let ctx = shared_ctx().await;
+    let expected = ctx
+        .table("team_stats")
+        .await
+        .unwrap()
+        .select(vec![
             col("team_name").alias("team_stats.team_name"),
             col("goals").alias("team_stats.goals"),
         ])
-        .group_by([col("team_stats.team_name")])
-        .agg([col("team_stats.goals").sum().alias("team_stats.goals")])
+        .unwrap()
+        .aggregate(
+            vec![Expr::Column(Column::from_name("team_stats.team_name"))],
+            vec![
+                sum(Expr::Column(Column::from_name("team_stats.goals"))).alias("team_stats.goals"),
+            ],
+        )
+        .unwrap()
         .collect()
+        .await
         .unwrap();
 
     let cols = &["team_stats.team_name", "team_stats.goals"];
-    assert!(
-        sorted_select(actual, "team_stats.team_name", cols).equals_missing(&sorted_select(
-            expected,
-            "team_stats.team_name",
-            cols
-        )),
+    assert_eq!(
+        sorted_select(actual, "team_stats.team_name", cols),
+        sorted_select(expected, "team_stats.team_name", cols),
         "team_goals by team_name mismatch"
     );
 }
 
-#[test]
-fn test_game_count_by_group() {
-    let dm = build_dm();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_game_count_by_group() {
+    let dm = shared_dm().await;
     let qc = AggContext::new(
         vec!["game_count".to_string()],
         None,
@@ -323,50 +378,51 @@ fn test_game_count_by_group() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc);
+    let actual = dm_query(&dm, qc).await;
 
-    let games =
-        scan("tests/data_files/games.parquet").select([col("game_id").alias("games.game_id")]);
-    let gb = scan("tests/data_files/groups_bridge.parquet").select([
-        col("game_id").alias("groups_bridge.game_id"),
-        col("group_id").alias("groups_bridge.group_id"),
-    ]);
-    let groups = scan("tests/data_files/groups.parquet").select([
-        col("group_id").alias("groups.group_id"),
-        col("group_name").alias("groups.group_name"),
-    ]);
-    let expected = games
-        .join(
-            gb,
-            [col("games.game_id")],
-            [col("groups_bridge.game_id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .join(
-            groups,
-            [col("groups_bridge.group_id")],
-            [col("groups.group_id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .group_by([col("groups.group_name")])
-        .agg([col("games.game_id").count().alias("games.game_count")])
-        .collect()
-        .unwrap();
+    let ctx = shared_ctx().await;
+    let expected = normalize_schema(
+        ctx.table("games")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("groups_bridge").await.unwrap(),
+                JoinType::Left,
+                &["games.game_id"],
+                &["groups_bridge.game_id"],
+                None,
+            )
+            .unwrap()
+            .join(
+                ctx.table("groups").await.unwrap(),
+                JoinType::Left,
+                &["groups_bridge.group_id"],
+                &["groups.group_id"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("groups.group_name")],
+                vec![count(col("games.game_id")).alias("games.game_count")],
+            )
+            .unwrap(),
+    )
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
 
     let cols = &["groups.group_name", "games.game_count"];
-    assert!(
-        sorted_select(actual, "groups.group_name", cols).equals_missing(&sorted_select(
-            expected,
-            "groups.group_name",
-            cols
-        )),
+    assert_eq!(
+        sorted_select(actual, "groups.group_name", cols),
+        sorted_select(expected, "groups.group_name", cols),
         "game_count by group_name mismatch"
     );
 }
 
-#[test]
-fn test_player_goals_by_platform() {
-    let dm = build_dm();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_player_goals_by_platform() {
+    let dm = shared_dm().await;
     let qc = AggContext::new(
         vec!["player_goals".to_string()],
         None,
@@ -379,47 +435,43 @@ fn test_player_goals_by_platform() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc);
+    let actual = dm_query(&dm, qc).await;
 
-    let ps = scan("tests/data_files/player_stats.parquet").select([
-        col("player_id").alias("player_stats.player_id"),
-        col("goals").alias("player_stats.goals"),
-    ]);
-    let pl = scan("tests/data_files/players.parquet").select([
-        col("player_id").alias("players.player_id"),
-        col("platform").alias("players.platform"),
-    ]);
-    let expected = ps
-        .join(
-            pl,
-            [col("player_stats.player_id")],
-            [col("players.player_id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .group_by([col("players.platform")])
-        .agg([col("player_stats.goals").sum().alias("player_stats.goals")])
-        .collect()
-        .unwrap();
+    let ctx = shared_ctx().await;
+    let expected = normalize_schema(
+        ctx.table("player_stats")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("players").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.player_id"],
+                &["players.player_id"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("players.platform")],
+                vec![sum(col("player_stats.goals")).alias("player_stats.goals")],
+            )
+            .unwrap(),
+    )
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
 
-    assert!(
-        expected.height() <= 10,
-        "expected few distinct platforms, got {}",
-        expected.height()
-    );
     let cols = &["players.platform", "player_stats.goals"];
-    assert!(
-        sorted_select(actual, "players.platform", cols).equals_missing(&sorted_select(
-            expected,
-            "players.platform",
-            cols
-        )),
+    assert_eq!(
+        sorted_select(actual, "players.platform", cols),
+        sorted_select(expected, "players.platform", cols),
         "player_goals by platform mismatch"
     );
 }
 
-#[test]
-fn test_multi_measure_join() {
-    let dm = build_dm();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_multi_measure_join() {
+    let dm = shared_dm().await;
     let qc = AggContext::new(
         vec!["player_goals".to_string(), "game_count".to_string()],
         None,
@@ -432,90 +484,110 @@ fn test_multi_measure_join() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc);
+    let actual = dm_query(&dm, qc).await;
 
-    let ps = scan("tests/data_files/player_stats.parquet").select([
-        col("player_id").alias("player_stats.player_id"),
-        col("goals").alias("player_stats.goals"),
-    ]);
-    let pl = scan("tests/data_files/players.parquet").select([
-        col("player_id").alias("players.player_id"),
-        col("player_name").alias("players.player_name"),
-    ]);
-    let player_goals_df = ps
-        .join(
-            pl.clone(),
-            [col("player_stats.player_id")],
-            [col("players.player_id")],
-            JoinArgs::new(JoinType::Left),
+    let ctx = shared_ctx().await;
+
+    // player_goals by player_name: player_stats → players
+    let player_goals_df = normalize_schema(
+        ctx.table("player_stats")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("players").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.player_id"],
+                &["players.player_id"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("players.player_name")],
+                vec![sum(col("player_stats.goals")).alias("player_stats.goals")],
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    // game_count by player_name: games → player_stats → players
+    let game_count_df = normalize_schema(
+        ctx.table("games")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("player_stats").await.unwrap(),
+                JoinType::Left,
+                &["games.game_id"],
+                &["player_stats.game_id"],
+                None,
+            )
+            .unwrap()
+            .join(
+                ctx.table("players").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.player_id"],
+                &["players.player_id"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("players.player_name")],
+                vec![count(col("games.game_id")).alias("games.game_count")],
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Merge the two normalized measure DFs via SQL FULL OUTER JOIN with COALESCE.
+    // Collecting first and registering as MemTables avoids the duplicate-qualified-
+    // column-name error that DataFusion raises when both DFs share the same
+    // qualified group column in a logical-plan Full join.
+    let pg_batches = player_goals_df.collect().await.unwrap();
+    let gc_batches = game_count_df.collect().await.unwrap();
+    let merge_ctx = SessionContext::new();
+    merge_ctx
+        .register_table(
+            "pg",
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(pg_batches[0].schema(), vec![pg_batches])
+                    .unwrap(),
+            ),
         )
-        .group_by([col("players.player_name")])
-        .agg([col("player_stats.goals").sum().alias("player_stats.goals")])
-        .collect()
         .unwrap();
-
-    let games =
-        scan("tests/data_files/games.parquet").select([col("game_id").alias("games.game_id")]);
-    let ps2 = scan("tests/data_files/player_stats.parquet").select([
-        col("game_id").alias("player_stats.game_id"),
-        col("player_id").alias("player_stats.player_id"),
-    ]);
-    let game_count_df = games
-        .join(
-            ps2,
-            [col("games.game_id")],
-            [col("player_stats.game_id")],
-            JoinArgs::new(JoinType::Left),
+    merge_ctx
+        .register_table(
+            "gc",
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(gc_batches[0].schema(), vec![gc_batches])
+                    .unwrap(),
+            ),
         )
-        .join(
-            pl,
-            [col("player_stats.player_id")],
-            [col("players.player_id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .group_by([col("players.player_name")])
-        .agg([col("games.game_id").count().alias("games.game_count")])
-        .collect()
         .unwrap();
-
-    let expected = player_goals_df
-        .lazy()
-        .join(
-            game_count_df.lazy(),
-            [col("players.player_name")],
-            [col("players.player_name")],
-            JoinArgs::new(JoinType::Full),
-        )
+    let expected = merge_ctx
+        .sql(r#"SELECT
+                COALESCE(pg."players.player_name", gc."players.player_name") AS "players.player_name",
+                pg."player_stats.goals",
+                gc."games.game_count"
+               FROM pg FULL OUTER JOIN gc
+               ON pg."players.player_name" = gc."players.player_name""#)
+        .await
+        .unwrap()
         .collect()
+        .await
         .unwrap();
 
     let sort_col = "players.player_name";
     let measure_cols = &["player_stats.goals", "games.game_count"];
-    let actual_sorted = actual
-        .sort(
-            [sort_col],
-            SortMultipleOptions::default().with_nulls_last(true),
-        )
-        .unwrap()
-        .select(measure_cols)
-        .unwrap();
-    let expected_sorted = expected
-        .sort(
-            [sort_col],
-            SortMultipleOptions::default().with_nulls_last(true),
-        )
-        .unwrap()
-        .select(measure_cols)
-        .unwrap();
-    assert!(
-        actual_sorted.equals_missing(&expected_sorted),
+    assert_eq!(
+        sorted_select(actual, sort_col, measure_cols),
+        sorted_select(expected, sort_col, measure_cols),
         "multi-measure (player_goals + game_count) by player_name mismatch"
     );
 }
 
-#[test]
-fn test_player_goals_and_game_count_by_group() {
-    let dm = build_dm();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_player_goals_and_game_count_by_group() {
+    let dm = shared_dm().await;
     let qc = AggContext::new(
         vec!["player_goals".to_string(), "game_count".to_string()],
         None,
@@ -528,102 +600,131 @@ fn test_player_goals_and_game_count_by_group() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc);
+    let actual = dm_query(&dm, qc).await;
 
-    // player_goals by group: player_stats -> groups_bridge -> groups
-    let ps = scan("tests/data_files/player_stats.parquet").select([
-        col("game_id").alias("player_stats.game_id"),
-        col("goals").alias("player_stats.goals"),
-    ]);
-    let gb = scan("tests/data_files/groups_bridge.parquet").select([
-        col("game_id").alias("groups_bridge.game_id"),
-        col("group_id").alias("groups_bridge.group_id"),
-    ]);
-    let groups = scan("tests/data_files/groups.parquet").select([
-        col("group_id").alias("groups.group_id"),
-        col("group_name").alias("groups.group_name"),
-    ]);
-    let player_goals_df = ps
-        .join(
-            gb.clone(),
-            [col("player_stats.game_id")],
-            [col("groups_bridge.game_id")],
-            JoinArgs::new(JoinType::Left),
+    let ctx = shared_ctx().await;
+
+    // player_goals by group: player_stats → games → groups_bridge → groups
+    let player_goals_df = normalize_schema(
+        ctx.table("player_stats")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("games").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.game_id"],
+                &["games.game_id"],
+                None,
+            )
+            .unwrap()
+            .join(
+                ctx.table("groups_bridge").await.unwrap(),
+                JoinType::Left,
+                &["games.game_id"],
+                &["groups_bridge.game_id"],
+                None,
+            )
+            .unwrap()
+            .join(
+                ctx.table("groups").await.unwrap(),
+                JoinType::Left,
+                &["groups_bridge.group_id"],
+                &["groups.group_id"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("groups.group_name")],
+                vec![sum(col("player_stats.goals")).alias("player_stats.goals")],
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    // game_count by group: games → groups_bridge → groups
+    let game_count_df = normalize_schema(
+        ctx.table("games")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("groups_bridge").await.unwrap(),
+                JoinType::Left,
+                &["games.game_id"],
+                &["groups_bridge.game_id"],
+                None,
+            )
+            .unwrap()
+            .join(
+                ctx.table("groups").await.unwrap(),
+                JoinType::Left,
+                &["groups_bridge.group_id"],
+                &["groups.group_id"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("groups.group_name")],
+                vec![count(col("games.game_id")).alias("games.game_count")],
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Merge using UNION ALL + GROUP BY MAX — the same semantics as combine_measures.
+    // A FULL JOIN would give incorrect results for NULL group_name rows because
+    // NULL != NULL in join conditions, whereas GROUP BY correctly coalesces them.
+    let pg_batches = player_goals_df.collect().await.unwrap();
+    let gc_batches = game_count_df.collect().await.unwrap();
+    let merge_ctx = SessionContext::new();
+    merge_ctx
+        .register_table(
+            "pg",
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(pg_batches[0].schema(), vec![pg_batches])
+                    .unwrap(),
+            ),
         )
-        .join(
-            groups.clone(),
-            [col("groups_bridge.group_id")],
-            [col("groups.group_id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .group_by([col("groups.group_name")])
-        .agg([col("player_stats.goals").sum().alias("player_stats.goals")])
-        .collect()
         .unwrap();
-
-    // game_count by group: games -> groups_bridge -> groups
-    let games =
-        scan("tests/data_files/games.parquet").select([col("game_id").alias("games.game_id")]);
-    let game_count_df = games
-        .join(
-            gb,
-            [col("games.game_id")],
-            [col("groups_bridge.game_id")],
-            JoinArgs::new(JoinType::Left),
+    merge_ctx
+        .register_table(
+            "gc",
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(gc_batches[0].schema(), vec![gc_batches])
+                    .unwrap(),
+            ),
         )
-        .join(
-            groups,
-            [col("groups_bridge.group_id")],
-            [col("groups.group_id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .group_by([col("groups.group_name")])
-        .agg([col("games.game_id").count().alias("games.game_count")])
-        .collect()
         .unwrap();
-
-    let expected = player_goals_df
-        .lazy()
-        .join(
-            game_count_df.lazy(),
-            [col("groups.group_name")],
-            [col("groups.group_name")],
-            JoinArgs::new(JoinType::Full),
-        )
+    let expected = merge_ctx
+        .sql(r#"SELECT "groups.group_name",
+                       MAX("player_stats.goals") AS "player_stats.goals",
+                       MAX("games.game_count")   AS "games.game_count"
+               FROM (
+                   SELECT "groups.group_name", "player_stats.goals", NULL AS "games.game_count" FROM pg
+                   UNION ALL
+                   SELECT "groups.group_name", NULL AS "player_stats.goals", "games.game_count" FROM gc
+               ) t
+               GROUP BY "groups.group_name""#)
+        .await
+        .unwrap()
         .collect()
+        .await
         .unwrap();
 
     let sort_col = "groups.group_name";
     let measure_cols = &["player_stats.goals", "games.game_count"];
-    let actual_sorted = actual
-        .sort(
-            [sort_col],
-            SortMultipleOptions::default().with_nulls_last(true),
-        )
-        .unwrap()
-        .select(measure_cols)
-        .unwrap();
-    let expected_sorted = expected
-        .sort(
-            [sort_col],
-            SortMultipleOptions::default().with_nulls_last(true),
-        )
-        .unwrap()
-        .select(measure_cols)
-        .unwrap();
-    assert!(
-        actual_sorted.equals_missing(&expected_sorted),
+    assert_eq!(
+        sorted_select(actual, sort_col, measure_cols),
+        sorted_select(expected, sort_col, measure_cols),
         "multi-measure (player_goals + game_count) by group_name mismatch"
     );
 }
 
 /// Verify that `use_pre_agg` in AggContext controls whether the pre-aggregation
-/// parquet file appears in the query's logical plan.
-#[test]
-fn test_pre_agg_explain_toggle() {
-    let (dm, _tmp) = build_dm_with_pre_agg();
+/// parquet file appears in the measure's logical plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_pre_agg_explain_toggle() {
+    let (dm, _tmp) = build_dm_with_pre_agg().await;
 
-    // Query grouped by players.player_name — covered by player_goals_by_player pre-agg.
     let make_qc = |use_pre_agg: bool| {
         AggContext::new(
             vec!["player_goals".to_string()],
@@ -639,21 +740,36 @@ fn test_pre_agg_explain_toggle() {
         .unwrap()
     };
 
-    let explain_with = match dm.execute(&DataQuery::Agg(make_qc(true)), true).unwrap() {
-        DataOutput::Explanation(s) => s,
-        _ => panic!("expected Explanation"),
-    };
-    let explain_without = match dm.execute(&DataQuery::Agg(make_qc(false)), true).unwrap() {
-        DataOutput::Explanation(s) => s,
-        _ => panic!("expected Explanation"),
-    };
+    let df_with = player_goals(&dm, &make_qc(true)).unwrap();
+    let df_without = player_goals(&dm, &make_qc(false)).unwrap();
+
+    let plan_with = pretty_format_batches(
+        &df_with
+            .explain(false, false)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    let plan_without = pretty_format_batches(
+        &df_without
+            .explain(false, false)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_string();
 
     assert!(
-        explain_with.contains("player_goals_by_player"),
-        "use_pre_agg=true: expected pre-agg file in plan, got:\n{explain_with}"
+        plan_with.contains("player_goals_by_player"),
+        "use_pre_agg=true: expected pre-agg file in plan, got:\n{plan_with}"
     );
     assert!(
-        !explain_without.contains("player_goals_by_player"),
-        "use_pre_agg=false: expected no pre-agg file in plan, got:\n{explain_without}"
+        !plan_without.contains("player_goals_by_player"),
+        "use_pre_agg=false: expected no pre-agg file in plan, got:\n{plan_without}"
     );
 }

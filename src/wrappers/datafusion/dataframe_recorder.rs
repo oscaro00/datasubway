@@ -6,7 +6,9 @@ use datafusion::prelude::{DataFrame, Expr};
 use crate::column_expressions::column_context::{AllowExcludeRecord, IntoColsExpr, IntoFilterExpr};
 use crate::data_model::DataModel;
 
-use super::agg_expr::{extract_agg_exprs, resolve_source_col, rewrite_for_pre_agg};
+use super::agg_expr::{
+    extract_agg_exprs, resolve_source_col, rewrite_for_pre_agg, rewrite_group_for_pre_agg,
+};
 use super::aggregate_with_metadata::{MetadataDataFrame, fmt_exprs};
 
 // ── Op enum ──────────────────────────────────────────────────────────────────
@@ -197,6 +199,17 @@ impl DataFrameRecorder {
                     group_expr,
                     aggr_expr,
                 } => {
+                    let final_group = if from_pre_agg {
+                        // Pre-agg parquet stores columns with flat dot-names (relation=None).
+                        // Convert qualified refs like col("players.player_name") to
+                        // Column::from_name("players.player_name") so they resolve correctly.
+                        group_expr
+                            .into_iter()
+                            .map(rewrite_group_for_pre_agg)
+                            .collect()
+                    } else {
+                        group_expr
+                    };
                     let final_aggr = if from_pre_agg {
                         aggr_expr
                             .into_iter()
@@ -209,11 +222,11 @@ impl DataFrameRecorder {
                     let ae_json = serde_json::to_string(&allow_exclude_records).unwrap_or_default();
                     let metadata = BTreeMap::from([
                         ("allow_exclude".to_string(), ae_json),
-                        ("group_by".to_string(), fmt_exprs(&group_expr)),
+                        ("group_by".to_string(), fmt_exprs(&final_group)),
                         ("aggregates".to_string(), fmt_exprs(&final_aggr)),
                     ]);
 
-                    let df = mdf.aggregate(group_expr, final_aggr, metadata)?;
+                    let df = mdf.aggregate(final_group, final_aggr, metadata)?;
                     return Ok(df);
                 }
 
@@ -230,21 +243,32 @@ impl DataFrameRecorder {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Update `alias_map` with any alias introduced at the top level of `expr`.
-/// Follows transitive chains so `alias_map["c"] = "a"` when a→b→c.
+/// Only tracks column aliases (e.g. `col("x").alias("y")`), not aggregate
+/// aliases (e.g. `sum(col("x")).alias("y")`), to avoid poisoning the map
+/// with expression strings that aren't source column names.
 pub(crate) fn update_alias_map(alias_map: &mut HashMap<String, String>, expr: &Expr) {
     if let Expr::Alias(a) = expr {
-        let resolved = resolve_expr_to_source(&a.expr, alias_map);
-        alias_map.insert(a.name.to_string(), resolved);
+        if let Some(resolved) = resolve_expr_to_source(&a.expr, alias_map) {
+            alias_map.insert(a.name.to_string(), resolved);
+        }
     }
 }
 
-fn resolve_expr_to_source(expr: &Expr, alias_map: &HashMap<String, String>) -> String {
+/// Returns the ultimate source column name reachable from `expr`, or `None`
+/// if `expr` is not a column or simple alias/cast chain over a column.
+fn resolve_expr_to_source(expr: &Expr, alias_map: &HashMap<String, String>) -> Option<String> {
     match expr {
-        Expr::Column(c) => resolve_source_col(&c.name, alias_map),
+        Expr::Column(c) => {
+            let full = match &c.relation {
+                Some(rel) => format!("{rel}.{}", c.name),
+                None => c.name.clone(),
+            };
+            Some(resolve_source_col(&full, alias_map))
+        }
         Expr::Alias(a) => resolve_expr_to_source(&a.expr, alias_map),
         Expr::Cast(c) => resolve_expr_to_source(&c.expr, alias_map),
         Expr::TryCast(c) => resolve_expr_to_source(&c.expr, alias_map),
-        _ => format!("{expr}"),
+        _ => None,
     }
 }
 
@@ -252,7 +276,11 @@ fn resolve_expr_to_source(expr: &Expr, alias_map: &HashMap<String, String>) -> S
 pub(crate) fn collect_col_names(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
         Expr::Column(c) => {
-            out.insert(c.name.clone());
+            let full = match &c.relation {
+                Some(rel) => format!("{rel}.{}", c.name),
+                None => c.name.clone(),
+            };
+            out.insert(full);
         }
         Expr::Alias(a) => collect_col_names(&a.expr, out),
         Expr::BinaryExpr(b) => {
@@ -281,8 +309,12 @@ pub(crate) fn collect_col_names(expr: &Expr, out: &mut HashSet<String>) {
 fn collect_col_names_filtered(expr: &Expr, agg_col_set: &HashSet<&str>, out: &mut HashSet<String>) {
     match expr {
         Expr::Column(c) => {
-            if !agg_col_set.contains(c.name.as_str()) {
-                out.insert(c.name.clone());
+            let full = match &c.relation {
+                Some(rel) => format!("{rel}.{}", c.name),
+                None => c.name.clone(),
+            };
+            if !agg_col_set.contains(full.as_str()) {
+                out.insert(full);
             }
         }
         Expr::Alias(a) => collect_col_names_filtered(&a.expr, agg_col_set, out),

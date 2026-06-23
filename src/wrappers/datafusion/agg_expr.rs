@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use datafusion::common::Column;
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::prelude::Expr;
 
@@ -33,7 +34,10 @@ pub fn extract_agg_exprs(expr: &Expr) -> Vec<(String, String)> {
 /// looking through casts and aliases.
 pub(crate) fn extract_col_name(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Column(c) => Some(c.name.clone()),
+        Expr::Column(c) => Some(match &c.relation {
+            Some(rel) => format!("{rel}.{}", c.name),
+            None => c.name.clone(),
+        }),
         Expr::Alias(a) => extract_col_name(&a.expr),
         Expr::Cast(c) => extract_col_name(&c.expr),
         Expr::TryCast(c) => extract_col_name(&c.expr),
@@ -59,6 +63,21 @@ pub fn resolve_source_col(name: &str, alias_map: &HashMap<String, String>) -> St
 }
 
 // ── Rewriting ─────────────────────────────────────────────────────────────────
+
+/// Rewrite a group-by column expression to use an unqualified `Column::from_name`
+/// reference — matching the flat field names written into pre-aggregation parquet files.
+pub fn rewrite_group_for_pre_agg(expr: Expr) -> Expr {
+    match expr {
+        Expr::Column(c) => {
+            let flat = match &c.relation {
+                Some(rel) => format!("{rel}.{}", c.name),
+                None => c.name.clone(),
+            };
+            Expr::Column(Column::from_name(&flat))
+        }
+        other => other,
+    }
+}
 
 /// Rewrite an aggregation expression to operate on pre-aggregated component
 /// columns instead of the raw source column.
@@ -99,9 +118,9 @@ pub fn rewrite_for_pre_agg(expr: Expr, alias_map: &HashMap<String, String>) -> E
 
 fn build_pre_agg_expr(col_name: &str, agg_name: &str) -> Option<Expr> {
     use datafusion::functions_aggregate::expr_fn::{max, min, sum};
-    use datafusion::prelude::col;
 
-    let c = |component: &str| col(component_col_name(col_name, component).as_str());
+    let c =
+        |component: &str| Expr::Column(Column::from_name(component_col_name(col_name, component)));
 
     Some(match agg_name {
         "sum" => sum(c("sum")),
