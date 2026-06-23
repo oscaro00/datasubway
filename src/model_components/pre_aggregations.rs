@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use datafusion::prelude::col;
+
+use crate::data_model::DataModel;
+
 /// Maps user-facing agg names to stored component column suffixes.
 /// e.g. "mean" needs both "sum" and "count" components stored.
 pub fn agg_expansion(agg_name: &str) -> Result<Vec<&'static str>, String> {
@@ -122,6 +126,124 @@ impl PreAggregation {
         true
     }
 }
+
+// ── DataModel write methods ───────────────────────────────────────────────────
+
+impl DataModel {
+    /// Compute and write parquet files for the named pre-aggregations.
+    pub fn write_pre_aggs(&self, names: &[&str]) -> Result<(), String> {
+        let pre_aggs = self
+            .0
+            .pre_aggs
+            .as_ref()
+            .ok_or("no pre-aggregations registered on this DataModel")?;
+        for &name in names {
+            let pa = pre_aggs
+                .iter()
+                .find(|pa| pa.name == name)
+                .ok_or_else(|| format!("pre-aggregation '{name}' not found"))?;
+            self.write_pre_agg(pa)?;
+        }
+        Ok(())
+    }
+
+    fn write_pre_agg(&self, pa: &PreAggregation) -> Result<(), String> {
+        use datafusion::dataframe::DataFrameWriteOptions;
+        use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
+        use datafusion::prelude::Expr;
+
+        let path = self
+            .0
+            .pre_agg_path
+            .as_deref()
+            .ok_or("pre_agg_path not set on DataModel")?;
+
+        let all_col_names = pa.group_by.iter().chain(pa.aggregations.keys());
+        let mut referenced_tables: Vec<String> = all_col_names
+            .filter_map(|c| c.split_once('.').map(|(t, _)| t.to_string()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        referenced_tables.sort();
+
+        if referenced_tables.is_empty() {
+            return Err("all columns must be table-qualified (e.g. orders.amount)".into());
+        }
+
+        let base_table = referenced_tables
+            .iter()
+            .find(|candidate| {
+                referenced_tables
+                    .iter()
+                    .all(|t| t == *candidate || self.0.joins.find_path(candidate, t).is_some())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "no single base table can reach all tables {referenced_tables:?} via join graph"
+                )
+            })?
+            .clone();
+
+        let non_agg_str: std::collections::HashSet<String> =
+            pa.group_by.iter().cloned().collect();
+        let agg_str: HashMap<String, Vec<String>> = pa
+            .aggregations
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let mut df = self
+            .get_df_table(&base_table, &non_agg_str, &agg_str, false)
+            .map_err(|e| e.to_string())?
+            .inner;
+
+        let group_by_exprs: Vec<Expr> = pa
+            .group_by
+            .iter()
+            .map(|c| col(c.as_str()).alias(c.as_str()))
+            .collect();
+
+        let mut agg_exprs: Vec<Expr> = Vec::new();
+        for (qcol, components) in &pa.aggregations {
+            for component in components {
+                let alias = component_col_name(qcol, component);
+                let qcol_expr = || col(qcol.as_str());
+                let expr = match component.as_str() {
+                    "sum" => sum(qcol_expr()).alias(&alias),
+                    "count" => count(qcol_expr()).alias(&alias),
+                    "min" => min(qcol_expr()).alias(&alias),
+                    "max" => max(qcol_expr()).alias(&alias),
+                    "sumsq" => sum(qcol_expr() * qcol_expr()).alias(&alias),
+                    other => return Err(format!("unknown pre-agg component '{other}'")),
+                };
+                agg_exprs.push(expr);
+            }
+        }
+
+        df = df
+            .aggregate(group_by_exprs, agg_exprs)
+            .map_err(|e| format!("failed to aggregate for pre-agg: {e}"))?;
+
+        let file_path = format!("{path}/{}.parquet", pa.name);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(
+                    df.write_parquet(&file_path, DataFrameWriteOptions::new(), None),
+                )
+            }),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(df.write_parquet(&file_path, DataFrameWriteOptions::new(), None)),
+        }
+        .map_err(|e| format!("failed to write parquet: {e}"))?;
+
+        Ok(())
+    }
+}
+
+// ── Coverage helpers ──────────────────────────────────────────────────────────
 
 /// Find the best (smallest row_count) pre-agg that covers the request.
 pub fn find_best_pre_agg<'a>(

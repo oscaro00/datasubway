@@ -236,18 +236,21 @@ fn sorted_select(batches: Vec<RecordBatch>, sort_col: &str, cols: &[&str]) -> St
     let schema = batches[0].schema();
     let combined = concat_batches(&schema, &batches).unwrap();
 
+    let sort_opts = Some(SortOptions { descending: false, nulls_first: true });
     let sort_idx = schema.index_of(sort_col).unwrap();
-    let indices = lexsort_to_indices(
-        &[SortColumn {
-            values: Arc::clone(combined.column(sort_idx)),
-            options: Some(SortOptions {
-                descending: false,
-                nulls_first: true,
-            }),
-        }],
-        None,
-    )
-    .unwrap();
+    // Primary: sort_col. Secondary: each selected column in order — stabilizes ties
+    // (e.g. two rows with NULL primary key produced by different sides of a FULL JOIN).
+    let mut sort_columns = vec![SortColumn {
+        values: Arc::clone(combined.column(sort_idx)),
+        options: sort_opts,
+    }];
+    for &c in cols {
+        let i = schema.index_of(c).unwrap();
+        if i != sort_idx {
+            sort_columns.push(SortColumn { values: Arc::clone(combined.column(i)), options: sort_opts });
+        }
+    }
+    let indices = lexsort_to_indices(&sort_columns, None).unwrap();
 
     let out_schema = Arc::new(Schema::new(
         cols.iter()
@@ -670,41 +673,36 @@ async fn test_player_goals_and_game_count_by_group() {
     )
     .unwrap();
 
-    // Merge using UNION ALL + GROUP BY MAX — the same semantics as combine_measures.
-    // A FULL JOIN would give incorrect results for NULL group_name rows because
-    // NULL != NULL in join conditions, whereas GROUP BY correctly coalesces them.
-    let pg_batches = player_goals_df.collect().await.unwrap();
-    let gc_batches = game_count_df.collect().await.unwrap();
-    let merge_ctx = SessionContext::new();
-    merge_ctx
-        .register_table(
-            "pg",
-            Arc::new(
-                datafusion::datasource::MemTable::try_new(pg_batches[0].schema(), vec![pg_batches])
-                    .unwrap(),
-            ),
+    // Rename game_count's group key before joining to avoid the duplicate-column
+    // error DataFusion raises on FULL JOIN when both sides share a flat-aliased name.
+    let game_count_aliased = game_count_df
+        .select(vec![
+            Expr::Column(Column::from_name("groups.group_name")).alias("__gc_group__"),
+            Expr::Column(Column::from_name("games.game_count")),
+        ])
+        .unwrap();
+
+    // FULL JOIN with standard equality — NULL != NULL is intentional: a NULL
+    // group_name from one measure is not assumed to match a NULL from another.
+    let joined = player_goals_df
+        .join_on(
+            game_count_aliased,
+            JoinType::Full,
+            [Expr::Column(Column::from_name("groups.group_name"))
+                .eq(Expr::Column(Column::from_name("__gc_group__")))],
         )
         .unwrap();
-    merge_ctx
-        .register_table(
-            "gc",
-            Arc::new(
-                datafusion::datasource::MemTable::try_new(gc_batches[0].schema(), vec![gc_batches])
-                    .unwrap(),
-            ),
-        )
-        .unwrap();
-    let expected = merge_ctx
-        .sql(r#"SELECT "groups.group_name",
-                       MAX("player_stats.goals") AS "player_stats.goals",
-                       MAX("games.game_count")   AS "games.game_count"
-               FROM (
-                   SELECT "groups.group_name", "player_stats.goals", NULL AS "games.game_count" FROM pg
-                   UNION ALL
-                   SELECT "groups.group_name", NULL AS "player_stats.goals", "games.game_count" FROM gc
-               ) t
-               GROUP BY "groups.group_name""#)
-        .await
+
+    let expected = joined
+        .select(vec![
+            coalesce(vec![
+                Expr::Column(Column::from_name("groups.group_name")),
+                Expr::Column(Column::from_name("__gc_group__")),
+            ])
+            .alias("groups.group_name"),
+            Expr::Column(Column::from_name("player_stats.goals")),
+            Expr::Column(Column::from_name("games.game_count")),
+        ])
         .unwrap()
         .collect()
         .await
