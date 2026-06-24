@@ -20,14 +20,7 @@ pub fn plan_merge_key(df: &DataFrame) -> Result<String, String> {
         .downcast_ref::<AggregateWithMetadata>()
         .ok_or("expected AggregateWithMetadata at plan root")?;
 
-    let mut group_strs: Vec<String> = node.group_expr.iter().map(|e| format!("{e}")).collect();
-    group_strs.sort();
-
-    Ok(format!(
-        "{}|{}",
-        node.input.display_graphviz(),
-        group_strs.join(",")
-    ))
+    Ok(format!("{}", node.input.display_graphviz()))
 }
 
 /// Merge a group of compatible DataFrames into one whose AggregateWithMetadata

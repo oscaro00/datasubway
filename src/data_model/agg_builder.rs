@@ -59,13 +59,25 @@ impl DataModel {
             measure_dfs.push((m_name.clone(), df));
         }
 
-        // Merge compatible measures (identical input subplan + group-by expressions).
-        // Measures that cannot be merged remain separate and are FULL JOINed below.
+        // Validate group-by compatibility upfront: all measures must resolve to the
+        // same group-by columns so the FULL JOIN chain has consistent join keys.
+        let join_cols = resolve_group_by_cols(&measure_dfs[0].1)?;
+        for (m_name, df) in &measure_dfs[1..] {
+            let cols = resolve_group_by_cols(df)?;
+            if cols != join_cols {
+                return Err(format!(
+                    "incompatible group-by columns across measures: '{m_name}' resolved {:?} but expected {:?}",
+                    cols, join_cols
+                ));
+            }
+        }
+
+        // Merge compatible measures (identical input subplan). Group-by equivalence is
+        // already guaranteed above, so the merge key only needs to cover the input plan.
         let merged = merge_measure_dfs(measure_dfs, &self.0.ctx)?;
 
         let mut merged_iter = merged.into_iter().enumerate();
         let (_, first) = merged_iter.next().unwrap();
-        let join_cols = resolve_group_by_cols(&first)?;
 
         // Flatten the first measure's output: qualified group-by columns
         // (e.g. Column{relation:"orders", name:"date"}) become flat dot-named aliases
@@ -77,14 +89,6 @@ impl DataModel {
         // enumerate() resumes at index 1 after consuming the first element, so
         // right_idx matches the alias "m1", "m2", ... that full_join_right_measure uses.
         for (right_idx, right_df) in merged_iter {
-            let right_join_cols = resolve_group_by_cols(&right_df)?;
-            if right_join_cols != join_cols {
-                return Err(format!(
-                    "incompatible group-by columns across measures: {:?} vs {:?}",
-                    join_cols, right_join_cols
-                ));
-            }
-
             combined =
                 full_join_right_measure(&self.0.ctx, combined, right_df, &join_cols, right_idx)?;
         }
