@@ -27,6 +27,7 @@ use crate::wrappers::datafusion::{
 
 mod agg_builder;
 mod column_values_builder;
+mod merge_optimizer;
 mod select_builder;
 
 // Re-export flatten_df under the historic name for callers (e.g. integration tests)

@@ -164,6 +164,8 @@ async fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
     );
     dm.add_measure(DfMeasure::new("player_goals", player_goals))
         .unwrap();
+    dm.add_measure(DfMeasure::new("player_assists", player_assists))
+        .unwrap();
     dm.add_measure(DfMeasure::new("team_goals", team_goals))
         .unwrap();
     dm.add_measure(DfMeasure::new("game_count", game_count))
@@ -183,6 +185,21 @@ fn player_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<D
                 ColumnInclude::None,
             ),
             vec![sum(col("player_stats.goals")).alias("player_stats.goals")],
+        )
+        .build()
+}
+
+fn player_assists(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
+    let mut recorder = dm.table("player_stats");
+    recorder.pre_agg_allowed = qc.use_pre_agg;
+    recorder
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![sum(col("player_stats.assists")).alias("player_stats.assists")],
         )
         .build()
 }
@@ -742,6 +759,77 @@ async fn test_player_goals_and_game_count_by_group() {
         sorted_select(actual, sort_col, measure_cols),
         sorted_select(expected, sort_col, measure_cols),
         "multi-measure (player_goals + game_count) by group_name mismatch"
+    );
+}
+
+/// Verify that player_goals and player_assists (both sourced from player_stats) are
+/// merged into a single aggregate node when use_pre_agg is disabled, so no Full join
+/// appears between them in the logical plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_player_goals_and_assists_merged() {
+    // shared_pre_agg_dm already has both player_goals and player_assists registered.
+    // use_pre_agg = Some(false) ensures both measures scan the same raw player_stats
+    // table, giving them identical input subplans and making them candidates for merging.
+    let dm = shared_pre_agg_dm().await;
+
+    let qc = AggContext::new(
+        vec!["player_goals".to_string(), "player_assists".to_string()],
+        None,
+        Some(vec!["players.player_name".to_string()]),
+        None,
+        None,
+        None,
+        None,
+        Some(false),
+        None,
+    )
+    .unwrap();
+
+    let plan = dm.display_graphviz(&DataQuery::Agg(qc.clone())).unwrap();
+    println!("{plan}");
+    assert!(
+        !plan.contains("Full"),
+        "merged measures should not produce a Full join:\n{plan}"
+    );
+
+    let actual = dm_query(dm, qc).await;
+
+    let ctx = shared_ctx().await;
+    let expected = normalize_schema(
+        ctx.table("player_stats")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("players").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.player_id"],
+                &["players.player_id"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("players.player_name")],
+                vec![
+                    sum(col("player_stats.goals")).alias("player_stats.goals"),
+                    sum(col("player_stats.assists")).alias("player_stats.assists"),
+                ],
+            )
+            .unwrap(),
+    )
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let cols = &[
+        "players.player_name",
+        "player_stats.goals",
+        "player_stats.assists",
+    ];
+    assert_eq!(
+        sorted_select(actual, "players.player_name", cols),
+        sorted_select(expected, "players.player_name", cols),
+        "merged player_goals + player_assists by player_name mismatch"
     );
 }
 

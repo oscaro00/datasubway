@@ -109,15 +109,8 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 - More aggregation algorithms like KLL or t-digest for percentiles
 - Docs
 - Tests
-- Fix the mistake to not handle columns properly
-  - sum(Expr::Column(Column::from_name("team_stats.goals"))).alias("team_stats.goals") is unacceptable for users to write
-  - Just reference relations and columns as datafusion intended
-- Logic to rewrite similar queries if their only difference is the aggregate column
 - Figure out logic for:
-  - with_columns()
-  - join()
   - Ducklake for atomic pre aggregation updates?
-  - Aliases generally
 
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files

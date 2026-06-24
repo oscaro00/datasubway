@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Field;
 use datafusion::common::{Column, TableReference};
-use datafusion::logical_expr::{JoinType, LogicalPlan, LogicalPlanBuilder, SortExpr, SubqueryAlias};
+use datafusion::logical_expr::{
+    JoinType, LogicalPlan, LogicalPlanBuilder, SortExpr, SubqueryAlias,
+};
 use datafusion::prelude::{DataFrame, Expr, col};
 
 use crate::{
@@ -13,6 +15,8 @@ use crate::{
         measures::{MeasureMetadata, resolve_group_by_cols},
     },
 };
+
+use super::merge_optimizer::merge_measure_dfs;
 
 use super::DataModel;
 
@@ -42,33 +46,37 @@ impl DataModel {
             .collect();
         qc.validate(&known_measures, &all_columns)?;
 
-        // Build the first measure and determine shared group-by columns.
-        let first_name = qc.measures.first().unwrap();
-        let first_df = self
-            .0
-            .measures
-            .get(first_name)
-            .unwrap()
-            .call(self, qc)
-            .map_err(|e| format!("measure '{first_name}' failed: {e}"))?;
-        let join_cols = resolve_group_by_cols(&first_df)?;
-
-        // Flatten the first measure's output: qualified group-by columns
-        // (e.g. Column{relation:"orders", name:"date"}) become flat dot-named aliases
-        // ("orders.date" with no qualifier). This makes them consistently referenceable
-        // by Column::from_name throughout the rest of build_agg_frame.
-        let mut combined = flatten_df(first_df)?;
-
-        // Chain FULL JOINs one at a time — no Vec<DataFrame> is collected.
-        for (right_idx, m_name) in qc.measures[1..].iter().enumerate() {
-            let right_df = self
+        // Build all measure DataFrames before any joining.
+        let mut measure_dfs: Vec<(String, DataFrame)> = Vec::with_capacity(qc.measures.len());
+        for m_name in &qc.measures {
+            let df = self
                 .0
                 .measures
                 .get(m_name)
                 .unwrap()
                 .call(self, qc)
                 .map_err(|e| format!("measure '{m_name}' failed: {e}"))?;
+            measure_dfs.push((m_name.clone(), df));
+        }
 
+        // Merge compatible measures (identical input subplan + group-by expressions).
+        // Measures that cannot be merged remain separate and are FULL JOINed below.
+        let merged = merge_measure_dfs(measure_dfs, &self.0.ctx)?;
+
+        let mut merged_iter = merged.into_iter().enumerate();
+        let (_, first) = merged_iter.next().unwrap();
+        let join_cols = resolve_group_by_cols(&first)?;
+
+        // Flatten the first measure's output: qualified group-by columns
+        // (e.g. Column{relation:"orders", name:"date"}) become flat dot-named aliases
+        // ("orders.date" with no qualifier). This makes them consistently referenceable
+        // by Column::from_name throughout the rest of build_agg_frame.
+        let mut combined = flatten_df(first)?;
+
+        // Chain FULL JOINs for any remaining (non-merged) DataFrames.
+        // enumerate() resumes at index 1 after consuming the first element, so
+        // right_idx matches the alias "m1", "m2", ... that full_join_right_measure uses.
+        for (right_idx, right_df) in merged_iter {
             let right_join_cols = resolve_group_by_cols(&right_df)?;
             if right_join_cols != join_cols {
                 return Err(format!(
@@ -77,13 +85,8 @@ impl DataModel {
                 ));
             }
 
-            combined = full_join_right_measure(
-                &self.0.ctx,
-                combined,
-                right_df,
-                &join_cols,
-                right_idx + 1,
-            )?;
+            combined =
+                full_join_right_measure(&self.0.ctx, combined, right_df, &join_cols, right_idx)?;
         }
 
         if let Some(having_expr) = json_to_expr(&qc.havings) {
@@ -96,9 +99,7 @@ impl DataModel {
             let sort_exprs: Vec<SortExpr> = qc
                 .sorts
                 .iter()
-                .map(|(c, d)| {
-                    Expr::Column(Column::from_name(c.as_str())).sort(d != "desc", true)
-                })
+                .map(|(c, d)| Expr::Column(Column::from_name(c.as_str())).sort(d != "desc", true))
                 .collect();
             combined = combined
                 .sort(sort_exprs)
@@ -236,9 +237,8 @@ fn build_post_join_projection(
         // This is a left-side non-join-key column (flat alias, no qualifier expected).
         let col_name = field.name().to_string();
         seen_measure_cols.insert(col_name.clone());
-        proj_exprs.push(
-            Expr::Column(Column::from_name(col_name.as_str())).alias(col_name.as_str()),
-        );
+        proj_exprs
+            .push(Expr::Column(Column::from_name(col_name.as_str())).alias(col_name.as_str()));
     }
 
     // 3. Project right's non-join-key columns, skipping any already present on the left.
