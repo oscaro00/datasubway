@@ -59,7 +59,7 @@ pub struct DataFrameRecorder {
 }
 
 impl DataFrameRecorder {
-    pub fn new(table_name: String, data_model: DataModel) -> Self {
+    pub fn new(table_name: String, data_model: DataModel, use_pre_agg: bool) -> Self {
         Self {
             table_name,
             data_model,
@@ -67,7 +67,7 @@ impl DataFrameRecorder {
             non_agg_cols: HashSet::new(),
             agg_cols: HashMap::new(),
             allow_exclude_records: Vec::new(),
-            pre_agg_allowed: true,
+            pre_agg_allowed: use_pre_agg,
             alias_map: HashMap::new(),
         }
     }
@@ -472,7 +472,7 @@ mod tests {
     fn test_reachable_filter_kept() {
         let dm = make_dm();
         let rec = dm
-            .table("orders")
+            .table("orders", true)
             .filter(col("customers.country").eq(lit("US")));
         assert_eq!(filter_ops(rec).len(), 1);
     }
@@ -481,7 +481,7 @@ mod tests {
     fn test_unreachable_filter_dropped() {
         let dm = make_dm();
         let rec = dm
-            .table("orders")
+            .table("orders", true)
             .filter(col("products.price").lt(lit(50.0f64)));
         assert_eq!(filter_ops(rec).len(), 0);
     }
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn test_compound_and_partial_prune() {
         let dm = make_dm();
-        let rec = dm.table("orders").filter(
+        let rec = dm.table("orders", true).filter(
             col("orders.amount")
                 .gt(lit(0.0f64))
                 .and(col("products.price").lt(lit(50.0f64))),
@@ -507,7 +507,7 @@ mod tests {
         // pre_agg_allowed starts true; with_columns sets it false
         let dm = make_dm();
         let rec = dm
-            .table("orders")
+            .table("orders", true)
             .with_columns(vec![col("orders.amount").alias("amt")]);
         assert!(!rec.pre_agg_allowed);
     }
@@ -516,7 +516,7 @@ mod tests {
     fn test_with_columns_tracks_alias() {
         let dm = make_dm();
         let rec = dm
-            .table("orders")
+            .table("orders", true)
             .with_columns(vec![col("orders.amount").alias("amt")]);
         assert_eq!(rec.alias_map.get("amt"), Some(&"orders.amount".to_string()));
     }
@@ -525,7 +525,7 @@ mod tests {
     fn test_transitive_alias_chain() {
         let dm = make_dm();
         let rec = dm
-            .table("orders")
+            .table("orders", true)
             .with_columns(vec![col("orders.amount").alias("a")])
             .with_columns(vec![col("a").alias("b")])
             .with_columns(vec![col("b").alias("c")]);

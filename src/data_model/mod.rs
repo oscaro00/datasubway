@@ -113,12 +113,12 @@ impl DataModel {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    pub fn table(&self, table_name: &str) -> DataFrameRecorder {
+    pub fn table(&self, table_name: &str, use_pre_agg: bool) -> DataFrameRecorder {
         assert!(
             self.0.table_providers.contains_key(table_name),
             "table '{table_name}' not found in DataModel"
         );
-        DataFrameRecorder::new(table_name.to_string(), self.clone())
+        DataFrameRecorder::new(table_name.to_string(), self.clone(), use_pre_agg)
     }
 
     pub fn add_measure(&mut self, measure: DfMeasure) -> Result<(), String> {

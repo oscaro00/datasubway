@@ -175,9 +175,7 @@ async fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
 }
 
 fn player_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
-    let mut recorder = dm.table("player_stats");
-    recorder.pre_agg_allowed = qc.use_pre_agg;
-    recorder
+    dm.table("player_stats", qc.use_pre_agg)
         .aggregate(
             allow(
                 ColumnPattern::OnePattern("*".into()),
@@ -190,9 +188,7 @@ fn player_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<D
 }
 
 fn player_assists(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
-    let mut recorder = dm.table("player_stats");
-    recorder.pre_agg_allowed = qc.use_pre_agg;
-    recorder
+    dm.table("player_stats", qc.use_pre_agg)
         .aggregate(
             allow(
                 ColumnPattern::OnePattern("*".into()),
@@ -205,9 +201,7 @@ fn player_assists(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result
 }
 
 fn team_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
-    let mut recorder = dm.table("team_stats");
-    recorder.pre_agg_allowed = qc.use_pre_agg;
-    recorder
+    dm.table("team_stats", qc.use_pre_agg)
         .aggregate(
             allow(
                 ColumnPattern::OnePattern("*".into()),
@@ -220,9 +214,7 @@ fn team_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<Dat
 }
 
 fn game_count(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
-    let mut recorder = dm.table("games");
-    recorder.pre_agg_allowed = qc.use_pre_agg;
-    recorder
+    dm.table("games", qc.use_pre_agg)
         .aggregate(
             allow(
                 ColumnPattern::OnePattern("*".into()),

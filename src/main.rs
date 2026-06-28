@@ -36,7 +36,7 @@ async fn main() {
 
     // Basic filter
     let df = dm
-        .table("orders")
+        .table("orders", true)
         .filter(col("orders.customer_id").not_eq(lit(20i64)))
         .build()
         .unwrap();
@@ -47,7 +47,7 @@ async fn main() {
     );
 
     // Full scan
-    let df2 = dm.table("orders").build().unwrap();
+    let df2 = dm.table("orders", true).build().unwrap();
     let results2 = df2.collect().await.unwrap();
     println!(
         "full scan: {} rows",
@@ -57,7 +57,7 @@ async fn main() {
     // Group-by + agg
     use datafusion::functions_aggregate::expr_fn::sum;
     let df3 = dm
-        .table("orders")
+        .table("orders", true)
         .aggregate(
             vec![col("orders.customer_id")],
             vec![sum(col("orders.amount")).alias("total")],
