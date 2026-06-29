@@ -121,7 +121,3 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 - Add optional AI dependency to get chat bot functionality working
 
 ## Known Issues
-
-- Introducing new columns or aliasing existing columns to a new name in a measure can cause pre agg covers() logic to fail
-  - Ignoring column names that don't exist in the data model seems like a solution, but you might need to know how aggregations used on the new column are saved with the root column(s)
-  - Are the root columns of the new column agg columns or non agg columns?

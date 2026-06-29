@@ -149,17 +149,33 @@ async fn build_dm() -> DataModel {
         .unwrap();
     dm.add_measure(DfMeasure::new("game_count", game_count))
         .unwrap();
+    dm.add_measure(DfMeasure::new(
+        "player_percent_team_boost_collected",
+        player_percent_of_team_boost_collected,
+    ))
+    .unwrap();
     dm
 }
 
-/// Pre-aggregation for player_goals grouped by player_name.
-fn player_goals_pre_agg() -> PreAggregation {
-    PreAggregation::new(
-        "player_goals_by_player".into(),
-        vec!["players.player_name".into()],
-        HashMap::from([("player_stats.goals".into(), vec!["sum".into()])]),
-    )
-    .unwrap()
+/// Pre-aggregations
+fn player_goals_pre_agg() -> Vec<PreAggregation> {
+    vec![
+        PreAggregation::new(
+            "player_goals_by_player".into(),
+            vec!["players.player_name".into()],
+            HashMap::from([("player_stats.goals".into(), vec!["sum".into()])]),
+        )
+        .unwrap(),
+        PreAggregation::new(
+            "player_team_boost_collected".into(),
+            vec!["players.player_name".into()],
+            HashMap::from([
+                ("player_stats.amount_collected".into(), vec!["sum".into()]),
+                ("team_stats.amount_collected".into(), vec!["sum".into()]),
+            ]),
+        )
+        .unwrap(),
+    ]
 }
 
 async fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
@@ -168,7 +184,7 @@ async fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
     let mut dm = DataModel::new(
         make_tables().await,
         JoinGraph::new(&make_joins()).unwrap(),
-        vec![player_goals_pre_agg()],
+        player_goals_pre_agg(),
         Some(path),
     );
     dm.add_measure(DfMeasure::new("player_goals", player_goals))
@@ -179,7 +195,13 @@ async fn build_dm_with_pre_agg() -> (DataModel, TempDir) {
         .unwrap();
     dm.add_measure(DfMeasure::new("game_count", game_count))
         .unwrap();
+    dm.add_measure(DfMeasure::new(
+        "player_percent_team_boost_collected",
+        player_percent_of_team_boost_collected,
+    ))
+    .unwrap();
     dm.write_pre_aggs(&["player_goals_by_player"]).unwrap();
+    dm.write_pre_aggs(&["player_team_boost_collected"]).unwrap();
     (dm, tmp)
 }
 
@@ -231,6 +253,26 @@ fn game_count(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<Dat
                 ColumnInclude::None,
             ),
             vec![count_distinct(col("player_stats.game_id")).alias("games.game_count")],
+        )
+        .build()
+}
+
+fn player_percent_of_team_boost_collected(
+    dm: &DataModel,
+    qc: &AggContext,
+) -> datafusion::common::Result<DataFrame> {
+    dm.table("player_stats", qc.use_pre_agg)
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![
+                (sum(col("player_stats.amount_collected"))
+                    / sum(col("team_stats.amount_collected")))
+                .alias("player_percent_of_team_boost_collected"),
+            ],
         )
         .build()
 }
@@ -720,6 +762,81 @@ async fn test_player_goals_and_assists_merged() {
         sorted_select(actual, "players.player_name", cols),
         sorted_select(expected, "players.player_name", cols),
         "merged player_goals + player_assists by player_name mismatch"
+    );
+}
+
+/// Verify that player_percent_of_team_boost_collected uses the player_team_boost_collected
+/// pre-agg when use_pre_agg=true and produces correct results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_player_percent_team_boost_pre_agg() {
+    let (dm, _tmp) = build_dm_with_pre_agg().await;
+
+    let qc = AggContext::new(
+        vec!["player_percent_team_boost_collected".to_string()],
+        None,
+        Some(vec!["players.player_name".to_string()]),
+        None,
+        None,
+        None,
+        None,
+        Some(true),
+        None,
+    )
+    .unwrap();
+
+    let plan = dm.display_graphviz(&DataQuery::Agg(qc.clone())).unwrap();
+    println!("{plan}");
+    assert!(
+        plan.contains("player_team_boost_collected"),
+        "use_pre_agg=true: expected pre-agg table in plan, got:\n{plan}"
+    );
+
+    let actual = dm_query(&dm, qc).await;
+
+    let ctx = shared_ctx().await;
+    let expected = normalize_schema(
+        ctx.table("player_stats")
+            .await
+            .unwrap()
+            .join(
+                ctx.table("players").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.player_id"],
+                &["players.player_id"],
+                None,
+            )
+            .unwrap()
+            .join(
+                ctx.table("team_stats").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.game_id", "player_stats.team_name"],
+                &["team_stats.game_id", "team_stats.team_name"],
+                None,
+            )
+            .unwrap()
+            .aggregate(
+                vec![col("players.player_name")],
+                vec![
+                    (sum(col("player_stats.amount_collected"))
+                        / sum(col("team_stats.amount_collected")))
+                    .alias("player_percent_of_team_boost_collected"),
+                ],
+            )
+            .unwrap(),
+    )
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let cols = &[
+        "players.player_name",
+        "player_percent_of_team_boost_collected",
+    ];
+    assert_eq!(
+        sorted_select(actual, "players.player_name", cols),
+        sorted_select(expected, "players.player_name", cols),
+        "player_percent_of_team_boost_collected by player_name mismatch"
     );
 }
 

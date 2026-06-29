@@ -116,7 +116,11 @@ pub fn rewrite_for_pre_agg(
         Expr::BinaryExpr(b) => {
             let left = rewrite_for_pre_agg(*b.left, alias_map, pre_agg_name);
             let right = rewrite_for_pre_agg(*b.right, alias_map, pre_agg_name);
-            left + right
+            Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+                left: Box::new(left),
+                op: b.op,
+                right: Box::new(right),
+            })
         }
         other => other,
     }

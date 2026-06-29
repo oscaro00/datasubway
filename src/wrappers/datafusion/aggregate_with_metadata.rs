@@ -3,7 +3,8 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchemaRef, Result};
 use datafusion::execution::context::{QueryPlanner, SessionState};
 use datafusion::logical_expr::{
-    Aggregate, Extension, LogicalPlan, SortExpr, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+    Extension, LogicalPlan, LogicalPlanBuilder, SortExpr, UserDefinedLogicalNode,
+    UserDefinedLogicalNodeCore,
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
@@ -118,13 +119,21 @@ impl ExtensionPlanner for AggregateWithMetadataExtensionPlanner {
         let Some(agg) = node.as_any().downcast_ref::<AggregateWithMetadata>() else {
             return Ok(None);
         };
-        let logical_agg = LogicalPlan::Aggregate(Aggregate::try_new(
-            agg.input.clone(),
-            agg.group_expr.clone(),
-            agg.aggr_expr.clone(),
-        )?);
+        // Use LogicalPlanBuilder so DataFusion's normalization runs (e.g. it
+        // splits BinaryExpr of aggregates into individual aggs + a projection,
+        // which Aggregate::try_new does not do on its own).
+        // Rebuild via LogicalPlanBuilder and run the logical optimizer before
+        // physical planning. This is necessary for complex aggregate expressions
+        // (e.g. sum(A) / sum(B)) which the optimizer normalizes into separate
+        // aggregates + a projection. Skipping the optimizer causes the physical
+        // aggregate planner to reject BinaryExpr inside aggr_expr.
+        let input_plan = Arc::unwrap_or_clone(agg.input.clone());
+        let logical_agg = LogicalPlanBuilder::from(input_plan)
+            .aggregate(agg.group_expr.clone(), agg.aggr_expr.clone())?
+            .build()?;
+        let optimized = session_state.optimize(&logical_agg)?;
         let physical = planner
-            .create_physical_plan(&logical_agg, session_state)
+            .create_physical_plan(&optimized, session_state)
             .await?;
         Ok(Some(physical))
     }
