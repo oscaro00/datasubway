@@ -9,7 +9,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::TableProvider;
 use datafusion::common::Column;
-use datafusion::functions_aggregate::expr_fn::{count, sum};
+use datafusion::functions_aggregate::expr_fn::{count_distinct, sum};
 use datafusion::prelude::*;
 use tempfile::TempDir;
 
@@ -72,14 +72,15 @@ async fn make_tables() -> HashMap<String, Arc<dyn TableProvider>> {
 
 fn make_joins() -> Vec<Join> {
     vec![
-        // player_stats is the central fact table
+        // player_stats is the central fact table; games, players, and team_stats
+        // are all dimensions that join onto it (RightOnLeft = one-way from left to right).
         Join {
             left: "player_stats".into(),
             right: "games".into(),
             left_on: vec!["player_stats.game_id".into()],
             right_on: vec!["games.game_id".into()],
             how: JoinHow::Left,
-            direction: JoinDirection::Both,
+            direction: JoinDirection::RightOnLeft,
         },
         Join {
             left: "player_stats".into(),
@@ -97,6 +98,14 @@ fn make_joins() -> Vec<Join> {
                 "player_stats.team_name".into(),
             ],
             right_on: vec!["team_stats.game_id".into(), "team_stats.team_name".into()],
+            how: JoinHow::Left,
+            direction: JoinDirection::RightOnLeft,
+        },
+        Join {
+            left: "games".into(),
+            right: "team_stats".into(),
+            left_on: vec!["games.game_id".into()],
+            right_on: vec!["team_stats.game_id".into()],
             how: JoinHow::Left,
             direction: JoinDirection::RightOnLeft,
         },
@@ -214,14 +223,14 @@ fn team_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<Dat
 }
 
 fn game_count(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
-    dm.table("games", qc.use_pre_agg)
+    dm.table("player_stats", qc.use_pre_agg)
         .aggregate(
             allow(
                 ColumnPattern::OnePattern("*".into()),
                 ColumnContext::MultipleStrings(qc.groups.clone()),
                 ColumnInclude::None,
             ),
-            vec![count(col("games.game_id")).alias("games.game_count")],
+            vec![count_distinct(col("player_stats.game_id")).alias("games.game_count")],
         )
         .build()
 }
@@ -417,8 +426,16 @@ async fn test_game_count_by_group() {
 
     let ctx = shared_ctx().await;
     let expected = normalize_schema(
-        ctx.table("games")
+        ctx.table("player_stats")
             .await
+            .unwrap()
+            .join(
+                ctx.table("games").await.unwrap(),
+                JoinType::Left,
+                &["player_stats.game_id"],
+                &["games.game_id"],
+                None,
+            )
             .unwrap()
             .join(
                 ctx.table("groups_bridge").await.unwrap(),
@@ -438,7 +455,7 @@ async fn test_game_count_by_group() {
             .unwrap()
             .aggregate(
                 vec![col("groups.group_name")],
-                vec![count(col("games.game_id")).alias("games.game_count")],
+                vec![count_distinct(col("player_stats.game_id")).alias("games.game_count")],
             )
             .unwrap(),
     )
@@ -526,10 +543,10 @@ async fn test_multi_measure_join() {
     );
     let actual = dm_query(&dm, qc).await;
 
+    // Both measures start from player_stats and join to players — same subplan,
+    // so the merge optimizer combines them into a single aggregate (no Full join).
     let ctx = shared_ctx().await;
-
-    // player_goals by player_name: player_stats → players
-    let player_goals_df = normalize_schema(
+    let expected = normalize_schema(
         ctx.table("player_stats")
             .await
             .unwrap()
@@ -543,78 +560,17 @@ async fn test_multi_measure_join() {
             .unwrap()
             .aggregate(
                 vec![col("players.player_name")],
-                vec![sum(col("player_stats.goals")).alias("player_stats.goals")],
+                vec![
+                    sum(col("player_stats.goals")).alias("player_stats.goals"),
+                    count_distinct(col("player_stats.game_id")).alias("games.game_count"),
+                ],
             )
             .unwrap(),
     )
+    .unwrap()
+    .collect()
+    .await
     .unwrap();
-
-    // game_count by player_name: games → player_stats → players
-    let game_count_df = normalize_schema(
-        ctx.table("games")
-            .await
-            .unwrap()
-            .join(
-                ctx.table("player_stats").await.unwrap(),
-                JoinType::Left,
-                &["games.game_id"],
-                &["player_stats.game_id"],
-                None,
-            )
-            .unwrap()
-            .join(
-                ctx.table("players").await.unwrap(),
-                JoinType::Left,
-                &["player_stats.player_id"],
-                &["players.player_id"],
-                None,
-            )
-            .unwrap()
-            .aggregate(
-                vec![col("players.player_name")],
-                vec![count(col("games.game_id")).alias("games.game_count")],
-            )
-            .unwrap(),
-    )
-    .unwrap();
-
-    // Merge the two normalized measure DFs via SQL FULL OUTER JOIN with COALESCE.
-    // Collecting first and registering as MemTables avoids the duplicate-qualified-
-    // column-name error that DataFusion raises when both DFs share the same
-    // qualified group column in a logical-plan Full join.
-    let pg_batches = player_goals_df.collect().await.unwrap();
-    let gc_batches = game_count_df.collect().await.unwrap();
-    let merge_ctx = SessionContext::new();
-    merge_ctx
-        .register_table(
-            "pg",
-            Arc::new(
-                datafusion::datasource::MemTable::try_new(pg_batches[0].schema(), vec![pg_batches])
-                    .unwrap(),
-            ),
-        )
-        .unwrap();
-    merge_ctx
-        .register_table(
-            "gc",
-            Arc::new(
-                datafusion::datasource::MemTable::try_new(gc_batches[0].schema(), vec![gc_batches])
-                    .unwrap(),
-            ),
-        )
-        .unwrap();
-    let expected = merge_ctx
-        .sql(r#"SELECT
-                COALESCE(pg."players.player_name", gc."players.player_name") AS "players.player_name",
-                pg."player_stats.goals",
-                gc."games.game_count"
-               FROM pg FULL OUTER JOIN gc
-               ON pg."players.player_name" = gc."players.player_name""#)
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
 
     let sort_col = "players.player_name";
     let measure_cols = &["player_stats.goals", "games.game_count"];
@@ -642,10 +598,10 @@ async fn test_player_goals_and_game_count_by_group() {
     .unwrap();
     let actual = dm_query(&dm, qc).await;
 
+    // Both measures start from player_stats with the same path to groups — same
+    // subplan, so the merge optimizer combines them into a single aggregate.
     let ctx = shared_ctx().await;
-
-    // player_goals by group: player_stats → games → groups_bridge → groups
-    let player_goals_df = normalize_schema(
+    let expected = normalize_schema(
         ctx.table("player_stats")
             .await
             .unwrap()
@@ -675,75 +631,17 @@ async fn test_player_goals_and_game_count_by_group() {
             .unwrap()
             .aggregate(
                 vec![col("groups.group_name")],
-                vec![sum(col("player_stats.goals")).alias("player_stats.goals")],
+                vec![
+                    sum(col("player_stats.goals")).alias("player_stats.goals"),
+                    count_distinct(col("player_stats.game_id")).alias("games.game_count"),
+                ],
             )
             .unwrap(),
     )
+    .unwrap()
+    .collect()
+    .await
     .unwrap();
-
-    // game_count by group: games → groups_bridge → groups
-    let game_count_df = normalize_schema(
-        ctx.table("games")
-            .await
-            .unwrap()
-            .join(
-                ctx.table("groups_bridge").await.unwrap(),
-                JoinType::Left,
-                &["games.game_id"],
-                &["groups_bridge.game_id"],
-                None,
-            )
-            .unwrap()
-            .join(
-                ctx.table("groups").await.unwrap(),
-                JoinType::Left,
-                &["groups_bridge.group_id"],
-                &["groups.group_id"],
-                None,
-            )
-            .unwrap()
-            .aggregate(
-                vec![col("groups.group_name")],
-                vec![count(col("games.game_id")).alias("games.game_count")],
-            )
-            .unwrap(),
-    )
-    .unwrap();
-
-    // Rename game_count's group key before joining to avoid the duplicate-column
-    // error DataFusion raises on FULL JOIN when both sides share a flat-aliased name.
-    let game_count_aliased = game_count_df
-        .select(vec![
-            Expr::Column(Column::from_name("groups.group_name")).alias("__gc_group__"),
-            Expr::Column(Column::from_name("games.game_count")),
-        ])
-        .unwrap();
-
-    // FULL JOIN with standard equality — NULL != NULL is intentional: a NULL
-    // group_name from one measure is not assumed to match a NULL from another.
-    let joined = player_goals_df
-        .join_on(
-            game_count_aliased,
-            JoinType::Full,
-            [Expr::Column(Column::from_name("groups.group_name"))
-                .eq(Expr::Column(Column::from_name("__gc_group__")))],
-        )
-        .unwrap();
-
-    let expected = joined
-        .select(vec![
-            coalesce(vec![
-                Expr::Column(Column::from_name("groups.group_name")),
-                Expr::Column(Column::from_name("__gc_group__")),
-            ])
-            .alias("groups.group_name"),
-            Expr::Column(Column::from_name("player_stats.goals")),
-            Expr::Column(Column::from_name("games.game_count")),
-        ])
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
 
     let sort_col = "groups.group_name";
     let measure_cols = &["player_stats.goals", "games.game_count"];

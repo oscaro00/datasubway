@@ -3,7 +3,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchemaRef, Result};
 use datafusion::execution::context::{QueryPlanner, SessionState};
 use datafusion::logical_expr::{
-    Aggregate, Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+    Aggregate, Extension, LogicalPlan, SortExpr, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
@@ -203,6 +203,35 @@ impl MetadataDataFrame {
             self.0
                 .join(right, join_type, left_cols, right_cols, filter)?,
         ))
+    }
+
+    pub fn distinct(self) -> Result<Self> {
+        Ok(Self(self.0.distinct()?))
+    }
+
+    pub fn distinct_on(
+        self,
+        on_expr: Vec<Expr>,
+        select_expr: Vec<Expr>,
+        sort_expr: Option<Vec<SortExpr>>,
+    ) -> Result<Self> {
+        Ok(Self(self.0.distinct_on(on_expr, select_expr, sort_expr)?))
+    }
+
+    pub fn drop_columns(self, columns: Vec<String>) -> Result<Self> {
+        Ok(Self(self.0.drop_columns(&columns)?))
+    }
+
+    pub fn union(self, right: DataFrame) -> Result<Self> {
+        Ok(Self(self.0.union(right)?))
+    }
+
+    pub fn union_distinct(self, right: DataFrame) -> Result<Self> {
+        Ok(Self(self.0.union_distinct(right)?))
+    }
+
+    pub fn window(self, window_exprs: Vec<Expr>) -> Result<Self> {
+        Ok(Self(self.0.window(window_exprs)?))
     }
 
     /// Call `aggregate()` and attach `metadata` to the resulting logical plan node.

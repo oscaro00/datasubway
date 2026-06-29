@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use datafusion::logical_expr::JoinType;
+use datafusion::logical_expr::{JoinType, SortExpr};
 use datafusion::prelude::{DataFrame, Expr};
 
 use crate::column_expressions::column_context::{AllowExcludeRecord, IntoColsExpr, IntoFilterExpr};
@@ -32,6 +32,16 @@ pub enum DataFrameOp {
         skip: usize,
         fetch: Option<usize>,
     },
+    Distinct,
+    DistinctOn {
+        on_expr: Vec<Expr>,
+        select_expr: Vec<Expr>,
+        sort_expr: Option<Vec<SortExpr>>,
+    },
+    DropColumns(Vec<String>),
+    Union(DataFrame),
+    UnionDistinct(DataFrame),
+    Window(Vec<Expr>),
 }
 
 // ── Recorder ─────────────────────────────────────────────────────────────────
@@ -156,6 +166,54 @@ impl DataFrameRecorder {
         self
     }
 
+    pub fn distinct(mut self) -> Self {
+        self.ops.push(DataFrameOp::Distinct);
+        self
+    }
+
+    pub fn distinct_on(
+        mut self,
+        on_expr: Vec<Expr>,
+        select_expr: Vec<Expr>,
+        sort_expr: Option<Vec<SortExpr>>,
+    ) -> Self {
+        for e in on_expr.iter().chain(select_expr.iter()) {
+            collect_col_names(e, &mut self.non_agg_cols);
+        }
+        self.ops.push(DataFrameOp::DistinctOn {
+            on_expr,
+            select_expr,
+            sort_expr,
+        });
+        self
+    }
+
+    pub fn drop_columns(mut self, columns: Vec<String>) -> Self {
+        self.ops.push(DataFrameOp::DropColumns(columns));
+        self
+    }
+
+    pub fn union(mut self, right: DataFrame) -> Self {
+        self.ops.push(DataFrameOp::Union(right));
+        self
+    }
+
+    pub fn union_distinct(mut self, right: DataFrame) -> Self {
+        self.ops.push(DataFrameOp::UnionDistinct(right));
+        self
+    }
+
+    /// Window functions operate on raw row-level data and cannot be applied to
+    /// pre-aggregated tables, so this sets `pre_agg_allowed = false`.
+    pub fn window(mut self, window_exprs: Vec<Expr>) -> Self {
+        self.pre_agg_allowed = false;
+        for e in &window_exprs {
+            collect_col_names(e, &mut self.non_agg_cols);
+        }
+        self.ops.push(DataFrameOp::Window(window_exprs));
+        self
+    }
+
     // ── Build ─────────────────────────────────────────────────────────────────
 
     /// Execute all recorded operations against the appropriate base table
@@ -231,6 +289,22 @@ impl DataFrameRecorder {
                 DataFrameOp::Sort(exprs) => mdf.sort(exprs)?,
 
                 DataFrameOp::Limit { skip, fetch } => mdf.limit(skip, fetch)?,
+
+                DataFrameOp::Distinct => mdf.distinct()?,
+
+                DataFrameOp::DistinctOn {
+                    on_expr,
+                    select_expr,
+                    sort_expr,
+                } => mdf.distinct_on(on_expr, select_expr, sort_expr)?,
+
+                DataFrameOp::DropColumns(cols) => mdf.drop_columns(cols)?,
+
+                DataFrameOp::Union(right) => mdf.union(right)?,
+
+                DataFrameOp::UnionDistinct(right) => mdf.union_distinct(right)?,
+
+                DataFrameOp::Window(exprs) => mdf.window(exprs)?,
             };
         }
 

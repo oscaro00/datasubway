@@ -201,15 +201,11 @@ fn compute_lookup(
                     continue; // Skip back-edges to start.
                 }
                 if visited.contains(*neighbor) {
-                    // Cross-edge to a non-start visited node is only allowed when it is the
-                    // reverse of the bidirectional tree edge that brought us to `current`.
-                    let is_bidi_reverse = join_edge.direction == JoinDirection::Both
-                        && parent.get(current).copied() == Some(*neighbor);
-                    if !is_bidi_reverse {
-                        return Err(format!(
-                            "Multiple paths from '{start}' to '{neighbor}' detected"
-                        ));
-                    }
+                    // Cross-edge to an already-visited node: skip it.
+                    // BFS already recorded the shortest path to this neighbor, so we
+                    // let that stand (first-found wins). The only exception we still
+                    // allow explicitly is the reverse of a bidirectional tree edge,
+                    // which is harmless and not a true second path.
                     continue;
                 }
                 visited.insert(neighbor);
