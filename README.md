@@ -109,8 +109,6 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 - More aggregation algorithms like KLL or t-digest for percentiles
 - Docs
 - Tests
-- Figure out logic for:
-  - Ducklake for atomic pre aggregation updates?
 
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files

@@ -17,7 +17,9 @@ use crate::model_components::{
     measures::{
         DfMeasure, MeasureMetadata, extract_df_measure_metadata, validate_df_measure_structure,
     },
-    pre_aggregations::{PreAggregation, agg_needed_components},
+    pre_aggregations::{
+        PreAggregation, agg_needed_components, read_parquet_row_count, resolve_pre_agg_path,
+    },
     select_context::SelectContext,
 };
 use crate::wrappers::datafusion::{
@@ -65,7 +67,7 @@ pub(crate) struct DataModelInner {
     pub(crate) joins: JoinGraph,
     pub(crate) measures: HashMap<String, DfMeasure>,
     pub(crate) measure_metadata: HashMap<String, MeasureMetadata>,
-    pub(crate) pre_aggs: Option<Vec<PreAggregation>>,
+    pub(crate) pre_aggs: Option<std::sync::RwLock<Vec<PreAggregation>>>,
     pub(crate) pre_agg_path: Option<String>,
 }
 
@@ -96,7 +98,7 @@ impl DataModel {
             }
         }
 
-        DataModel(Arc::new(DataModelInner {
+        let dm = DataModel(Arc::new(DataModelInner {
             ctx,
             table_providers: tables,
             joins,
@@ -105,10 +107,33 @@ impl DataModel {
             pre_aggs: if pre_aggs.is_empty() {
                 None
             } else {
-                Some(pre_aggs)
+                Some(std::sync::RwLock::new(pre_aggs))
             },
             pre_agg_path,
-        }))
+        }));
+
+        // Best-effort: restore bookkeeping from any existing pointer files on disk.
+        if let (Some(path), Some(lock)) = (dm.0.pre_agg_path.as_deref(), dm.0.pre_aggs.as_ref()) {
+            let mut pre_aggs = lock.write().unwrap();
+            for pa in pre_aggs.iter_mut() {
+                if let Some(versioned) = resolve_pre_agg_path(path, &pa.name) {
+                    if let Some(rc) = read_parquet_row_count(&versioned) {
+                        pa.row_count = rc;
+                    }
+                    if let Ok(meta) = std::fs::metadata(&versioned) {
+                        if let Ok(modified) = meta.modified() {
+                            let secs = modified
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            pa.written_at = Some(secs.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        dm
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -194,7 +219,8 @@ impl DataModel {
         pre_agg_allowed: bool,
     ) -> datafusion::common::Result<DataFrameWrapper> {
         if pre_agg_allowed && !agg_cols.is_empty() {
-            if let (Some(pre_aggs), Some(path)) = (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
+            if let (Some(pre_aggs_lock), Some(path)) =
+                (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
             {
                 let non_agg_vec: Vec<String> = non_agg_cols.iter().cloned().collect();
                 let agg_map: HashMap<String, HashSet<String>> = agg_cols
@@ -210,6 +236,7 @@ impl DataModel {
                     })
                     .collect();
 
+                let pre_aggs = pre_aggs_lock.read().unwrap();
                 let mut candidates: Vec<&PreAggregation> = pre_aggs
                     .iter()
                     .filter(|pa| pa.covers(&non_agg_vec, &agg_map))
@@ -217,7 +244,10 @@ impl DataModel {
                 candidates.sort_by_key(|pa| pa.row_count);
 
                 'candidates: for candidate in &candidates {
-                    let pre_agg_file = format!("{path}/{}.parquet", candidate.name);
+                    let Some(pre_agg_file) = resolve_pre_agg_path(path, &candidate.name) else {
+                        debug!(pre_agg = %candidate.name, "no current pointer, trying next");
+                        continue 'candidates;
+                    };
                     if !std::path::Path::new(&pre_agg_file).exists() {
                         debug!(pre_agg = %candidate.name, "parquet not found, trying next");
                         continue 'candidates;
@@ -381,8 +411,110 @@ mod tests {
     }
 
     #[test]
-    fn test_write_pre_agg_creates_file() {
+    fn test_write_pre_agg_creates_versioned_file() {
+        let (dm, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        let base = tmp.path().to_str().unwrap();
+
+        // Pointer file must exist.
+        assert!(tmp.path().join("daily_revenue.current").exists());
+
+        // Pointer must resolve to an existing versioned parquet.
+        let versioned = resolve_pre_agg_path(base, "daily_revenue")
+            .expect("pointer should resolve to a versioned path");
+        assert!(
+            std::path::Path::new(&versioned).exists(),
+            "versioned path does not exist: {versioned}"
+        );
+
+        // Bookkeeping must be populated after write.
+        let pre_aggs = dm.0.pre_aggs.as_ref().unwrap().read().unwrap();
+        let pa = pre_aggs.iter().find(|p| p.name == "daily_revenue").unwrap();
+        assert!(pa.row_count > 0, "row_count should be > 0 after write");
+        assert!(
+            pa.written_at.is_some(),
+            "written_at should be Some after write"
+        );
+    }
+
+    #[test]
+    fn test_write_twice_keeps_two_versions_then_purge() {
+        let (dm, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        dm.write_pre_aggs(&["daily_revenue"]).unwrap();
+
+        let base = tmp.path().to_str().unwrap();
+        let versioned_entries: Vec<_> = std::fs::read_dir(base)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let s = e.file_name();
+                let s = s.to_string_lossy();
+                s.starts_with("daily_revenue.") && s.ends_with(".parquet")
+            })
+            .collect();
+        assert!(
+            versioned_entries.len() >= 2,
+            "expected at least two versioned entries after two writes"
+        );
+
+        dm.purge_old_pre_agg_versions(&["daily_revenue"]).unwrap();
+
+        let remaining: Vec<_> = std::fs::read_dir(base)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let s = e.file_name();
+                let s = s.to_string_lossy();
+                s.starts_with("daily_revenue.") && s.ends_with(".parquet")
+            })
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "expected exactly one versioned entry after purge"
+        );
+    }
+
+    #[test]
+    fn test_new_restores_bookkeeping_from_existing_pointer() {
+        // Write a pre-agg with one DataModel instance, then construct a fresh DataModel
+        // pointing at the same path and verify row_count / written_at are restored from disk.
         let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
-        assert!(tmp.path().join("daily_revenue.parquet").exists());
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let dm2 = make_orders_dm(Some(path), vec![daily_revenue_pre_agg()]);
+
+        let pre_aggs = dm2.0.pre_aggs.as_ref().unwrap().read().unwrap();
+        let pa = pre_aggs.iter().find(|p| p.name == "daily_revenue").unwrap();
+        assert!(
+            pa.row_count > 0,
+            "row_count should be restored from parquet metadata on DataModel::new"
+        );
+        assert!(
+            pa.written_at.is_some(),
+            "written_at should be restored from file mtime on DataModel::new"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_pointer_resolves_to_missing_path() {
+        let (_, tmp) = write_and_get_tmp(daily_revenue_pre_agg());
+        let base = tmp.path().to_str().unwrap();
+
+        // Overwrite the pointer to reference a non-existent versioned file.
+        std::fs::write(
+            format!("{base}/daily_revenue.current"),
+            "daily_revenue.0.parquet",
+        )
+        .unwrap();
+
+        // resolve_pre_agg_path returns the path named in the pointer even when it doesn't exist.
+        // The read path's subsequent exists() check will see it as missing and fall through.
+        let resolved =
+            resolve_pre_agg_path(base, "daily_revenue").expect("pointer file should still parse");
+        assert!(
+            !std::path::Path::new(&resolved).exists(),
+            "resolved path should not exist for corrupt pointer"
+        );
     }
 }

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use datafusion::prelude::col;
 
@@ -140,22 +141,65 @@ impl PreAggregation {
     }
 }
 
+// ── File-system helpers ───────────────────────────────────────────────────────
+
+/// Reads the pointer file for a pre-agg and returns the full path to the current versioned parquet.
+pub(crate) fn resolve_pre_agg_path(base_path: &str, name: &str) -> Option<String> {
+    let pointer = format!("{base_path}/{name}.current");
+    let versioned = std::fs::read_to_string(&pointer).ok()?;
+    Some(format!("{base_path}/{}", versioned.trim()))
+}
+
+/// Reads a parquet file's (or directory of parquet files') metadata to return the total row count.
+pub(crate) fn read_parquet_row_count(path: &str) -> Option<u64> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let p = std::path::Path::new(path);
+    if p.is_dir() {
+        let total: i64 = std::fs::read_dir(p)
+            .ok()?
+            .flatten()
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "parquet"))
+            .filter_map(|e| {
+                let f = std::fs::File::open(e.path()).ok()?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(f).ok()?;
+                Some(builder.metadata().file_metadata().num_rows())
+            })
+            .sum();
+        Some(total as u64)
+    } else {
+        let f = std::fs::File::open(p).ok()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).ok()?;
+        Some(builder.metadata().file_metadata().num_rows() as u64)
+    }
+}
+
 // ── DataModel write methods ───────────────────────────────────────────────────
 
 impl DataModel {
     /// Compute and write parquet files for the named pre-aggregations.
     pub fn write_pre_aggs(&self, names: &[&str]) -> Result<(), String> {
-        let pre_aggs = self
+        let lock = self
             .0
             .pre_aggs
             .as_ref()
             .ok_or("no pre-aggregations registered on this DataModel")?;
-        for &name in names {
-            let pa = pre_aggs
+        // Clone definitions before dropping the read lock so no lock is held during the write.
+        let pre_agg_defs: Vec<PreAggregation> = {
+            let pre_aggs = lock.read().unwrap();
+            names
                 .iter()
-                .find(|pa| pa.name == name)
-                .ok_or_else(|| format!("pre-aggregation '{name}' not found"))?;
-            self.write_pre_agg(pa)?;
+                .map(|&name| {
+                    pre_aggs
+                        .iter()
+                        .find(|pa| pa.name == name)
+                        .cloned()
+                        .ok_or_else(|| format!("pre-aggregation '{name}' not found"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for pa_def in &pre_agg_defs {
+            self.write_pre_agg(pa_def)?;
         }
         Ok(())
     }
@@ -236,19 +280,86 @@ impl DataModel {
             .aggregate(group_by_exprs, agg_exprs)
             .map_err(|e| format!("failed to aggregate for pre-agg: {e}"))?;
 
-        let file_path = format!("{path}/{}.parquet", pa.name);
+        let unix_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let versioned_filename = format!("{}.{}.parquet", pa.name, unix_millis);
+        let versioned_path = format!("{path}/{versioned_filename}");
+        let pointer_path = format!("{path}/{}.current", pa.name);
+        let tmp_pointer_path = format!("{path}/{}.current.tmp", pa.name);
+
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(df.write_parquet(&file_path, DataFrameWriteOptions::new(), None))
+                handle.block_on(df.write_parquet(
+                    &versioned_path,
+                    DataFrameWriteOptions::new(),
+                    None,
+                ))
             }),
             Err(_) => tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("tokio runtime")
-                .block_on(df.write_parquet(&file_path, DataFrameWriteOptions::new(), None)),
+                .block_on(df.write_parquet(&versioned_path, DataFrameWriteOptions::new(), None)),
         }
         .map_err(|e| format!("failed to write parquet: {e}"))?;
 
+        let row_count = read_parquet_row_count(&versioned_path).unwrap_or(0);
+
+        // Atomic pointer swap: write to tmp then rename (POSIX atomic).
+        std::fs::write(&tmp_pointer_path, &versioned_filename)
+            .map_err(|e| format!("failed to write tmp pointer: {e}"))?;
+        std::fs::rename(&tmp_pointer_path, &pointer_path)
+            .map_err(|e| format!("failed to rename pointer: {e}"))?;
+
+        let written_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+        if let Some(lock) = &self.0.pre_aggs {
+            let mut pre_aggs = lock.write().unwrap();
+            if let Some(entry) = pre_aggs.iter_mut().find(|p| p.name == pa.name) {
+                entry.row_count = row_count;
+                entry.written_at = Some(written_at);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete all non-current versioned parquet files for the named pre-aggregations.
+    pub fn purge_old_pre_agg_versions(&self, names: &[&str]) -> Result<(), String> {
+        let path = self
+            .0
+            .pre_agg_path
+            .as_deref()
+            .ok_or("pre_agg_path not set")?;
+        for &name in names {
+            let current = resolve_pre_agg_path(path, name)
+                .ok_or_else(|| format!("no current pointer for '{name}'"))?;
+            let entries =
+                std::fs::read_dir(path).map_err(|e| format!("cannot read pre_agg_path: {e}"))?;
+            let prefix = format!("{name}.");
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let s = fname.to_string_lossy();
+                if s.starts_with(&prefix)
+                    && s.ends_with(".parquet")
+                    && entry.path() != std::path::Path::new(&current)
+                {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        std::fs::remove_dir_all(&p)
+                            .map_err(|e| format!("failed to delete dir '{}': {e}", s))?;
+                    } else {
+                        std::fs::remove_file(&p)
+                            .map_err(|e| format!("failed to delete '{}': {e}", s))?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
