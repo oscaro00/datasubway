@@ -48,6 +48,30 @@ impl AggregateWithMetadata {
     }
 }
 
+/// Returns the `AggregateWithMetadata` node at the root of `df`'s logical plan,
+/// or an error if the plan doesn't end with `.aggregate()`.
+pub fn root_aggregate_node(df: &DataFrame) -> Result<&AggregateWithMetadata, String> {
+    match df.logical_plan() {
+        LogicalPlan::Extension(e) => e
+            .node
+            .as_any()
+            .downcast_ref::<AggregateWithMetadata>()
+            .ok_or_else(|| "expected AggregateWithMetadata at plan root".to_string()),
+        _ => Err("expected AggregateWithMetadata at plan root".into()),
+    }
+}
+
+/// Parses the JSON-serialized `allow_exclude` metadata entry into records,
+/// defaulting to empty if absent or malformed.
+pub fn allow_exclude_records(
+    node: &AggregateWithMetadata,
+) -> Vec<crate::column_expressions::column_context::AllowExcludeRecord> {
+    node.metadata
+        .get("allow_exclude")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
 impl PartialOrd for AggregateWithMetadata {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.metadata.partial_cmp(&other.metadata)

@@ -18,7 +18,8 @@ use crate::model_components::{
         DfMeasure, MeasureMetadata, extract_df_measure_metadata, validate_df_measure_structure,
     },
     pre_aggregations::{
-        PreAggregation, agg_needed_components, read_parquet_row_count, resolve_pre_agg_path,
+        PreAggregation, agg_needed_components, read_parquet_row_count, resolve_fresh_pre_agg_path,
+        resolve_pre_agg_path,
     },
     select_context::SelectContext,
 };
@@ -166,6 +167,30 @@ impl DataModel {
         self.0.joins.find_path(base, target).is_some()
     }
 
+    /// Flatten every registered table's schema into the full set of qualified
+    /// `table.column` names known to this model.
+    pub(crate) fn known_qualified_columns(&self) -> HashSet<String> {
+        self.0
+            .table_providers
+            .iter()
+            .flat_map(|(name, provider)| {
+                let prefix = format!("{name}.");
+                provider
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        if f.name().starts_with(&prefix) {
+                            f.name().to_string()
+                        } else {
+                            format!("{prefix}{}", f.name())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub async fn execute(&self, q: &DataQuery) -> Result<DataOutput, String> {
         let df = match q {
             DataQuery::Agg(ctx) => self.build_agg_frame(ctx)?,
@@ -244,14 +269,12 @@ impl DataModel {
                 candidates.sort_by_key(|pa| pa.row_count);
 
                 'candidates: for candidate in &candidates {
-                    let Some(pre_agg_file) = resolve_pre_agg_path(path, &candidate.name) else {
-                        debug!(pre_agg = %candidate.name, "no current pointer, trying next");
+                    let Some(pre_agg_file) =
+                        resolve_fresh_pre_agg_path(path, &candidate.name, None)
+                    else {
+                        debug!(pre_agg = %candidate.name, "no current pointer or file missing, trying next");
                         continue 'candidates;
                     };
-                    if !std::path::Path::new(&pre_agg_file).exists() {
-                        debug!(pre_agg = %candidate.name, "parquet not found, trying next");
-                        continue 'candidates;
-                    }
                     debug!(pre_agg = %candidate.name, table = %table_name, "using pre-aggregation");
                     if let Ok(raw_df) = self.read_parquet_sync(&pre_agg_file) {
                         match SubqueryAlias::try_new(
@@ -350,6 +373,19 @@ impl DataModel {
                 .block_on(ctx.read_parquet(path, ParquetReadOptions::default())),
         }
     }
+}
+
+/// Convert validated `(column, direction)` sort pairs into DataFusion sort expressions.
+pub(crate) fn sort_exprs(sorts: &[(String, String)]) -> Vec<datafusion::logical_expr::SortExpr> {
+    sorts
+        .iter()
+        .map(|(c, d)| {
+            datafusion::logical_expr::Expr::Column(datafusion::common::Column::from_name(
+                c.as_str(),
+            ))
+            .sort(d != "desc", true)
+        })
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

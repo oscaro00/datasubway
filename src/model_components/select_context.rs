@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::column_expressions::filter_expr::extract_filter_cols;
+use crate::model_components::{validate_limit, validate_membership, validate_sorts};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectContext {
@@ -23,10 +24,7 @@ impl SelectContext {
             return Err("columns must not be empty".into());
         }
 
-        let limit = limit.unwrap_or(10000);
-        if limit == 0 {
-            return Err("limit must be > 0".into());
-        }
+        let limit = validate_limit(limit)?;
 
         Ok(SelectContext {
             columns,
@@ -42,27 +40,11 @@ impl SelectContext {
     }
 
     pub fn validate(&self, all_columns: &std::collections::HashSet<String>) -> Result<(), String> {
-        for c in &self.columns {
-            if !all_columns.contains(c) {
-                return Err(format!("Unknown column: '{}'", c));
-            }
-        }
+        validate_membership(&self.columns, all_columns, "Unknown column")?;
+        validate_membership(&self.filter_columns(), all_columns, "Unknown filter column")?;
 
-        for fc in &self.filter_columns() {
-            if !all_columns.contains(fc) {
-                return Err(format!("Unknown filter column: '{}'", fc));
-            }
-        }
-
-        let col_set: std::collections::HashSet<&String> = self.columns.iter().collect();
-        for (col, direction) in &self.sorts {
-            if !col_set.contains(col) {
-                return Err(format!("Sort column not in selected columns: '{}'", col));
-            }
-            if direction != "asc" && direction != "desc" {
-                return Err(format!("Invalid sort direction: '{}'", direction));
-            }
-        }
+        let col_set: std::collections::HashSet<String> = self.columns.iter().cloned().collect();
+        validate_sorts(&self.sorts, &col_set, "Sort column not in selected columns")?;
 
         Ok(())
     }

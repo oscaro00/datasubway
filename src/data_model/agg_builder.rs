@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Field;
 use datafusion::common::{Column, TableReference};
-use datafusion::logical_expr::{
-    JoinType, LogicalPlan, LogicalPlanBuilder, SortExpr, SubqueryAlias,
-};
+use datafusion::logical_expr::{JoinType, LogicalPlan, LogicalPlanBuilder, SubqueryAlias};
 use datafusion::prelude::{DataFrame, Expr, col};
 
 use crate::{
@@ -24,26 +22,7 @@ impl DataModel {
     pub(super) fn build_agg_frame(&self, qc: &AggContext) -> Result<DataFrame, String> {
         let known_measures: Vec<MeasureMetadata> =
             self.0.measure_metadata.values().cloned().collect();
-        let all_columns: HashSet<String> = self
-            .0
-            .table_providers
-            .iter()
-            .flat_map(|(name, provider)| {
-                let prefix = format!("{name}.");
-                provider
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| {
-                        if f.name().starts_with(&prefix) {
-                            f.name().to_string()
-                        } else {
-                            format!("{prefix}{}", f.name())
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let all_columns = self.known_qualified_columns();
         qc.validate(&known_measures, &all_columns)?;
 
         // Build all measure DataFrames before any joining.
@@ -100,13 +79,8 @@ impl DataModel {
         }
 
         if !qc.sorts.is_empty() {
-            let sort_exprs: Vec<SortExpr> = qc
-                .sorts
-                .iter()
-                .map(|(c, d)| Expr::Column(Column::from_name(c.as_str())).sort(d != "desc", true))
-                .collect();
             combined = combined
-                .sort(sort_exprs)
+                .sort(super::sort_exprs(&qc.sorts))
                 .map_err(|e| format!("sort failed: {e}"))?;
         }
 

@@ -59,6 +59,24 @@ impl JoinGraph {
         self.lookup.get(start)?.get(end).cloned()
     }
 
+    /// Finds a single table among `referenced_tables` that can reach every other
+    /// referenced table via `find_path`. Returns an error listing the tables if none exists.
+    pub fn find_reachable_base(&self, referenced_tables: &[String]) -> Result<String, String> {
+        referenced_tables
+            .iter()
+            .find(|candidate| {
+                referenced_tables
+                    .iter()
+                    .all(|t| t == *candidate || self.find_path(candidate, t).is_some())
+            })
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "no single base table can reach all tables {referenced_tables:?} via join graph"
+                )
+            })
+    }
+
     /// Returns the minimal, deduplicated set of joins needed to reach all `targets` from `base`.
     /// Shared intermediate hops are not duplicated across multiple target paths.
     pub fn find_joins_for_tables(&self, base: &str, targets: &[&str]) -> Vec<Join> {

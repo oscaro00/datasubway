@@ -1,11 +1,20 @@
 use std::collections::HashMap;
 
+use datafusion::common::Column;
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::prelude::{Expr, col};
 
 use crate::model_components::pre_aggregations::{pre_agg_component_col_name, to_pre_agg_col_name};
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
+
+/// Flatten a (possibly qualified) `Column` into a `table.col` / `col` string.
+pub(crate) fn qualified_name(c: &Column) -> String {
+    match &c.relation {
+        Some(rel) => format!("{rel}.{}", c.name),
+        None => c.name.clone(),
+    }
+}
 
 /// Walk a DataFusion `Expr` and return every `(source_column, agg_function_name)`
 /// pair found in it. Pattern-matches the Expr tree directly — no JSON round-trip.
@@ -33,10 +42,7 @@ pub fn extract_agg_exprs(expr: &Expr) -> Vec<(String, String)> {
 /// looking through casts and aliases.
 pub(crate) fn extract_col_name(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Column(c) => Some(match &c.relation {
-            Some(rel) => format!("{rel}.{}", c.name),
-            None => c.name.clone(),
-        }),
+        Expr::Column(c) => Some(qualified_name(c)),
         Expr::Alias(a) => extract_col_name(&a.expr),
         Expr::Cast(c) => extract_col_name(&c.expr),
         Expr::TryCast(c) => extract_col_name(&c.expr),
@@ -78,10 +84,7 @@ pub fn rewrite_group_for_pre_agg(
 ) -> Expr {
     match expr {
         Expr::Column(c) => {
-            let flat = match &c.relation {
-                Some(rel) => format!("{rel}.{}", c.name),
-                None => c.name.clone(),
-            };
+            let flat = qualified_name(&c);
             let resolved = resolve_source_col(&flat, alias_map);
             col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved)).as_str())
                 .alias(flat.as_str())

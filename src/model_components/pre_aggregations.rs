@@ -6,18 +6,43 @@ use datafusion::prelude::col;
 
 use crate::data_model::DataModel;
 
+/// Canonical aggregation kinds and the stored component column suffixes each needs.
+/// e.g. a mean/avg needs both "sum" and "count" components stored.
+enum AggKind {
+    Sum,
+    Count,
+    Min,
+    Max,
+    Mean,
+    StdVar,
+}
+
+impl AggKind {
+    fn components(&self) -> &'static [&'static str] {
+        match self {
+            AggKind::Sum => &["sum"],
+            AggKind::Count => &["count"],
+            AggKind::Min => &["min"],
+            AggKind::Max => &["max"],
+            AggKind::Mean => &["sum", "count"],
+            AggKind::StdVar => &["sum", "sumsq", "count"],
+        }
+    }
+}
+
 /// Maps user-facing agg names to stored component column suffixes.
 /// e.g. "mean" needs both "sum" and "count" components stored.
 pub fn agg_expansion(agg_name: &str) -> Result<Vec<&'static str>, String> {
-    match agg_name {
-        "sum" => Ok(vec!["sum"]),
-        "count" => Ok(vec!["count"]),
-        "min" => Ok(vec!["min"]),
-        "max" => Ok(vec!["max"]),
-        "mean" => Ok(vec!["sum", "count"]),
-        "std" | "var" => Ok(vec!["sum", "sumsq", "count"]),
-        _ => Err(format!("Unknown aggregation type: {}", agg_name)),
-    }
+    let kind = match agg_name {
+        "sum" => AggKind::Sum,
+        "count" => AggKind::Count,
+        "min" => AggKind::Min,
+        "max" => AggKind::Max,
+        "mean" => AggKind::Mean,
+        "std" | "var" => AggKind::StdVar,
+        _ => return Err(format!("Unknown aggregation type: {}", agg_name)),
+    };
+    Ok(kind.components().to_vec())
 }
 
 /// Returns the column name for a pre-agg component stored in parquet.
@@ -41,16 +66,17 @@ pub fn pre_agg_component_col_name(qualified_col: &str, component: &str) -> Strin
 
 /// Maps a DataFusion aggregate function name to the pre-agg components it requires.
 pub fn agg_needed_components(agg_fn_name: &str) -> Option<Vec<&'static str>> {
-    match agg_fn_name {
-        "sum" | "SUM" => Some(vec!["sum"]),
-        "count" | "COUNT" => Some(vec!["count"]),
-        "min" | "MIN" => Some(vec!["min"]),
-        "max" | "MAX" => Some(vec!["max"]),
-        "avg" | "AVG" | "mean" => Some(vec!["sum", "count"]),
-        "stddev" | "STDDEV" | "stddev_pop" | "STDDEV_POP" => Some(vec!["sum", "sumsq", "count"]),
-        "variance" | "VARIANCE" | "var_pop" | "VAR_POP" => Some(vec!["sum", "sumsq", "count"]),
-        _ => None,
-    }
+    let kind = match agg_fn_name {
+        "sum" | "SUM" => AggKind::Sum,
+        "count" | "COUNT" => AggKind::Count,
+        "min" | "MIN" => AggKind::Min,
+        "max" | "MAX" => AggKind::Max,
+        "avg" | "AVG" | "mean" => AggKind::Mean,
+        "stddev" | "STDDEV" | "stddev_pop" | "STDDEV_POP" => AggKind::StdVar,
+        "variance" | "VARIANCE" | "var_pop" | "VAR_POP" => AggKind::StdVar,
+        _ => return None,
+    };
+    Some(kind.components().to_vec())
 }
 
 /// A pre-aggregation definition with its metadata.
@@ -150,6 +176,28 @@ pub(crate) fn resolve_pre_agg_path(base_path: &str, name: &str) -> Option<String
     Some(format!("{base_path}/{}", versioned.trim()))
 }
 
+/// Resolves a pre-aggregation's current parquet pointer to a path, returning `None`
+/// if the pointer is missing, the file is older than `max_age` seconds (when set),
+/// or the file doesn't exist on disk.
+pub(crate) fn resolve_fresh_pre_agg_path(
+    base_path: &str,
+    name: &str,
+    max_age: Option<u64>,
+) -> Option<String> {
+    let pre_agg_file = resolve_pre_agg_path(base_path, name)?;
+    if let Some(max_age) = max_age {
+        let modified = std::fs::metadata(&pre_agg_file).ok()?.modified().ok()?;
+        let age = modified.elapsed().unwrap_or(std::time::Duration::MAX);
+        if age > std::time::Duration::from_secs(max_age) {
+            return None;
+        }
+    }
+    if !std::path::Path::new(&pre_agg_file).exists() {
+        return None;
+    }
+    Some(pre_agg_file)
+}
+
 /// Reads a parquet file's (or directory of parquet files') metadata to return the total row count.
 pub(crate) fn read_parquet_row_count(path: &str) -> Option<u64> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -227,19 +275,7 @@ impl DataModel {
             return Err("all columns must be table-qualified (e.g. orders.amount)".into());
         }
 
-        let base_table = referenced_tables
-            .iter()
-            .find(|candidate| {
-                referenced_tables
-                    .iter()
-                    .all(|t| t == *candidate || self.0.joins.find_path(candidate, t).is_some())
-            })
-            .ok_or_else(|| {
-                format!(
-                    "no single base table can reach all tables {referenced_tables:?} via join graph"
-                )
-            })?
-            .clone();
+        let base_table = self.0.joins.find_reachable_base(&referenced_tables)?;
 
         let non_agg_str: std::collections::HashSet<String> = pa.group_by.iter().cloned().collect();
         let agg_str: HashMap<String, Vec<String>> = pa

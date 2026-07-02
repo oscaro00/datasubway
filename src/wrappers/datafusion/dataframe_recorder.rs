@@ -7,7 +7,8 @@ use crate::column_expressions::column_context::{AllowExcludeRecord, IntoColsExpr
 use crate::data_model::DataModel;
 
 use super::agg_expr::{
-    extract_agg_exprs, resolve_source_col, rewrite_for_pre_agg, rewrite_group_for_pre_agg,
+    extract_agg_exprs, qualified_name, resolve_source_col, rewrite_for_pre_agg,
+    rewrite_group_for_pre_agg,
 };
 use super::aggregate_with_metadata::{MetadataDataFrame, fmt_exprs};
 
@@ -344,13 +345,7 @@ pub(crate) fn update_alias_map(alias_map: &mut HashMap<String, String>, expr: &E
 /// if `expr` is not a column or simple alias/cast chain over a column.
 fn resolve_expr_to_source(expr: &Expr, alias_map: &HashMap<String, String>) -> Option<String> {
     match expr {
-        Expr::Column(c) => {
-            let full = match &c.relation {
-                Some(rel) => format!("{rel}.{}", c.name),
-                None => c.name.clone(),
-            };
-            Some(resolve_source_col(&full, alias_map))
-        }
+        Expr::Column(c) => Some(resolve_source_col(&qualified_name(c), alias_map)),
         Expr::Alias(a) => resolve_expr_to_source(&a.expr, alias_map),
         Expr::Cast(c) => resolve_expr_to_source(&c.expr, alias_map),
         Expr::TryCast(c) => resolve_expr_to_source(&c.expr, alias_map),
@@ -362,11 +357,7 @@ fn resolve_expr_to_source(expr: &Expr, alias_map: &HashMap<String, String>) -> O
 pub(crate) fn collect_col_names(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
         Expr::Column(c) => {
-            let full = match &c.relation {
-                Some(rel) => format!("{rel}.{}", c.name),
-                None => c.name.clone(),
-            };
-            out.insert(full);
+            out.insert(qualified_name(c));
         }
         Expr::Alias(a) => collect_col_names(&a.expr, out),
         Expr::BinaryExpr(b) => {
@@ -395,10 +386,7 @@ pub(crate) fn collect_col_names(expr: &Expr, out: &mut HashSet<String>) {
 fn collect_col_names_filtered(expr: &Expr, agg_col_set: &HashSet<&str>, out: &mut HashSet<String>) {
     match expr {
         Expr::Column(c) => {
-            let full = match &c.relation {
-                Some(rel) => format!("{rel}.{}", c.name),
-                None => c.name.clone(),
-            };
+            let full = qualified_name(c);
             if !agg_col_set.contains(full.as_str()) {
                 out.insert(full);
             }

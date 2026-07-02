@@ -1,4 +1,3 @@
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{DataFrame, Expr};
 
 use crate::column_expressions::column_context::{
@@ -6,7 +5,10 @@ use crate::column_expressions::column_context::{
 };
 use crate::data_model::DataModel;
 use crate::model_components::agg_context::AggContext;
-use crate::wrappers::datafusion::aggregate_with_metadata::AggregateWithMetadata;
+use crate::wrappers::datafusion::agg_expr::qualified_name;
+use crate::wrappers::datafusion::aggregate_with_metadata::{
+    allow_exclude_records, root_aggregate_node,
+};
 
 #[derive(Debug, Clone)]
 pub struct MeasureMetadata {
@@ -48,60 +50,35 @@ impl DfMeasure {
 /// A measure is valid iff its logical plan root is an `AggregateWithMetadata`
 /// node — i.e. the chain ended with `.aggregate()`.
 pub fn validate_df_measure_structure(df: &DataFrame) -> Result<(), String> {
-    match df.logical_plan() {
-        LogicalPlan::Extension(e)
-            if e.node
-                .as_any()
-                .downcast_ref::<AggregateWithMetadata>()
-                .is_some() =>
-        {
-            Ok(())
-        }
-        _ => Err(
-            "measure must end with aggregate() (no AggregateWithMetadata node at plan root)".into(),
-        ),
-    }
+    root_aggregate_node(df).map(|_| ()).map_err(|_| {
+        "measure must end with aggregate() (no AggregateWithMetadata node at plan root)".into()
+    })
 }
 
 /// Extract `MeasureMetadata` by reading the `AggregateWithMetadata` node from
 /// the DataFrame's logical plan. The `allow_exclude` key in the node metadata
 /// holds a JSON-serialized `Vec<AllowExcludeRecord>`.
 pub fn extract_df_measure_metadata(df: &DataFrame, name: &str) -> Result<MeasureMetadata, String> {
-    match df.logical_plan() {
-        LogicalPlan::Extension(e) => {
-            let node = e
-                .node
-                .as_any()
-                .downcast_ref::<AggregateWithMetadata>()
-                .ok_or("plan root is not AggregateWithMetadata")?;
+    let node = root_aggregate_node(df)?;
 
-            let allow_exclude_records: Vec<AllowExcludeRecord> = node
-                .metadata
-                .get("allow_exclude")
-                .map(|s| serde_json::from_str(s).unwrap_or_default())
-                .unwrap_or_default();
+    let output_columns: Vec<String> = node
+        .aggr_expr
+        .iter()
+        .filter_map(|e| {
+            if let Expr::Alias(a) = e {
+                Some(a.name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
 
-            let output_columns: Vec<String> = node
-                .aggr_expr
-                .iter()
-                .filter_map(|e| {
-                    if let Expr::Alias(a) = e {
-                        Some(a.name.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            Ok(MeasureMetadata {
-                name: name.into(),
-                output_columns: output_columns.clone(),
-                aggregate_columns: output_columns,
-                allow_exclude_calls: allow_exclude_records,
-            })
-        }
-        _ => Err("expected AggregateWithMetadata at plan root".into()),
-    }
+    Ok(MeasureMetadata {
+        name: name.into(),
+        output_columns: output_columns.clone(),
+        aggregate_columns: output_columns,
+        allow_exclude_calls: allow_exclude_records(node),
+    })
 }
 
 /// Resolve the group-by column names from a freshly-built measure DataFrame.
@@ -109,20 +86,8 @@ pub fn extract_df_measure_metadata(df: &DataFrame, name: &str) -> Result<Measure
 /// and re-evaluates the last one; falls back to the literal `group_expr` column
 /// names if no allow/exclude calls were recorded.
 pub fn resolve_group_by_cols(df: &DataFrame) -> Result<Vec<String>, String> {
-    let LogicalPlan::Extension(e) = df.logical_plan() else {
-        return Err("measure must end with aggregate()".into());
-    };
-    let node = e
-        .node
-        .as_any()
-        .downcast_ref::<AggregateWithMetadata>()
-        .ok_or("expected AggregateWithMetadata at plan root")?;
-
-    let records: Vec<AllowExcludeRecord> = node
-        .metadata
-        .get("allow_exclude")
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let node = root_aggregate_node(df)?;
+    let records = allow_exclude_records(node);
 
     match records.last() {
         None => {
@@ -131,11 +96,7 @@ pub fn resolve_group_by_cols(df: &DataFrame) -> Result<Vec<String>, String> {
                 .iter()
                 .filter_map(|e| {
                     if let Expr::Column(c) = e {
-                        let name = match &c.relation {
-                            Some(r) => format!("{r}.{}", c.name),
-                            None => c.name.clone(),
-                        };
-                        Some(name)
+                        Some(qualified_name(c))
                     } else {
                         None
                     }

@@ -188,55 +188,7 @@ pub fn allow(
     context: ColumnContext,
     include: ColumnInclude,
 ) -> AllowExcludeResult {
-    let record = AllowExcludeRecord {
-        kind: AllowExcludeKind::Allow,
-        pattern: pattern.clone(),
-        context: context.clone(),
-        include: include.clone(),
-    };
-
-    let normalized_patterns = normalize_column_pattern(pattern);
-    let pattern_owned: Vec<String> = normalized_patterns
-        .iter()
-        .map(|tc| tc.table_column())
-        .collect();
-    let all_patterns: Vec<&str> = pattern_owned.iter().map(String::as_str).collect();
-
-    match context {
-        ColumnContext::Expr(filter_expr) => {
-            let expr =
-                filter_expr_to_df(filter_expr, &all_patterns, true).unwrap_or_else(|| lit(true));
-            AllowExcludeResult {
-                inner: ColumnReturn::Expr(expr),
-                record,
-            }
-        }
-        ColumnContext::Json(json_val) => {
-            let expr = serde_json::from_value::<FilterExpr>(json_val)
-                .ok()
-                .and_then(|fe| filter_expr_to_df(fe, &all_patterns, true))
-                .unwrap_or_else(|| lit(true));
-            AllowExcludeResult {
-                inner: ColumnReturn::Expr(expr),
-                record,
-            }
-        }
-        string_context => {
-            let mut allowed_columns = include_to_strings(include);
-            let mut allowed_context: Vec<String> = context_to_table_columns(string_context)
-                .into_iter()
-                .filter(|c| match_context_pattern(c, &normalized_patterns))
-                .map(|c| c.table_column())
-                .collect();
-            allowed_columns.append(&mut allowed_context);
-            allowed_columns.sort();
-            allowed_columns.dedup();
-            AllowExcludeResult {
-                inner: ColumnReturn::Strings(allowed_columns),
-                record,
-            }
-        }
-    }
+    apply(AllowExcludeKind::Allow, pattern, context, include, true)
 }
 
 pub fn exclude(
@@ -244,8 +196,21 @@ pub fn exclude(
     context: ColumnContext,
     include: ColumnInclude,
 ) -> AllowExcludeResult {
+    apply(AllowExcludeKind::Exclude, pattern, context, include, false)
+}
+
+/// Shared implementation for `allow()`/`exclude()`. `keep_matching` selects which
+/// side of the pattern match is kept: `true` for allow (keep matches), `false`
+/// for exclude (keep non-matches).
+fn apply(
+    kind: AllowExcludeKind,
+    pattern: ColumnPattern,
+    context: ColumnContext,
+    include: ColumnInclude,
+    keep_matching: bool,
+) -> AllowExcludeResult {
     let record = AllowExcludeRecord {
-        kind: AllowExcludeKind::Exclude,
+        kind,
         pattern: pattern.clone(),
         context: context.clone(),
         include: include.clone(),
@@ -260,8 +225,8 @@ pub fn exclude(
 
     match context {
         ColumnContext::Expr(filter_expr) => {
-            let expr =
-                filter_expr_to_df(filter_expr, &all_patterns, false).unwrap_or_else(|| lit(true));
+            let expr = filter_expr_to_df(filter_expr, &all_patterns, keep_matching)
+                .unwrap_or_else(|| lit(true));
             AllowExcludeResult {
                 inner: ColumnReturn::Expr(expr),
                 record,
@@ -270,7 +235,7 @@ pub fn exclude(
         ColumnContext::Json(json_val) => {
             let expr = serde_json::from_value::<FilterExpr>(json_val)
                 .ok()
-                .and_then(|fe| filter_expr_to_df(fe, &all_patterns, false))
+                .and_then(|fe| filter_expr_to_df(fe, &all_patterns, keep_matching))
                 .unwrap_or_else(|| lit(true));
             AllowExcludeResult {
                 inner: ColumnReturn::Expr(expr),
@@ -279,12 +244,12 @@ pub fn exclude(
         }
         string_context => {
             let mut allowed_columns = include_to_strings(include);
-            let mut excluded_context: Vec<String> = context_to_table_columns(string_context)
+            let mut matched_context: Vec<String> = context_to_table_columns(string_context)
                 .into_iter()
-                .filter(|c| !match_context_pattern(c, &normalized_patterns))
+                .filter(|c| match_context_pattern(c, &normalized_patterns) == keep_matching)
                 .map(|c| c.table_column())
                 .collect();
-            allowed_columns.append(&mut excluded_context);
+            allowed_columns.append(&mut matched_context);
             allowed_columns.sort();
             allowed_columns.dedup();
             AllowExcludeResult {

@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use datafusion::logical_expr::{Aggregate, LogicalPlan};
 use datafusion::prelude::{DataFrame, SessionContext};
 
-use crate::wrappers::datafusion::aggregate_with_metadata::{AggregateWithMetadata, fmt_exprs};
+use crate::wrappers::datafusion::aggregate_with_metadata::{
+    AggregateWithMetadata, fmt_exprs, root_aggregate_node,
+};
 
 /// Returns a string that uniquely identifies a measure's mergeable "slot":
 /// the display-formatted input subplan + sorted display-formatted group expressions.
@@ -11,15 +13,7 @@ use crate::wrappers::datafusion::aggregate_with_metadata::{AggregateWithMetadata
 /// Two measures with the same key can have their aggr_expr merged into a single
 /// aggregate node, avoiding the FULL JOIN that would otherwise combine them.
 pub fn plan_merge_key(df: &DataFrame) -> Result<String, String> {
-    let LogicalPlan::Extension(e) = df.logical_plan() else {
-        return Err("measure plan root is not AggregateWithMetadata".into());
-    };
-    let node = e
-        .node
-        .as_any()
-        .downcast_ref::<AggregateWithMetadata>()
-        .ok_or("expected AggregateWithMetadata at plan root")?;
-
+    let node = root_aggregate_node(df)?;
     Ok(format!("{}", node.input.display_graphviz()))
 }
 
@@ -32,14 +26,7 @@ fn merge_group(group: Vec<(String, DataFrame)>, ctx: &SessionContext) -> Result<
 
     // Clone what we need from the first DataFrame; borrow is released at end of block.
     let (input_arc, group_expr, mut merged_aggr_expr, mut merged_metadata) = {
-        let LogicalPlan::Extension(e) = group[0].1.logical_plan() else {
-            return Err("first measure's plan root is not AggregateWithMetadata".into());
-        };
-        let node = e
-            .node
-            .as_any()
-            .downcast_ref::<AggregateWithMetadata>()
-            .ok_or("expected AggregateWithMetadata at plan root")?;
+        let node = root_aggregate_node(&group[0].1)?;
         (
             node.input.clone(),
             node.group_expr.clone(),
@@ -50,14 +37,7 @@ fn merge_group(group: Vec<(String, DataFrame)>, ctx: &SessionContext) -> Result<
 
     // Accumulate aggr_expr from the remaining group members; first value wins for metadata.
     for (_, df) in &group[1..] {
-        let LogicalPlan::Extension(e) = df.logical_plan() else {
-            return Err("measure plan root is not AggregateWithMetadata".into());
-        };
-        let node = e
-            .node
-            .as_any()
-            .downcast_ref::<AggregateWithMetadata>()
-            .ok_or("expected AggregateWithMetadata at plan root")?;
+        let node = root_aggregate_node(df)?;
         merged_aggr_expr.extend(node.aggr_expr.iter().cloned());
         for (k, v) in &node.metadata {
             merged_metadata
