@@ -119,3 +119,9 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 - Add optional AI dependency to get chat bot functionality working
 
 ## Known Issues
+
+- Some methods prevent pre aggregations from being used:
+  - join()
+    - Not sure if there is a way around this one (just break query into multiple statements with build())
+  - window()
+    - Need to think about this more, but it might be possible

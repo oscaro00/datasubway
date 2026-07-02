@@ -71,14 +71,19 @@ pub fn resolve_source_col(name: &str, alias_map: &HashMap<String, String>) -> St
 ///
 /// e.g. `col("players.player_name")` →
 ///      `col("player_goals_by_player.players__player_name").alias("players.player_name")`
-pub fn rewrite_group_for_pre_agg(expr: Expr, pre_agg_name: &str) -> Expr {
+pub fn rewrite_group_for_pre_agg(
+    expr: Expr,
+    alias_map: &HashMap<String, String>,
+    pre_agg_name: &str,
+) -> Expr {
     match expr {
         Expr::Column(c) => {
             let flat = match &c.relation {
                 Some(rel) => format!("{rel}.{}", c.name),
                 None => c.name.clone(),
             };
-            col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&flat)).as_str())
+            let resolved = resolve_source_col(&flat, alias_map);
+            col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved)).as_str())
                 .alias(flat.as_str())
         }
         other => other,

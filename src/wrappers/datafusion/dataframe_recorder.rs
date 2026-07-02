@@ -116,10 +116,12 @@ impl DataFrameRecorder {
         self
     }
 
-    /// Records `with_columns()`. Sets `pre_agg_allowed = false` and updates the
-    /// alias map so downstream agg expressions can be resolved correctly.
+    /// Records `with_columns()`. Updates the alias map so downstream agg
+    /// expressions can be resolved correctly. Pre-agg remains allowed because
+    /// `rewrite_for_pre_agg` / `rewrite_group_for_pre_agg` resolve aliases via
+    /// `alias_map`, and `build()` skips `WithColumns` ops when using a pre-agg
+    /// (pre-agg schemas only have dunder-named component columns).
     pub fn with_columns(mut self, exprs: Vec<Expr>) -> Self {
-        self.pre_agg_allowed = false;
         for expr in &exprs {
             update_alias_map(&mut self.alias_map, expr);
         }
@@ -133,7 +135,12 @@ impl DataFrameRecorder {
         let group_exprs = group_expr.into_exprs_with_record(&mut self.allow_exclude_records);
 
         for expr in &group_exprs {
-            collect_col_names(expr, &mut self.non_agg_cols);
+            let mut raw = HashSet::new();
+            collect_col_names(expr, &mut raw);
+            for name in raw {
+                self.non_agg_cols
+                    .insert(resolve_source_col(&name, &self.alias_map));
+            }
         }
 
         for expr in &aggr_expr {
@@ -142,7 +149,8 @@ impl DataFrameRecorder {
             let agg_col_set: HashSet<&str> = pairs.iter().map(|(c, _)| c.as_str()).collect();
             collect_col_names_filtered(expr, &agg_col_set, &mut self.non_agg_cols);
             for (col_name, agg_name) in pairs {
-                self.agg_cols.entry(col_name).or_default().push(agg_name);
+                let resolved = resolve_source_col(&col_name, &self.alias_map);
+                self.agg_cols.entry(resolved).or_default().push(agg_name);
             }
         }
 
@@ -252,7 +260,13 @@ impl DataFrameRecorder {
                     mdf.join(right, join_type, &l, &r, filter)?
                 }
 
-                DataFrameOp::WithColumns(exprs) => mdf.with_columns(exprs)?,
+                DataFrameOp::WithColumns(exprs) => {
+                    if from_pre_agg {
+                        mdf
+                    } else {
+                        mdf.with_columns(exprs)?
+                    }
+                }
 
                 DataFrameOp::Aggregate {
                     group_expr,
@@ -261,7 +275,7 @@ impl DataFrameRecorder {
                     let final_group = if from_pre_agg {
                         group_expr
                             .into_iter()
-                            .map(|e| rewrite_group_for_pre_agg(e, &pre_agg_name))
+                            .map(|e| rewrite_group_for_pre_agg(e, &alias_map, &pre_agg_name))
                             .collect()
                     } else {
                         group_expr
@@ -578,12 +592,56 @@ mod tests {
 
     #[test]
     fn test_join_disables_pre_agg() {
-        // pre_agg_allowed starts true; with_columns sets it false
+        // join() sets pre_agg_allowed = false; with_columns alone does not
+        let dm = make_dm();
+        let rec_with_cols = dm
+            .table("orders", true)
+            .with_columns(vec![col("orders.amount").alias("amt")]);
+        assert!(
+            rec_with_cols.pre_agg_allowed,
+            "with_columns alone should not disable pre-agg"
+        );
+
+        let customers_df = {
+            let dm2 = make_dm();
+            dm2.table("customers", true).build().unwrap()
+        };
+        let rec_join = make_dm().table("orders", true).join(
+            customers_df,
+            JoinType::Left,
+            vec!["orders.region".into()],
+            vec!["customers.region".into()],
+            None,
+        );
+        assert!(
+            !rec_join.pre_agg_allowed,
+            "join should still disable pre-agg"
+        );
+    }
+
+    #[test]
+    fn test_agg_cols_resolved_through_alias_map() {
+        use datafusion::functions_aggregate::expr_fn::sum;
+
         let dm = make_dm();
         let rec = dm
             .table("orders", true)
-            .with_columns(vec![col("orders.amount").alias("amt")]);
-        assert!(!rec.pre_agg_allowed);
+            .with_columns(vec![col("orders.amount").alias("amt")])
+            .aggregate(
+                vec![col("orders.region")],
+                vec![sum(col("amt")).alias("total")],
+            );
+
+        // agg_cols key should be the resolved source name, not the alias
+        assert!(
+            rec.agg_cols.contains_key("orders.amount"),
+            "expected 'orders.amount', got {:?}",
+            rec.agg_cols
+        );
+        assert!(
+            !rec.agg_cols.contains_key("amt"),
+            "alias 'amt' should not appear as agg_cols key"
+        );
     }
 
     #[test]
