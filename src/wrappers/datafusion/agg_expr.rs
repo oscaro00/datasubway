@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use datafusion::common::Column;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::prelude::{Expr, col};
 
@@ -144,6 +145,51 @@ pub fn rewrite_for_pre_agg(
     }
 }
 
+/// Rewrite every column reference within an arbitrary expression tree (e.g. a
+/// filter predicate, or a `distinct_on` selector) to reference the
+/// pre-aggregation's physical (dunder-encoded) column, so expressions written
+/// against logical qualified names (e.g. `players.player_name`) can be
+/// evaluated directly against a pre-agg source.
+///
+/// Unlike `rewrite_group_for_pre_agg`/`rewrite_for_pre_agg` (which only need to
+/// handle the constrained top-level shapes `.aggregate()` produces — a bare
+/// `Column`, or a `Column` wrapped in a single `AggregateFunction`), this walks
+/// the whole expression tree via DataFusion's own `TreeNode::transform`, so it
+/// is correct for arbitrary predicates (`AND`/`OR`, comparisons, `IS NULL`,
+/// `BETWEEN`, `IN`, `LIKE`, ...) without needing to hand-enumerate every `Expr`
+/// variant. No alias-back is needed (unlike the group-by rewrite) since these
+/// expressions don't appear in the output schema — they only gate/select rows.
+pub fn rewrite_expr_for_pre_agg(
+    expr: Expr,
+    alias_map: &HashMap<String, String>,
+    pre_agg_name: &str,
+) -> datafusion::common::Result<Expr> {
+    expr.transform(|e| {
+        if let Expr::Column(c) = &e {
+            let flat = qualified_name(c);
+            let resolved = resolve_source_col(&flat, alias_map);
+            let rewritten =
+                col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved)).as_str());
+            Ok(Transformed::yes(rewritten))
+        } else {
+            Ok(Transformed::no(e))
+        }
+    })
+    .map(|t| t.data)
+}
+
+/// Rewrite a plain column name (e.g. for `drop_columns`) to the pre-aggregation's
+/// physical dunder-encoded name. Companion to `rewrite_expr_for_pre_agg` for ops
+/// that carry column references as `String`s rather than `Expr` trees.
+pub fn rewrite_col_name_for_pre_agg(
+    name: &str,
+    alias_map: &HashMap<String, String>,
+    pre_agg_name: &str,
+) -> String {
+    let resolved = resolve_source_col(name, alias_map);
+    format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved))
+}
+
 fn build_pre_agg_expr(col_name: &str, agg_name: &str, pre_agg_name: &str) -> Option<Expr> {
     use datafusion::functions_aggregate::expr_fn::{max, min, sum};
 
@@ -216,5 +262,67 @@ mod tests {
     fn test_resolve_source_col_no_alias() {
         let map = HashMap::new();
         assert_eq!(resolve_source_col("orders.amount", &map), "orders.amount");
+    }
+
+    #[test]
+    fn test_rewrite_expr_for_pre_agg_bare_column() {
+        let map = HashMap::new();
+        let expr = col("players.player_name");
+        let rewritten = rewrite_expr_for_pre_agg(expr, &map, "goals_by_player").unwrap();
+        assert_eq!(
+            format!("{rewritten}"),
+            "goals_by_player.players__player_name"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_expr_for_pre_agg_comparison() {
+        use datafusion::prelude::lit;
+
+        let map = HashMap::new();
+        let expr = col("players.player_name").eq(lit("Nwpo"));
+        let rewritten = rewrite_expr_for_pre_agg(expr, &map, "goals_by_player").unwrap();
+        assert_eq!(
+            format!("{rewritten}"),
+            "goals_by_player.players__player_name = Utf8(\"Nwpo\")"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_expr_for_pre_agg_compound_and_or() {
+        use datafusion::prelude::lit;
+
+        let map = HashMap::new();
+        // (players.player_name = 'Nwpo' AND orders.amount > 0) OR orders.region = 'north'
+        let expr = col("players.player_name")
+            .eq(lit("Nwpo"))
+            .and(col("orders.amount").gt(lit(0.0f64)))
+            .or(col("orders.region").eq(lit("north")));
+        let rewritten = rewrite_expr_for_pre_agg(expr, &map, "pa").unwrap();
+        let text = format!("{rewritten}");
+        assert!(text.contains("pa.players__player_name"));
+        assert!(text.contains("pa.orders__amount"));
+        assert!(text.contains("pa.orders__region"));
+        // Structure (AND/OR, comparisons) must be preserved, not just column names.
+        assert!(text.contains("AND"));
+        assert!(text.contains("OR"));
+    }
+
+    #[test]
+    fn test_rewrite_expr_for_pre_agg_resolves_through_alias() {
+        let mut map = HashMap::new();
+        map.insert("amt".to_string(), "orders.amount".to_string());
+        let expr = col("amt");
+        let rewritten = rewrite_expr_for_pre_agg(expr, &map, "pa").unwrap();
+        assert_eq!(format!("{rewritten}"), "pa.orders__amount");
+    }
+
+    #[test]
+    fn test_rewrite_col_name_for_pre_agg() {
+        let map = HashMap::new();
+        assert_eq!(
+            rewrite_col_name_for_pre_agg("players.player_name", &map, "goals_by_player"),
+            "goals_by_player.players__player_name"
+        );
     }
 }

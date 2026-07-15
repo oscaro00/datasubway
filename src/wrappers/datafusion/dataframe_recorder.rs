@@ -7,8 +7,8 @@ use crate::column_expressions::column_context::{AllowExcludeRecord, IntoColsExpr
 use crate::data_model::DataModel;
 
 use super::agg_expr::{
-    extract_agg_exprs, qualified_name, resolve_source_col, rewrite_for_pre_agg,
-    rewrite_group_for_pre_agg,
+    extract_agg_exprs, qualified_name, resolve_source_col, rewrite_col_name_for_pre_agg,
+    rewrite_expr_for_pre_agg, rewrite_for_pre_agg, rewrite_group_for_pre_agg,
 };
 use super::aggregate_with_metadata::{MetadataDataFrame, fmt_exprs};
 
@@ -247,7 +247,14 @@ impl DataFrameRecorder {
 
         for op in self.ops {
             mdf = match op {
-                DataFrameOp::Filter(pred) => mdf.filter(pred)?,
+                DataFrameOp::Filter(pred) => {
+                    let pred = if from_pre_agg {
+                        rewrite_expr_for_pre_agg(pred, &alias_map, &pre_agg_name)?
+                    } else {
+                        pred
+                    };
+                    mdf.filter(pred)?
+                }
 
                 DataFrameOp::Join {
                     right,
@@ -311,9 +318,34 @@ impl DataFrameRecorder {
                     on_expr,
                     select_expr,
                     sort_expr,
-                } => mdf.distinct_on(on_expr, select_expr, sort_expr)?,
+                } => {
+                    let (on_expr, select_expr) = if from_pre_agg {
+                        (
+                            on_expr
+                                .into_iter()
+                                .map(|e| rewrite_expr_for_pre_agg(e, &alias_map, &pre_agg_name))
+                                .collect::<datafusion::common::Result<Vec<_>>>()?,
+                            select_expr
+                                .into_iter()
+                                .map(|e| rewrite_expr_for_pre_agg(e, &alias_map, &pre_agg_name))
+                                .collect::<datafusion::common::Result<Vec<_>>>()?,
+                        )
+                    } else {
+                        (on_expr, select_expr)
+                    };
+                    mdf.distinct_on(on_expr, select_expr, sort_expr)?
+                }
 
-                DataFrameOp::DropColumns(cols) => mdf.drop_columns(cols)?,
+                DataFrameOp::DropColumns(cols) => {
+                    let cols = if from_pre_agg {
+                        cols.iter()
+                            .map(|c| rewrite_col_name_for_pre_agg(c, &alias_map, &pre_agg_name))
+                            .collect()
+                    } else {
+                        cols
+                    };
+                    mdf.drop_columns(cols)?
+                }
 
                 DataFrameOp::Union(right) => mdf.union(right)?,
 
