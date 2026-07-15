@@ -354,56 +354,24 @@ fn resolve_expr_to_source(expr: &Expr, alias_map: &HashMap<String, String>) -> O
 }
 
 /// Collect all `Expr::Column` names from `expr` into `out`.
+///
+/// Delegates to DataFusion's own `Expr::column_refs`, which walks the full
+/// expression tree via the generic `TreeNode` traversal — exhaustive over
+/// every `Expr` variant (including `Case`/`when...otherwise`, `Between`,
+/// `InList`, etc.) by construction, rather than a hand-maintained allowlist
+/// that silently misses whichever variant nobody thought to add.
 pub(crate) fn collect_col_names(expr: &Expr, out: &mut HashSet<String>) {
-    match expr {
-        Expr::Column(c) => {
-            out.insert(qualified_name(c));
-        }
-        Expr::Alias(a) => collect_col_names(&a.expr, out),
-        Expr::BinaryExpr(b) => {
-            collect_col_names(&b.left, out);
-            collect_col_names(&b.right, out);
-        }
-        Expr::Cast(c) => collect_col_names(&c.expr, out),
-        Expr::TryCast(c) => collect_col_names(&c.expr, out),
-        Expr::AggregateFunction(agg) => {
-            for arg in &agg.params.args {
-                collect_col_names(arg, out);
-            }
-        }
-        Expr::ScalarFunction(sf) => {
-            for arg in &sf.args {
-                collect_col_names(arg, out);
-            }
-        }
-        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            collect_col_names(inner, out)
-        }
-        _ => {}
+    for c in expr.column_refs() {
+        out.insert(qualified_name(c));
     }
 }
 
 fn collect_col_names_filtered(expr: &Expr, agg_col_set: &HashSet<&str>, out: &mut HashSet<String>) {
-    match expr {
-        Expr::Column(c) => {
-            let full = qualified_name(c);
-            if !agg_col_set.contains(full.as_str()) {
-                out.insert(full);
-            }
+    for c in expr.column_refs() {
+        let full = qualified_name(c);
+        if !agg_col_set.contains(full.as_str()) {
+            out.insert(full);
         }
-        Expr::Alias(a) => collect_col_names_filtered(&a.expr, agg_col_set, out),
-        Expr::BinaryExpr(b) => {
-            collect_col_names_filtered(&b.left, agg_col_set, out);
-            collect_col_names_filtered(&b.right, agg_col_set, out);
-        }
-        Expr::Cast(c) => collect_col_names_filtered(&c.expr, agg_col_set, out),
-        Expr::TryCast(c) => collect_col_names_filtered(&c.expr, agg_col_set, out),
-        Expr::AggregateFunction(agg) => {
-            for arg in &agg.params.args {
-                collect_col_names_filtered(arg, agg_col_set, out);
-            }
-        }
-        _ => {}
     }
 }
 

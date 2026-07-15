@@ -72,11 +72,16 @@ pub fn resolve_source_col(name: &str, alias_map: &HashMap<String, String>) -> St
 /// Rewrite a group-by column expression to reference the pre-aggregation table.
 ///
 /// References the dunder column in the aliased pre-agg table and aliases the result
-/// back to the original qualified name. This keeps the aggregate output schema
-/// consistent with the non-pre-agg path so `flatten_df` needs no special handling.
+/// back to the original qualified name — using a *qualified* alias so the output
+/// field is `(Some("players"), "player_name")`, structurally identical to what a
+/// raw-table-sourced group-by column produces (a bare `col("players.player_name")`
+/// keeps its table's real qualifier). This keeps the aggregate output schema
+/// consistent with the non-pre-agg path regardless of source, so downstream code
+/// (`flatten_df`, the FULL JOIN merge path in `agg_builder.rs`) doesn't need to
+/// special-case "did this measure come from a pre-agg or a raw table".
 ///
 /// e.g. `col("players.player_name")` →
-///      `col("player_goals_by_player.players__player_name").alias("players.player_name")`
+///      `col("player_goals_by_player.players__player_name").alias_qualified(Some("players"), "player_name")`
 pub fn rewrite_group_for_pre_agg(
     expr: Expr,
     alias_map: &HashMap<String, String>,
@@ -86,8 +91,13 @@ pub fn rewrite_group_for_pre_agg(
         Expr::Column(c) => {
             let flat = qualified_name(&c);
             let resolved = resolve_source_col(&flat, alias_map);
-            col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved)).as_str())
-                .alias(flat.as_str())
+            let source = col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved)).as_str());
+            match flat.split_once('.') {
+                Some((table, col_name)) => {
+                    source.alias_qualified(Some(table.to_string()), col_name.to_string())
+                }
+                None => source.alias(flat.as_str()),
+            }
         }
         other => other,
     }
