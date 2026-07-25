@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::provider_as_source;
@@ -165,6 +166,19 @@ impl DataModel {
 
     pub fn can_join(&self, base: &str, target: &str) -> bool {
         self.0.joins.find_path(base, target).is_some()
+    }
+
+    /// Returns each registered table's name paired with its Arrow schema
+    /// (column names and types), sorted by table name.
+    pub fn schemas(&self) -> Vec<(String, SchemaRef)> {
+        let mut schemas: Vec<(String, SchemaRef)> = self
+            .0
+            .table_providers
+            .iter()
+            .map(|(name, provider)| (name.clone(), provider.schema()))
+            .collect();
+        schemas.sort_by(|a, b| a.0.cmp(&b.0));
+        schemas
     }
 
     /// Flatten every registered table's schema into the full set of qualified
@@ -444,6 +458,41 @@ mod tests {
         let dm = make_orders_dm(Some(path), vec![pa]);
         dm.write_pre_aggs(&["daily_revenue"]).unwrap();
         (dm, tmp)
+    }
+
+    #[test]
+    fn test_schemas_returns_sorted_table_schemas() {
+        let orders_schema = Arc::new(Schema::new(vec![
+            Field::new("date", DataType::Utf8, true),
+            Field::new("amount", DataType::Float64, true),
+        ]));
+        let orders_provider: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(orders_schema.clone(), vec![vec![]]).unwrap());
+
+        let customers_schema =
+            Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let customers_provider: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(customers_schema.clone(), vec![vec![]]).unwrap());
+
+        let dm = DataModel::new(
+            HashMap::from([
+                ("orders".to_string(), orders_provider),
+                ("customers".to_string(), customers_provider),
+            ]),
+            JoinGraph::new(&[]).unwrap(),
+            vec![],
+            None,
+        );
+
+        let schemas = dm.schemas();
+        let names: Vec<&str> = schemas.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["customers", "orders"]);
+
+        let (_, customers_out) = &schemas[0];
+        assert_eq!(customers_out, &customers_schema);
+
+        let (_, orders_out) = &schemas[1];
+        assert_eq!(orders_out, &orders_schema);
     }
 
     #[test]
