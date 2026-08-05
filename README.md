@@ -116,7 +116,7 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
   - Probably makes sense to expose methods from data_model.py that will print this info (leave the UI to users)
 - Roll based access control?
   - Might make more sense for this to be a user implemented feature because it involves auth
-- Add optional AI dependency to get chat bot functionality working
+- Add optional AI dependency to get chat bot functionality working (Cersei?)
 
 ## Known Issues
 
