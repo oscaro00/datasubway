@@ -50,9 +50,11 @@ pub enum DataFrameOp {
 /// Records operations on a DataFusion `DataFrame` and builds them lazily.
 ///
 /// Key properties vs the Polars `LazyFrameRecorder`:
-/// - `pre_agg_allowed`: set to `false` when `join()` or `with_columns()` is
-///   called. If false, the DataModel's `get_df_table()` will skip pre-agg
-///   selection for this chain.
+/// - `pre_agg_allowed`: set to `false` when `join()` or `window()` is called, or
+///   when `with_columns()` records a computed projection. If false, the
+///   DataModel's `get_df_table()` will skip pre-agg selection for this chain.
+///   A `with_columns()` that only renames/casts an existing column does *not*
+///   disable it — see that method's docs.
 /// - `alias_map`: tracks the transitive source column for every alias introduced
 ///   by `with_columns()` or `aggregate()`, enabling the pre-agg rewriter to find
 ///   the right component column even after multiple renaming steps.
@@ -63,7 +65,8 @@ pub struct DataFrameRecorder {
     pub non_agg_cols: HashSet<String>,
     pub agg_cols: HashMap<String, Vec<String>>,
     pub allow_exclude_records: Vec<AllowExcludeRecord>,
-    /// Set to `false` when `join()` or `with_columns()` is recorded.
+    /// Set to `false` when `join()` or `window()` is recorded, or when
+    /// `with_columns()` records a computed projection.
     pub pre_agg_allowed: bool,
     /// alias_name → ultimate source column name (follows transitive chains).
     pub alias_map: HashMap<String, String>,
@@ -118,12 +121,24 @@ impl DataFrameRecorder {
     }
 
     /// Records `with_columns()`. Updates the alias map so downstream agg
-    /// expressions can be resolved correctly. Pre-agg remains allowed because
-    /// `rewrite_for_pre_agg` / `rewrite_group_for_pre_agg` resolve aliases via
-    /// `alias_map`, and `build()` skips `WithColumns` ops when using a pre-agg
-    /// (pre-agg schemas only have dunder-named component columns).
+    /// expressions can be resolved correctly.
+    ///
+    /// A projection that traces back to a source column (a bare column, or an
+    /// alias/cast chain over one) keeps pre-agg eligibility: `build()` skips
+    /// `WithColumns` ops on the pre-agg path — pre-agg schemas only have
+    /// dunder-named component columns — and `rewrite_for_pre_agg` /
+    /// `rewrite_group_for_pre_agg` resolve the alias back through `alias_map`.
+    ///
+    /// A computed projection (e.g. `col("x") * 2`) has no such source column,
+    /// so its values exist in no pre-aggregation and skipping the op would
+    /// silently drop the computation. Those opt the chain out of pre-agg
+    /// explicitly, rather than leaving it to a later `covers()` lookup to miss
+    /// the untracked name and fall back by accident.
     pub fn with_columns(mut self, exprs: Vec<Expr>) -> Self {
         for expr in &exprs {
+            if resolve_expr_to_source(expr, &self.alias_map).is_none() {
+                self.pre_agg_allowed = false;
+            }
             update_alias_map(&mut self.alias_map, expr);
         }
         self.ops.push(DataFrameOp::WithColumns(exprs));
@@ -580,14 +595,14 @@ mod tests {
 
     #[test]
     fn test_join_disables_pre_agg() {
-        // join() sets pre_agg_allowed = false; with_columns alone does not
+        // join() sets pre_agg_allowed = false; a renaming with_columns does not
         let dm = make_dm();
         let rec_with_cols = dm
             .table("orders", true)
             .with_columns(vec![col("orders.amount").alias("amt")]);
         assert!(
             rec_with_cols.pre_agg_allowed,
-            "with_columns alone should not disable pre-agg"
+            "a renaming with_columns should not disable pre-agg"
         );
 
         let customers_df = {
@@ -639,6 +654,75 @@ mod tests {
             .table("orders", true)
             .with_columns(vec![col("orders.amount").alias("amt")]);
         assert_eq!(rec.alias_map.get("amt"), Some(&"orders.amount".to_string()));
+    }
+
+    #[test]
+    fn test_computed_alias_disables_pre_agg() {
+        // `orders.amount * 2` exists in no pre-aggregation, and build() would
+        // skip the WithColumns op on the pre-agg path, silently dropping the
+        // multiplication. The chain must opt out of pre-agg instead.
+        let dm = make_dm();
+        let rec = dm.table("orders", true).with_columns(vec![
+            (col("orders.amount") * lit(2.0f64)).alias("double_amount"),
+        ]);
+        assert!(
+            !rec.pre_agg_allowed,
+            "a computed alias should disable pre-agg"
+        );
+        assert!(
+            !rec.alias_map.contains_key("double_amount"),
+            "a computed alias has no source column to map to"
+        );
+    }
+
+    #[test]
+    fn test_computed_unaliased_expr_disables_pre_agg() {
+        // Same reasoning, for a projection that carries no explicit alias.
+        let dm = make_dm();
+        let rec = dm
+            .table("orders", true)
+            .with_columns(vec![col("orders.amount") * lit(2.0f64)]);
+        assert!(
+            !rec.pre_agg_allowed,
+            "a computed projection should disable pre-agg"
+        );
+    }
+
+    #[test]
+    fn test_cast_alias_keeps_pre_agg() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::Cast;
+
+        // A cast still traces back to orders.amount, so the alias resolves and
+        // the chain stays pre-agg eligible.
+        let dm = make_dm();
+        let cast = Expr::Cast(Cast::new(Box::new(col("orders.amount")), DataType::Float64));
+        let rec = dm
+            .table("orders", true)
+            .with_columns(vec![cast.alias("amt")]);
+        assert!(
+            rec.pre_agg_allowed,
+            "a cast over a source column should not disable pre-agg"
+        );
+        assert_eq!(rec.alias_map.get("amt"), Some(&"orders.amount".to_string()));
+    }
+
+    #[test]
+    fn test_aggregate_alias_does_not_disable_pre_agg() {
+        // The rule applies to with_columns only: aggregate output aliases are
+        // never resolvable to a source column, and disabling on them would turn
+        // pre-agg off for every measure.
+        use datafusion::functions_aggregate::expr_fn::sum;
+
+        let dm = make_dm();
+        let rec = dm.table("orders", true).aggregate(
+            vec![col("orders.region")],
+            vec![sum(col("orders.amount")).alias("total")],
+        );
+        assert!(
+            rec.pre_agg_allowed,
+            "an aggregate alias must not disable pre-agg"
+        );
     }
 
     #[test]
