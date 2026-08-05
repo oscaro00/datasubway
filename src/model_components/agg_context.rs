@@ -18,6 +18,12 @@ pub struct AggContext {
 }
 
 impl AggContext {
+    /// Each parameter is one field of the query-context payload this type
+    /// mirrors, so the arity tracks the payload rather than signalling a
+    /// function that does too much. Collapsing them into an options struct
+    /// would be an API change across every call site; revisit if the payload
+    /// grows further.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         measures: Vec<String>,
         filters: Option<serde_json::Value>,

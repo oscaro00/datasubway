@@ -224,7 +224,7 @@ pub fn filter_to_expr(filter: &Value, patterns: &[&str]) -> Option<Expr> {
 /// Use this for post-aggregation filters (havings) where columns may not exist in any
 /// table schema (e.g. measure output column aliases).
 pub fn json_to_expr(filter: &Value) -> Option<Expr> {
-    if filter.is_null() || filter.as_object().map_or(false, |m| m.is_empty()) {
+    if filter.is_null() || filter.as_object().is_some_and(|m| m.is_empty()) {
         return None;
     }
     let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
@@ -233,7 +233,7 @@ pub fn json_to_expr(filter: &Value) -> Option<Expr> {
 
 /// Extract column names from a raw JSON filter value.
 pub fn extract_filter_cols(value: &serde_json::Value) -> Vec<String> {
-    if value.is_null() || value.as_object().map_or(false, |m| m.is_empty()) {
+    if value.is_null() || value.as_object().is_some_and(|m| m.is_empty()) {
         return Vec::new();
     }
     match serde_json::from_value::<FilterExpr>(value.clone()) {

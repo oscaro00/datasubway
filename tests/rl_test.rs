@@ -367,7 +367,7 @@ async fn test_player_goals_by_player_name() {
         plan.contains("player_goals_by_player"),
         "use_pre_agg=true: expected pre-agg table in plan, got:\n{plan}"
     );
-    let actual = dm_query(&dm, qc).await;
+    let actual = dm_query(dm, qc).await;
 
     let ctx = shared_ctx().await;
     // Join raw scans (DataFusion qualifies columns automatically), aggregate, then
@@ -418,7 +418,7 @@ async fn test_team_goals_by_team_name() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc).await;
+    let actual = dm_query(dm, qc).await;
 
     let ctx = shared_ctx().await;
     let expected = ctx
@@ -464,7 +464,7 @@ async fn test_game_count_by_group() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc).await;
+    let actual = dm_query(dm, qc).await;
 
     let ctx = shared_ctx().await;
     let expected = normalize_schema(
@@ -529,7 +529,7 @@ async fn test_player_goals_by_platform() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc).await;
+    let actual = dm_query(dm, qc).await;
 
     let ctx = shared_ctx().await;
     let expected = normalize_schema(
@@ -583,7 +583,7 @@ async fn test_multi_measure_join() {
         "{}",
         dm.display_graphviz(&DataQuery::Agg(qc_clone)).unwrap()
     );
-    let actual = dm_query(&dm, qc).await;
+    let actual = dm_query(dm, qc).await;
 
     // Both measures start from player_stats and join to players — same subplan,
     // so the merge optimizer combines them into a single aggregate (no Full join).
@@ -638,7 +638,7 @@ async fn test_player_goals_and_game_count_by_group() {
         None,
     )
     .unwrap();
-    let actual = dm_query(&dm, qc).await;
+    let actual = dm_query(dm, qc).await;
 
     // Both measures start from player_stats with the same path to groups — same
     // subplan, so the merge optimizer combines them into a single aggregate.

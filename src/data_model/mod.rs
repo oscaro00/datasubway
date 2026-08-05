@@ -122,14 +122,14 @@ impl DataModel {
                     if let Some(rc) = read_parquet_row_count(&versioned) {
                         pa.row_count = rc;
                     }
-                    if let Ok(meta) = std::fs::metadata(&versioned) {
-                        if let Ok(modified) = meta.modified() {
-                            let secs = modified
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            pa.written_at = Some(secs.to_string());
-                        }
+                    if let Ok(meta) = std::fs::metadata(&versioned)
+                        && let Ok(modified) = meta.modified()
+                    {
+                        let secs = modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        pa.written_at = Some(secs.to_string());
                     }
                 }
             }
@@ -257,62 +257,61 @@ impl DataModel {
         agg_cols: &HashMap<String, Vec<String>>,
         pre_agg_allowed: bool,
     ) -> datafusion::common::Result<DataFrameWrapper> {
-        if pre_agg_allowed && !agg_cols.is_empty() {
-            if let (Some(pre_aggs_lock), Some(path)) =
+        if pre_agg_allowed
+            && !agg_cols.is_empty()
+            && let (Some(pre_aggs_lock), Some(path)) =
                 (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
-            {
-                let non_agg_vec: Vec<String> = non_agg_cols.iter().cloned().collect();
-                let agg_map: HashMap<String, HashSet<String>> = agg_cols
-                    .iter()
-                    .map(|(col, agg_names)| {
-                        let components: HashSet<String> = agg_names
-                            .iter()
-                            .filter_map(|name| agg_needed_components(name))
-                            .flatten()
-                            .map(|s| s.to_string())
-                            .collect();
-                        (col.clone(), components)
-                    })
-                    .collect();
+        {
+            let non_agg_vec: Vec<String> = non_agg_cols.iter().cloned().collect();
+            let agg_map: HashMap<String, HashSet<String>> = agg_cols
+                .iter()
+                .map(|(col, agg_names)| {
+                    let components: HashSet<String> = agg_names
+                        .iter()
+                        .filter_map(|name| agg_needed_components(name))
+                        .flatten()
+                        .map(|s| s.to_string())
+                        .collect();
+                    (col.clone(), components)
+                })
+                .collect();
 
-                let pre_aggs = pre_aggs_lock.read().unwrap();
-                let mut candidates: Vec<&PreAggregation> = pre_aggs
-                    .iter()
-                    .filter(|pa| pa.covers(&non_agg_vec, &agg_map))
-                    .collect();
-                candidates.sort_by_key(|pa| pa.row_count);
+            let pre_aggs = pre_aggs_lock.read().unwrap();
+            let mut candidates: Vec<&PreAggregation> = pre_aggs
+                .iter()
+                .filter(|pa| pa.covers(&non_agg_vec, &agg_map))
+                .collect();
+            candidates.sort_by_key(|pa| pa.row_count);
 
-                'candidates: for candidate in &candidates {
-                    let Some(pre_agg_file) =
-                        resolve_fresh_pre_agg_path(path, &candidate.name, None)
-                    else {
-                        debug!(pre_agg = %candidate.name, "no current pointer or file missing, trying next");
-                        continue 'candidates;
-                    };
-                    debug!(pre_agg = %candidate.name, table = %table_name, "using pre-aggregation");
-                    if let Ok(raw_df) = self.read_parquet_sync(&pre_agg_file) {
-                        match SubqueryAlias::try_new(
-                            Arc::new(raw_df.into_unoptimized_plan()),
-                            candidate.name.as_str(),
-                        ) {
-                            Ok(alias) => {
-                                let df = DataFrame::new(
-                                    self.0.ctx.state(),
-                                    LogicalPlan::SubqueryAlias(alias),
-                                );
-                                return Ok(DataFrameWrapper {
-                                    inner: df,
-                                    from_pre_agg: true,
-                                    pre_agg_name: Some(candidate.name.clone()),
-                                });
-                            }
-                            Err(e) => {
-                                debug!(pre_agg = %candidate.name, err = %e, "SubqueryAlias failed, trying next");
-                            }
+            'candidates: for candidate in &candidates {
+                let Some(pre_agg_file) = resolve_fresh_pre_agg_path(path, &candidate.name, None)
+                else {
+                    debug!(pre_agg = %candidate.name, "no current pointer or file missing, trying next");
+                    continue 'candidates;
+                };
+                debug!(pre_agg = %candidate.name, table = %table_name, "using pre-aggregation");
+                if let Ok(raw_df) = self.read_parquet_sync(&pre_agg_file) {
+                    match SubqueryAlias::try_new(
+                        Arc::new(raw_df.into_unoptimized_plan()),
+                        candidate.name.as_str(),
+                    ) {
+                        Ok(alias) => {
+                            let df = DataFrame::new(
+                                self.0.ctx.state(),
+                                LogicalPlan::SubqueryAlias(alias),
+                            );
+                            return Ok(DataFrameWrapper {
+                                inner: df,
+                                from_pre_agg: true,
+                                pre_agg_name: Some(candidate.name.clone()),
+                            });
+                        }
+                        Err(e) => {
+                            debug!(pre_agg = %candidate.name, err = %e, "SubqueryAlias failed, trying next");
                         }
                     }
-                    debug!(pre_agg = %candidate.name, "failed to read parquet, trying next");
                 }
+                debug!(pre_agg = %candidate.name, "failed to read parquet, trying next");
             }
         }
 

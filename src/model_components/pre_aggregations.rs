@@ -207,7 +207,7 @@ pub(crate) fn read_parquet_row_count(path: &str) -> Option<u64> {
         let total: i64 = std::fs::read_dir(p)
             .ok()?
             .flatten()
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "parquet"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
             .filter_map(|e| {
                 let f = std::fs::File::open(e.path()).ok()?;
                 let builder = ParquetRecordBatchReaderBuilder::try_new(f).ok()?;

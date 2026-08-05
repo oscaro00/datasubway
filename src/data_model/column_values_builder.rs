@@ -21,22 +21,19 @@ impl DataModel {
             return Err(format!("unknown table: '{table_name}'"));
         }
 
-        if ctx.use_pre_agg {
-            if let (Some(pre_aggs_lock), Some(path)) =
+        if ctx.use_pre_agg
+            && let (Some(pre_aggs_lock), Some(path)) =
                 (&self.0.pre_aggs, self.0.pre_agg_path.as_deref())
-            {
-                let pre_aggs = pre_aggs_lock.read().unwrap();
-                let found = match ctx.mode {
-                    ColumnValuesMode::Distinct => {
-                        self.try_distinct_from_pre_agg(ctx, &pre_aggs, path)
-                    }
-                    ColumnValuesMode::Range => self.try_range_from_pre_agg(ctx, &pre_aggs, path),
-                };
-                if let Some(df) = found {
-                    return Ok(df);
-                }
-                trace!(column = %ctx.column, "no valid pre-agg, falling back");
+        {
+            let pre_aggs = pre_aggs_lock.read().unwrap();
+            let found = match ctx.mode {
+                ColumnValuesMode::Distinct => self.try_distinct_from_pre_agg(ctx, &pre_aggs, path),
+                ColumnValuesMode::Range => self.try_range_from_pre_agg(ctx, &pre_aggs, path),
+            };
+            if let Some(df) = found {
+                return Ok(df);
             }
+            trace!(column = %ctx.column, "no valid pre-agg, falling back");
         }
 
         let base = self

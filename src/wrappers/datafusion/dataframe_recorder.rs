@@ -89,11 +89,11 @@ impl DataFrameRecorder {
     // ── Methods ───────────────────────────────────────────────────────────────
 
     pub fn filter(mut self, predicate: impl IntoFilterExpr) -> Self {
-        if let Some(pred) = predicate.into_filter(&mut self.allow_exclude_records) {
-            if let Some(pruned) = prune_filter_by_tables(pred, &self.table_name, &self.data_model) {
-                collect_col_names(&pruned, &mut self.non_agg_cols);
-                self.ops.push(DataFrameOp::Filter(pruned));
-            }
+        if let Some(pred) = predicate.into_filter(&mut self.allow_exclude_records)
+            && let Some(pruned) = prune_filter_by_tables(pred, &self.table_name, &self.data_model)
+        {
+            collect_col_names(&pruned, &mut self.non_agg_cols);
+            self.ops.push(DataFrameOp::Filter(pruned));
         }
         self
     }
@@ -381,10 +381,10 @@ impl DataFrameRecorder {
 /// aliases (e.g. `sum(col("x")).alias("y")`), to avoid poisoning the map
 /// with expression strings that aren't source column names.
 pub(crate) fn update_alias_map(alias_map: &mut HashMap<String, String>, expr: &Expr) {
-    if let Expr::Alias(a) = expr {
-        if let Some(resolved) = resolve_expr_to_source(&a.expr, alias_map) {
-            alias_map.insert(a.name.to_string(), resolved);
-        }
+    if let Expr::Alias(a) = expr
+        && let Some(resolved) = resolve_expr_to_source(&a.expr, alias_map)
+    {
+        alias_map.insert(a.name.to_string(), resolved);
     }
 }
 

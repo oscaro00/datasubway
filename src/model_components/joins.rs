@@ -144,11 +144,7 @@ fn has_long_cycle_from(adj: &HashMap<&str, Vec<&str>>, start: &str) -> bool {
     let mut path: Vec<(&str, usize)> = vec![(start, 0)];
     let mut in_path: HashSet<&str> = HashSet::from([start]);
 
-    loop {
-        let (current, i) = match path.last() {
-            Some(&top) => top,
-            None => break,
-        };
+    while let Some(&(current, i)) = path.last() {
         let neighbors = adj.get(current).map(|v| v.as_slice()).unwrap_or(&[]);
         if i < neighbors.len() {
             path.last_mut().unwrap().1 += 1;

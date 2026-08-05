@@ -136,16 +136,13 @@ pub fn parse_column_pattern(pattern: &str) -> Option<TableColumn> {
 }
 
 pub fn match_context_pattern(context_column: &TableColumn, patterns: &[TableColumn]) -> bool {
-    for pat in patterns.iter() {
-        if pat.table() == "*" {
-            return true;
-        } else if pat.table() == context_column.table()
-            && (pat.column() == "*" || pat.column() == context_column.column())
-        {
-            return true;
-        }
-    }
-    false
+    patterns.iter().any(|pat| {
+        // `*` matches any column in any table; `table.*` matches any column in
+        // that table; otherwise both halves must match exactly.
+        pat.table() == "*"
+            || (pat.table() == context_column.table()
+                && (pat.column() == "*" || pat.column() == context_column.column()))
+    })
 }
 
 fn include_to_strings(include: ColumnInclude) -> Vec<String> {
