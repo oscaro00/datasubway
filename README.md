@@ -109,18 +109,6 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 - More aggregation algorithms like KLL or t-digest for percentiles
 - Docs
 - Tests
-- Figure out logic for:
-  - with_columns() - should make a measure ineligible for pre aggregations
-  - join() 
-    - method chains should end in .build() to return a LazyFrame
-    - join() should be a wrapper method like the other wrappers
-    - like with_columns(), a method chain should become ineligible for pre aggregations
-  - Aliases generally - need to construct a tree/map to track column/aliases/agg functions throughout a measure
-    - A map should be enough since expressions merging multiple columns should not be allowed
-  - Expressions in agg() should only be allowed to be col().agg_fn().round()?.alias()?; anything more complex leads to issues (like a case() statement)
-  - Ducklake for atomic pre aggregation updates
-    - This avoids the situation where a pre aggregation is being updated while another API thread reads from it
-  - Grafeo for join network (validates acyclic, and only one path between tables)
 
 - Benchmark system
 - HTMX UI/TUI for displaying pre agg metadata and rewriting files
@@ -132,7 +120,8 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 
 ## Known Issues
 
-- Introducing new columns or aliasing existing columns to a new name in a measure can cause pre agg covers() logic to fail
-  - Ignoring column names that don't exist in the data model seems like a solution, but you might need to know how aggregations used on the new column are saved with the root column(s)
-  - Are the root columns of the new column agg columns or non agg columns?
-  - The real solution is building a map/tree to track columns, aliases, and aggregation functions
+- Some methods prevent pre aggregations from being used:
+  - join()
+    - Not sure if there is a way around this one (just break query into multiple statements with build())
+  - window()
+    - Need to think about this more, but it might be possible

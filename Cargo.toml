@@ -1,6 +1,6 @@
 [package]
 name = "datasubway"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 
 [lib]
@@ -11,18 +11,16 @@ crate-type = ["rlib"]
 name = "datasubway"
 path = "src/main.rs"
 
-[features]
-async = ["dep:tokio", "polars/async"]
-dynamic_group_by = ["polars/dynamic_group_by"]
-
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-polars = { version = "0.53.0", features = ["lazy", "is_in", "meta", "serde-lazy", "parquet"] }
 regex = "1.12.3"
 tracing = "0.1"
+datafusion = "54.0.0"
+parquet = "54"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

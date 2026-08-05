@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::column_expressions::filter_expr::extract_filter_cols;
 use crate::model_components::measures::MeasureMetadata;
+use crate::model_components::{validate_limit, validate_membership, validate_sorts};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggContext {
@@ -17,6 +18,12 @@ pub struct AggContext {
 }
 
 impl AggContext {
+    /// Each parameter is one field of the query-context payload this type
+    /// mirrors, so the arity tracks the payload rather than signalling a
+    /// function that does too much. Collapsing them into an options struct
+    /// would be an API change across every call site; revisit if the payload
+    /// grows further.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         measures: Vec<String>,
         filters: Option<serde_json::Value>,
@@ -32,10 +39,7 @@ impl AggContext {
             return Err("measures must not be empty".into());
         }
 
-        let limit = limit.unwrap_or(10000);
-        if limit == 0 {
-            return Err("limit must be > 0".into());
-        }
+        let limit = validate_limit(limit)?;
 
         Ok(AggContext {
             measures,
@@ -91,18 +95,8 @@ impl AggContext {
             }
         }
 
-        for g in &self.groups {
-            if !all_columns.contains(g) {
-                return Err(format!("Unknown group column: '{}'", g));
-            }
-        }
-
-        let filter_cols = self.filter_columns();
-        for fc in &filter_cols {
-            if !all_columns.contains(fc) {
-                return Err(format!("Unknown filter column: '{}'", fc));
-            }
-        }
+        validate_membership(&self.groups, all_columns, "Unknown group column")?;
+        validate_membership(&self.filter_columns(), all_columns, "Unknown filter column")?;
 
         let mut valid_having_cols: std::collections::HashSet<String> =
             self.groups.iter().cloned().collect();
@@ -114,22 +108,12 @@ impl AggContext {
             }
         }
 
-        let having_cols = self.having_columns();
-        for hc in &having_cols {
-            if !valid_having_cols.contains(hc) {
-                return Err(format!("Invalid having column: '{}'", hc));
-            }
-        }
-
-        let valid_sort_cols = &valid_having_cols;
-        for (col, direction) in &self.sorts {
-            if !valid_sort_cols.contains(col) {
-                return Err(format!("Invalid sort column: '{}'", col));
-            }
-            if direction != "asc" && direction != "desc" {
-                return Err(format!("Invalid sort direction: '{}'", direction));
-            }
-        }
+        validate_membership(
+            &self.having_columns(),
+            &valid_having_cols,
+            "Invalid having column",
+        )?;
+        validate_sorts(&self.sorts, &valid_having_cols, "Invalid sort column")?;
 
         Ok(())
     }

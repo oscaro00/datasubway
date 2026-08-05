@@ -1,88 +1,72 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use datasubway::{
-    data_model::DataModel,
-    model_components::{joins::JoinGraph, pre_aggregations::PreAggregation},
-};
-use polars::prelude::*;
+use datafusion::arrow::array::{Float64Array, Int64Array};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use datafusion::prelude::{col, lit};
 
-pub fn main() -> Result<(), &'static str> {
-    let orders = df![
-        "id"          => [1i64, 2, 3],
-        "customer_id" => [10i64, 20, 10],
-        "amount"      => [100.0f64, 200.0, 150.0],
-    ]
-    .unwrap()
-    .lazy();
+use datasubway::{data_model::DataModel, model_components::joins::JoinGraph};
 
-    let tables = HashMap::from([("orders".to_string(), orders)]);
-    let joins = JoinGraph::new(&[]).unwrap();
+#[tokio::main]
+async fn main() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("customer_id", DataType::Int64, false),
+        Field::new("amount", DataType::Float64, false),
+    ]));
 
-    let dm = DataModel::new(tables, joins, vec![], None);
-
-    let test_result = dm
-        .table("orders")
-        .filter(Some(col("customer_id").neq(lit(20i64))))
-        .sort(["amount"], SortMultipleOptions::default())
-        .build()
-        .collect();
-
-    println!("{:?}", test_result);
-
-    let test_result2 = dm.table("orders").build().collect();
-
-    println!("{:?}", test_result2);
-
-    let _test_result3 = dm
-        .table("orders")
-        .group_by(vec![col("customer_id")])
-        .agg(vec![col("amount").max().alias("amount")])
-        .build()
-        .collect();
-
-    println!("{:?}", _test_result3);
-
-    // --- Pre-aggregation example ---
-    // Build a table with date/region breakdown so the pre-agg is meaningful.
-    let orders_detailed = df![
-        "date"        => ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
-        "region"      => ["north", "south", "north", "south"],
-        "amount"      => [100.0f64, 200.0, 150.0, 250.0],
-    ]
-    .unwrap()
-    .lazy();
-
-    // Define a pre-aggregation that groups by date and region, storing sum and
-    // the components needed to reconstruct mean (sum + count).
-    let pa = PreAggregation::new(
-        "daily_revenue".into(),
-        vec!["orders.date".into(), "orders.region".into()],
-        HashMap::from([("orders.amount".into(), vec!["sum".into(), "mean".into()])]),
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![10, 20, 10])),
+            Arc::new(Float64Array::from(vec![100.0, 200.0, 150.0])),
+        ],
     )
     .unwrap();
 
-    let tmp_dir = std::env::temp_dir();
-    let dm2 = DataModel::new(
-        HashMap::from([("orders".to_string(), orders_detailed)]),
-        JoinGraph::new(&[]).unwrap(),
-        vec![pa],
-        Some(tmp_dir.to_str().unwrap().to_string()),
+    let provider = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+    let tables = HashMap::from([(
+        "orders".to_string(),
+        provider as Arc<dyn datafusion::catalog::TableProvider>,
+    )]);
+    let dm = DataModel::new(tables, JoinGraph::new(&[]).unwrap(), vec![], None);
+
+    // Basic filter
+    let df = dm
+        .table("orders", true)
+        .filter(col("orders.customer_id").not_eq(lit(20i64)))
+        .build()
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    println!(
+        "filter result: {} rows",
+        results.iter().map(|b| b.num_rows()).sum::<usize>()
     );
 
-    // Write the pre-agg parquet to the temp directory.
-    dm2.write_pre_aggs(&["daily_revenue"]).unwrap();
+    // Full scan
+    let df2 = dm.table("orders", true).build().unwrap();
+    let results2 = df2.collect().await.unwrap();
+    println!(
+        "full scan: {} rows",
+        results2.iter().map(|b| b.num_rows()).sum::<usize>()
+    );
 
-    // This query is covered by the pre-agg (same group_by + sum on amount),
-    // so DataModel automatically reads from the pre-agg file instead of
-    // recomputing over the base table.
-    let pre_agg_result = dm2
-        .table("orders")
-        .group_by(vec![col("orders.date"), col("orders.region")])
-        .agg(vec![col("orders.amount").sum().alias("total")])
+    // Group-by + agg
+    use datafusion::functions_aggregate::expr_fn::sum;
+    let df3 = dm
+        .table("orders", true)
+        .aggregate(
+            vec![col("orders.customer_id")],
+            vec![sum(col("orders.amount")).alias("total")],
+        )
         .build()
-        .collect();
-
-    println!("pre-agg result: {:?}", pre_agg_result);
-
-    Ok(())
+        .unwrap();
+    let results3 = df3.collect().await.unwrap();
+    println!(
+        "agg result: {} rows",
+        results3.iter().map(|b| b.num_rows()).sum::<usize>()
+    );
 }
