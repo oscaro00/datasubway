@@ -1,6 +1,6 @@
 # Project Plan
 
-The purpose of this library is to define a data model using python focusing on the library polars. The data model will act as a central repository of domain specific calculations that can be written very flexibly. Calling these calculations will be as simple as naming the calculations along with a json-like object for the query parameters you want as context. I imagine this library would be implemented in tandem with an api library to make data access easy. This data model is primarily geared towards OLAP use cases (i.e. read heavy workloads of large chunks of data). Data insertion and updates on tables will not be scope of this work.
+The purpose of this library is to define a data model using rust focusing on the crate datafusion. The data model will act as a central repository of domain specific calculations that can be written very flexibly. Calling these calculations will be as simple as naming the calculations along with a json-like object for the query parameters you want as context. I imagine this crate would be implemented in tandem with an api crate to make data access easy. This data model is primarily geared towards OLAP use cases (i.e. read heavy workloads of large chunks of data). Data insertion and updates on tables will not be scope of this work.
 
 ## Core requirements for the data model:
 
@@ -14,7 +14,7 @@ The purpose of this library is to define a data model using python focusing on t
 
 ## Key features:
 
-- Using the polars lazy frame syntax also gives polars optimizations to query executions by default
+- Using the datafusion dataframe syntax also gives datafusion optimizations to query executions by default
 - Pre-aggregations are declarative (i.e. users define which columns to group by before calculations measures) and optimal pre-aggregations are selected by the data model engine without user input
 - Pre-aggregations are effective with the assumption that most queries do not need the fully granularity of the table, so a local parquet file with an aggregated version of the data will be faster (no network calls and less data to crunch)
 - Pre-aggregations can span several tables (table joins are expensive, so pre-computing them makes sense)
