@@ -29,7 +29,6 @@ The purpose of this library is to define a data model using rust focusing on the
 
 ```rust
 
-}
 ```
 
 ## Building, Testing, and Running
