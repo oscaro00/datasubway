@@ -105,6 +105,7 @@ To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("data
 
 ## TO DO
 
+- When a pre agg updates, delete the old copy
 - More aggregation algorithms like KLL or t-digest for percentiles
 - Docs
 - Tests

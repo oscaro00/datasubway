@@ -19,7 +19,6 @@ serde_json = "1"
 regex = "1.12.3"
 tracing = "0.1"
 datafusion = "54.0.0"
-parquet = "54"
 async-trait = "0.1"
 
 [dev-dependencies]

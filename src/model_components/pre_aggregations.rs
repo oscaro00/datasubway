@@ -200,7 +200,10 @@ pub(crate) fn resolve_fresh_pre_agg_path(
 
 /// Reads a parquet file's (or directory of parquet files') metadata to return the total row count.
 pub(crate) fn read_parquet_row_count(path: &str) -> Option<u64> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    // Via DataFusion's re-export rather than a direct `parquet` dependency:
+    // a separately-versioned parquet crate pulls in its own arrow stack, and
+    // its `RecordBatch` is then a different type from DataFusion's.
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let p = std::path::Path::new(path);
     if p.is_dir() {
