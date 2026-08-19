@@ -894,3 +894,190 @@ async fn test_pre_agg_explain_toggle() {
         "use_pre_agg=false: expected no pre-agg file in plan, got:\n{plan_without}"
     );
 }
+
+// ── Derived statistics rolled up from a pre-aggregation ───────────────────────
+
+fn player_avg_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
+    use datafusion::functions_aggregate::expr_fn::avg;
+    dm.table("player_stats", qc.use_pre_agg)
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![avg(col("player_stats.goals")).alias("player_stats.avg_goals")],
+        )
+        .build()
+}
+
+fn player_stddev_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
+    use datafusion::functions_aggregate::expr_fn::stddev_pop;
+    dm.table("player_stats", qc.use_pre_agg)
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![stddev_pop(col("player_stats.goals")).alias("player_stats.stddev_goals")],
+        )
+        .build()
+}
+
+fn player_variance_goals(dm: &DataModel, qc: &AggContext) -> datafusion::common::Result<DataFrame> {
+    use datafusion::functions_aggregate::expr_fn::var_pop;
+    dm.table("player_stats", qc.use_pre_agg)
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![var_pop(col("player_stats.goals")).alias("player_stats.variance_goals")],
+        )
+        .build()
+}
+
+/// A model whose pre-agg stores the components (`sum`, `count`, `sumsq`) that
+/// mean/stddev/variance are reconstructed from.
+async fn build_dm_with_derived_stats_pre_agg() -> (DataModel, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let mut dm = DataModel::new(
+        make_tables().await,
+        JoinGraph::new(&make_joins()).unwrap(),
+        vec![
+            PreAggregation::new(
+                "player_goal_stats_by_player".into(),
+                vec!["players.player_name".into()],
+                HashMap::from([(
+                    "player_stats.goals".into(),
+                    vec!["mean".into(), "std".into(), "var".into()],
+                )]),
+            )
+            .unwrap(),
+        ],
+        Some(tmp.path().to_str().unwrap().to_string()),
+    );
+    dm.add_measure(DfMeasure::new("player_avg_goals", player_avg_goals))
+        .unwrap();
+    dm.add_measure(DfMeasure::new("player_stddev_goals", player_stddev_goals))
+        .unwrap();
+    dm.add_measure(DfMeasure::new(
+        "player_variance_goals",
+        player_variance_goals,
+    ))
+    .unwrap();
+    dm.write_pre_aggs(&["player_goal_stats_by_player"]).unwrap();
+    (dm, tmp)
+}
+
+/// Pull `(group, value)` pairs out of a result, sorted by group, with the value
+/// as `f64` regardless of its physical numeric type.
+fn numeric_by_group(
+    batches: Vec<RecordBatch>,
+    group_col: &str,
+    value_col: &str,
+) -> Vec<(String, f64)> {
+    use datafusion::arrow::array::{Array, Float64Array, StringArray};
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::DataType;
+
+    let schema = batches[0].schema();
+    let combined = concat_batches(&schema, &batches).unwrap();
+
+    let groups = cast(
+        combined.column(schema.index_of(group_col).unwrap()),
+        &DataType::Utf8,
+    )
+    .unwrap();
+    let groups = groups.as_any().downcast_ref::<StringArray>().unwrap();
+
+    let values = cast(
+        combined.column(schema.index_of(value_col).unwrap()),
+        &DataType::Float64,
+    )
+    .unwrap();
+    let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+
+    let mut out: Vec<(String, f64)> = (0..combined.num_rows())
+        .filter(|&i| !groups.is_null(i) && !values.is_null(i))
+        .map(|i| (groups.value(i).to_string(), values.value(i)))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Rolling a mean, stddev or variance out of a pre-aggregation must produce the
+/// same numbers as computing it straight from the base table.
+///
+/// Regression: the rollup divided the stored components directly, and `sum`,
+/// `count` and `sumsq` over an integer source column are all `Int64`, so
+/// DataFusion performed *integer* division. Every ratio below 1 collapsed to
+/// zero — a player averaging 0.4375 goals came back as 0, as did any win rate.
+///
+/// Compared with a tolerance rather than exactly: the rollup evaluates variance
+/// as `sumsq/n - mean^2` while the direct path uses DataFusion's streaming
+/// accumulator, so the two agree to within floating-point noise rather than
+/// bit-for-bit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_pre_agg_derived_stats_match_direct_computation() {
+    let (dm, _tmp) = build_dm_with_derived_stats_pre_agg().await;
+
+    let measures = [
+        ("player_avg_goals", "player_stats.avg_goals"),
+        ("player_stddev_goals", "player_stats.stddev_goals"),
+        ("player_variance_goals", "player_stats.variance_goals"),
+    ];
+
+    for (measure, output_col) in measures {
+        let query = |use_pre_agg: bool| {
+            AggContext::new(
+                vec![measure.into()],
+                None,
+                Some(vec!["players.player_name".into()]),
+                None,
+                None,
+                None,
+                None,
+                Some(use_pre_agg),
+                None,
+            )
+            .unwrap()
+        };
+
+        let from_pre_agg = numeric_by_group(
+            dm_query(&dm, query(true)).await,
+            "players.player_name",
+            output_col,
+        );
+        let direct = numeric_by_group(
+            dm_query(&dm, query(false)).await,
+            "players.player_name",
+            output_col,
+        );
+
+        assert_eq!(
+            from_pre_agg.len(),
+            direct.len(),
+            "{measure}: row counts differ between the two paths"
+        );
+        assert!(!from_pre_agg.is_empty(), "{measure}: no rows to compare");
+
+        for ((group, pre), (direct_group, want)) in from_pre_agg.iter().zip(&direct) {
+            assert_eq!(group, direct_group, "{measure}: group ordering differs");
+            assert!(
+                (pre - want).abs() <= 1e-9 * want.abs().max(1.0),
+                "{measure} for {group}: pre-agg gave {pre}, direct gave {want}"
+            );
+        }
+
+        // Guards against the assertions above passing on trivially equal data:
+        // `goals` is an Int32 column whose per-player statistics are genuinely
+        // fractional, which is exactly what integer division destroyed.
+        assert!(
+            from_pre_agg.iter().any(|(_, v)| v.fract() > 0.0),
+            "{measure}: expected fractional values, got only whole numbers"
+        );
+    }
+}

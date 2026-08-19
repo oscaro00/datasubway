@@ -191,7 +191,9 @@ pub fn rewrite_col_name_for_pre_agg(
 }
 
 fn build_pre_agg_expr(col_name: &str, agg_name: &str, pre_agg_name: &str) -> Option<Expr> {
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::functions_aggregate::expr_fn::{max, min, sum};
+    use datafusion::logical_expr::expr::Cast;
 
     // col("pre_agg_name.table__col__component") — DataFusion splits at the first dot,
     // yielding Column{relation: Some(pre_agg_name), name: "table__col__component"}.
@@ -203,23 +205,33 @@ fn build_pre_agg_expr(col_name: &str, agg_name: &str, pre_agg_name: &str) -> Opt
         .as_str())
     };
 
+    // Rolling a stored component back up preserves its type: `sum`, `count` and
+    // `sumsq` over an integer source column are all Int64. Dividing two Int64
+    // expressions is *integer* division, so any mean below 1 collapsed to 0 —
+    // a 93/200 win rate came back as 0 rather than 0.465. Every ratio below is
+    // therefore computed in floating point.
+    //
+    // Only the derived statistics are cast. `sum`/`min`/`max` deliberately keep
+    // the source type, so summing an integer column still yields an integer.
+    let real = |e: Expr| Expr::Cast(Cast::new(Box::new(e), DataType::Float64));
+
     Some(match agg_name {
         "sum" => sum(c("sum")),
         "count" => sum(c("count")),
         "min" => min(c("min")),
         "max" => max(c("max")),
-        "avg" | "mean" => sum(c("sum")) / sum(c("count")),
+        "avg" | "mean" => real(sum(c("sum"))) / real(sum(c("count"))),
         "stddev" | "stddev_pop" | "std" => {
             use datafusion::functions::expr_fn::sqrt;
-            let n = sum(c("count"));
-            let mean = sum(c("sum")) / n.clone();
-            let variance = sum(c("sumsq")) / n.clone() - mean.clone() * mean;
+            let n = real(sum(c("count")));
+            let mean = real(sum(c("sum"))) / n.clone();
+            let variance = real(sum(c("sumsq"))) / n.clone() - mean.clone() * mean;
             sqrt(variance)
         }
         "variance" | "var_pop" | "var" => {
-            let n = sum(c("count"));
-            let mean = sum(c("sum")) / n.clone();
-            sum(c("sumsq")) / n - mean.clone() * mean
+            let n = real(sum(c("count")));
+            let mean = real(sum(c("sum"))) / n.clone();
+            real(sum(c("sumsq"))) / n - mean.clone() * mean
         }
         _ => return None,
     })
