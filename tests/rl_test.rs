@@ -1081,3 +1081,85 @@ async fn test_pre_agg_derived_stats_match_direct_computation() {
         );
     }
 }
+
+// ── Projection pushdown through AggregateWithMetadata ─────────────────────────
+
+/// Extracts the `projection=[...]` list for the named table from a plan string.
+fn scan_projection(plan: &str, table: &str) -> Vec<String> {
+    let needle = format!("TableScan: {table} projection=[");
+    let start = plan
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no TableScan for '{table}' in plan:\n{plan}"))
+        + needle.len();
+    let end = plan[start..]
+        .find(']')
+        .expect("unterminated projection list");
+    plan[start..start + end]
+        .split(", ")
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// `AggregateWithMetadata` reports its required input columns via
+/// `necessary_children_exprs`, so `OptimizeProjections` must prune the scan
+/// beneath it instead of conservatively keeping all 99 `player_stats` columns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_projection_pushdown_through_aggregate_with_metadata() {
+    let (dm, _tmp) = build_dm_with_pre_agg().await;
+
+    let qc = AggContext::new(
+        vec!["player_goals".to_string()],
+        None,
+        Some(vec!["players.player_name".to_string()]),
+        None,
+        None,
+        None,
+        None,
+        Some(false), // scan the base table, which is 99 columns wide
+        None,
+    )
+    .unwrap();
+
+    let plan = pretty_format_batches(
+        &dm.explain(&DataQuery::Agg(qc), Default::default())
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_string();
+
+    let cols = scan_projection(&plan, "player_stats");
+
+    // Only the aggregated column and the join key survive. Without
+    // `necessary_children_exprs` this scan keeps all 99 columns.
+    assert!(
+        cols.contains(&"goals".to_string()),
+        "aggregated column missing from scan: {cols:?}"
+    );
+    assert!(
+        cols.contains(&"player_id".to_string()),
+        "join key missing from scan: {cols:?}"
+    );
+    assert!(
+        !cols.contains(&"time_powerslide".to_string()),
+        "unrelated column was not pruned: {cols:?}"
+    );
+    assert!(
+        cols.len() < 10,
+        "expected a pruned scan, got {} columns:\n{plan}",
+        cols.len()
+    );
+
+    // The metadata blob is elided in explain output, but keeps a digest so two
+    // plans differing only in metadata still render differently.
+    assert!(
+        plan.contains("allow_exclude=<"),
+        "expected elided metadata in plan:\n{plan}"
+    );
+    assert!(
+        !plan.contains("OnePattern"),
+        "raw allow_exclude JSON leaked into plan:\n{plan}"
+    );
+}

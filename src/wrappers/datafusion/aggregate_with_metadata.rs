@@ -9,7 +9,7 @@ use datafusion::logical_expr::{
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::{DataFrame, Expr};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -103,7 +103,7 @@ impl UserDefinedLogicalNodeCore for AggregateWithMetadata {
         let meta_pairs: Vec<String> = self
             .metadata
             .iter()
-            .map(|(k, v)| format!("{k}={v}"))
+            .map(|(k, v)| format!("{k}={}", elide(v)))
             .collect();
         write!(
             f,
@@ -112,6 +112,37 @@ impl UserDefinedLogicalNodeCore for AggregateWithMetadata {
             fmt_exprs(&self.aggr_expr),
             meta_pairs.join(", "),
         )
+    }
+
+    /// Reports which input columns the aggregate actually reads, letting
+    /// `OptimizeProjections` prune the scan beneath us. Without this the
+    /// optimizer cannot route requirements through an extension node and
+    /// conservatively keeps every input column, which leaves the logical plan
+    /// scanning all ~100 columns of a wide pre-aggregation.
+    ///
+    /// `output_columns` is ignored on purpose: it says which of *our* outputs
+    /// the parent wants, but dropping a `group_expr` would change grouping
+    /// cardinality and dropping an `aggr_expr` would desynchronise `schema`,
+    /// which `with_exprs_and_inputs` clones verbatim. The columns referenced by
+    /// all group and aggregate expressions are the tight, correct answer, and
+    /// are what DataFusion's own `Aggregate` computes for this case.
+    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        let input_schema = self.input.schema();
+
+        let mut refs = HashSet::new();
+        for expr in self.group_expr.iter().chain(&self.aggr_expr) {
+            expr.add_column_refs(&mut refs);
+        }
+
+        let mut indices = Vec::with_capacity(refs.len());
+        for col in refs {
+            // An unresolvable reference (an outer/correlated column, say) means
+            // we cannot answer safely. `None` falls back to "needs everything".
+            indices.push(input_schema.maybe_index_of_column(col)?);
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        Some(vec![indices])
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
@@ -283,6 +314,36 @@ impl MetadataDataFrame {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Metadata values longer than this are elided in explain output.
+const MAX_METADATA_VALUE: usize = 40;
+
+/// Shortens a long metadata value for explain output, keeping a digest so the
+/// rendering still distinguishes values that differ.
+///
+/// The digest matters beyond cosmetics: `plan_merge_key` identifies a measure's
+/// mergeable slot by display-formatting its input subplan, so if a rolled-up
+/// pre-aggregation ever nests one of these nodes inside another's input, this
+/// text becomes part of that key. Eliding values outright would collapse two
+/// plans that differ only in metadata into one key and merge measures that
+/// should have stayed separate.
+fn elide(value: &str) -> String {
+    if value.len() <= MAX_METADATA_VALUE {
+        return value.to_string();
+    }
+    format!("<{} chars #{:08x}>", value.len(), digest(value))
+}
+
+/// FNV-1a. Hand-rolled rather than `DefaultHasher` so the same plan always
+/// renders the same text — std makes no cross-run stability guarantee.
+fn digest(s: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in s.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
 
 pub fn fmt_exprs(exprs: &[Expr]) -> String {
     exprs
