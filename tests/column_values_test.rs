@@ -286,10 +286,13 @@ async fn test_column_values_distinct_from_group_by_pre_agg() {
     let plan = dm
         .display_graphviz(&DataQuery::ColumnValues(ctx.clone()))
         .unwrap();
-    // display_graphviz doesn't show the pre-agg's file/pointer name for this code path
-    // (no SubqueryAlias is applied, unlike get_df_table), so assert on a physical
-    // column that only exists in this pre-agg's schema, confirming it (not the raw
-    // players table) was actually read from.
+    // The pre-agg version is its own TableProvider, so it shows up as a TableScan
+    // named after the pre-agg. Assert on that plus a physical column unique to its
+    // schema, confirming it (not the raw players table) was read from.
+    assert!(
+        plan.contains("TableScan: player_name_group_by"),
+        "expected pre-agg TableScan in plan, got:\n{plan}"
+    );
     assert!(
         plan.contains("player_stats__goals__sum"),
         "expected pre-agg schema in plan, got:\n{plan}"
@@ -322,9 +325,8 @@ async fn test_column_values_range_from_group_by_pre_agg() {
     let plan = dm
         .display_graphviz(&DataQuery::ColumnValues(ctx.clone()))
         .unwrap();
-    // No SubqueryAlias is applied on this code path, so the pre-agg's name itself
-    // doesn't appear in the plan; assert on a physical column unique to this pre-agg's
-    // schema instead, confirming it (not the raw player_stats table) was read from.
+    // Assert on the pre-agg's own TableScan plus a physical column unique to its
+    // schema, confirming it (not the raw player_stats table) was read from.
     assert!(
         plan.contains("player_stats__assists__sum"),
         "expected pre-agg schema in plan, got:\n{plan}"
@@ -361,8 +363,8 @@ async fn test_column_values_range_from_aggregations_pre_agg_prefers_smaller() {
     let plan = dm
         .display_graphviz(&DataQuery::ColumnValues(ctx.clone()))
         .unwrap();
-    // No SubqueryAlias is applied on this code path, so assert on physical group_by
-    // columns unique to each candidate's schema instead of the pre-agg's own name.
+    // Assert on physical group_by columns unique to each candidate's schema, which
+    // distinguishes the two pre-aggs more precisely than the scan name alone.
     assert!(
         plan.contains("team_stats__team_name"),
         "expected smaller pre-agg (by team) in plan, got:\n{plan}"

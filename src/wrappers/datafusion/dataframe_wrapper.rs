@@ -7,7 +7,7 @@ use datafusion::prelude::DataFrame;
 pub struct DataFrameWrapper {
     pub inner: DataFrame,
     pub from_pre_agg: bool,
-    /// The pre-aggregation name when `from_pre_agg` is true; used as the
-    /// `SubqueryAlias` qualifier so column refs resolve as `pre_agg_name.col`.
+    /// The pre-aggregation name when `from_pre_agg` is true. It is the relation
+    /// of the version's `TableScan`, so column refs resolve as `pre_agg_name.col`.
     pub pre_agg_name: Option<String>,
 }

@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use datafusion::prelude::col;
 
 use crate::data_model::DataModel;
+use crate::model_components::pre_agg_store::{PreAggVersion, ReclaimReport};
 
 /// Canonical aggregation kinds and the stored component column suffixes each needs.
 /// e.g. a mean/avg needs both "sum" and "count" components stored.
@@ -79,15 +81,18 @@ pub fn agg_needed_components(agg_fn_name: &str) -> Option<Vec<&'static str>> {
     Some(kind.components().to_vec())
 }
 
-/// A pre-aggregation definition with its metadata.
+/// A pre-aggregation *definition*: which columns to group by and which agg
+/// components to store.
+///
+/// Deliberately carries no row count or write timestamp — those describe a
+/// particular file on disk, not the definition, and live on
+/// [`PreAggVersion`](crate::model_components::pre_agg_store::PreAggVersion).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreAggregation {
     pub name: String,
     pub group_by: Vec<String>,
     /// col_name -> list of component suffixes stored (e.g. "orders.amount" -> ["sum", "count"])
     pub aggregations: HashMap<String, Vec<String>>,
-    pub row_count: u64,
-    pub written_at: Option<String>,
 }
 
 impl PreAggregation {
@@ -121,8 +126,6 @@ impl PreAggregation {
             name,
             group_by,
             aggregations,
-            row_count: 0,
-            written_at: None,
         })
     }
 
@@ -167,92 +170,69 @@ impl PreAggregation {
     }
 }
 
-// ── File-system helpers ───────────────────────────────────────────────────────
-
-/// Reads the pointer file for a pre-agg and returns the full path to the current versioned parquet.
-pub(crate) fn resolve_pre_agg_path(base_path: &str, name: &str) -> Option<String> {
-    let pointer = format!("{base_path}/{name}.current");
-    let versioned = std::fs::read_to_string(&pointer).ok()?;
-    Some(format!("{base_path}/{}", versioned.trim()))
-}
-
-/// Resolves a pre-aggregation's current parquet pointer to a path, returning `None`
-/// if the pointer is missing, the file is older than `max_age` seconds (when set),
-/// or the file doesn't exist on disk.
-pub(crate) fn resolve_fresh_pre_agg_path(
-    base_path: &str,
-    name: &str,
-    max_age: Option<u64>,
-) -> Option<String> {
-    let pre_agg_file = resolve_pre_agg_path(base_path, name)?;
-    if let Some(max_age) = max_age {
-        let modified = std::fs::metadata(&pre_agg_file).ok()?.modified().ok()?;
-        let age = modified.elapsed().unwrap_or(std::time::Duration::MAX);
-        if age > std::time::Duration::from_secs(max_age) {
-            return None;
-        }
-    }
-    if !std::path::Path::new(&pre_agg_file).exists() {
-        return None;
-    }
-    Some(pre_agg_file)
-}
-
-/// Reads a parquet file's (or directory of parquet files') metadata to return the total row count.
-pub(crate) fn read_parquet_row_count(path: &str) -> Option<u64> {
-    // Via DataFusion's re-export rather than a direct `parquet` dependency:
-    // a separately-versioned parquet crate pulls in its own arrow stack, and
-    // its `RecordBatch` is then a different type from DataFusion's.
-    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let p = std::path::Path::new(path);
-    if p.is_dir() {
-        let total: i64 = std::fs::read_dir(p)
-            .ok()?
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
-            .filter_map(|e| {
-                let f = std::fs::File::open(e.path()).ok()?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(f).ok()?;
-                Some(builder.metadata().file_metadata().num_rows())
-            })
-            .sum();
-        Some(total as u64)
-    } else {
-        let f = std::fs::File::open(p).ok()?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(f).ok()?;
-        Some(builder.metadata().file_metadata().num_rows() as u64)
-    }
-}
-
 // ── DataModel write methods ───────────────────────────────────────────────────
 
 impl DataModel {
-    /// Compute and write parquet files for the named pre-aggregations.
+    /// Compute and write parquet files for the named pre-aggregations, then
+    /// reclaim whatever that supersedes.
     pub fn write_pre_aggs(&self, names: &[&str]) -> Result<(), String> {
-        let lock = self
+        let store = self
             .0
-            .pre_aggs
+            .pre_agg_store
             .as_ref()
             .ok_or("no pre-aggregations registered on this DataModel")?;
-        // Clone definitions before dropping the read lock so no lock is held during the write.
-        let pre_agg_defs: Vec<PreAggregation> = {
-            let pre_aggs = lock.read().unwrap();
-            names
-                .iter()
-                .map(|&name| {
-                    pre_aggs
-                        .iter()
-                        .find(|pa| pa.name == name)
-                        .cloned()
-                        .ok_or_else(|| format!("pre-aggregation '{name}' not found"))
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
+
+        let pre_agg_defs: Vec<PreAggregation> = names
+            .iter()
+            .map(|&name| {
+                store
+                    .def(name)
+                    .cloned()
+                    .ok_or_else(|| format!("pre-aggregation '{name}' not found"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         for pa_def in &pre_agg_defs {
             self.write_pre_agg(pa_def)?;
         }
+
+        // Safe to run unconditionally: reclaim only deletes versions it can prove
+        // nobody holds. This is what lets a rebuild clean up after itself.
+        store.reclaim();
         Ok(())
+    }
+
+    /// Delete superseded pre-aggregation versions that are provably unreferenced,
+    /// and sweep untracked leftovers past their grace window.
+    ///
+    /// A version is removed only once no in-flight query holds a lease on it (see
+    /// [`LeaseScope`](crate::model_components::pre_agg_store::LeaseScope)) *and*
+    /// it is past the retired grace floor. Cheap enough to call on a schedule.
+    pub fn reclaim_pre_agg_versions(&self) -> Result<ReclaimReport, String> {
+        let store = self
+            .0
+            .pre_agg_store
+            .as_ref()
+            .ok_or("no pre-aggregations registered on this DataModel")?;
+        Ok(store.reclaim())
+    }
+
+    /// How long a superseded version is kept even once it looks unreferenced.
+    /// Zero is correct and safe for a single-process deployment — the reference
+    /// count is the real guard. Raise it if another process may share the
+    /// directory, since the count cannot see readers outside this process.
+    pub fn set_pre_agg_retired_grace(&self, grace: std::time::Duration) {
+        if let Some(store) = &self.0.pre_agg_store {
+            store.set_retired_grace(grace);
+        }
+    }
+
+    /// How long an untracked versioned file (left by a crash or another process)
+    /// is kept before being swept.
+    pub fn set_pre_agg_orphan_grace(&self, grace: std::time::Duration) {
+        if let Some(store) = &self.0.pre_agg_store {
+            store.set_orphan_grace(grace);
+        }
     }
 
     fn write_pre_agg(&self, pa: &PreAggregation) -> Result<(), String> {
@@ -260,11 +240,12 @@ impl DataModel {
         use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
         use datafusion::prelude::Expr;
 
-        let path = self
+        let store = self
             .0
-            .pre_agg_path
-            .as_deref()
+            .pre_agg_store
+            .as_ref()
             .ok_or("pre_agg_path not set on DataModel")?;
+        let path = store.base_path().to_path_buf();
 
         let all_col_names = pa.group_by.iter().chain(pa.aggregations.keys());
         let mut referenced_tables: Vec<String> = all_col_names
@@ -319,19 +300,26 @@ impl DataModel {
             .aggregate(group_by_exprs, agg_exprs)
             .map_err(|e| format!("failed to aggregate for pre-agg: {e}"))?;
 
-        let unix_millis = SystemTime::now()
+        // Two rebuilds inside one millisecond would otherwise collide on the same
+        // filename, and publishing would retire the file it just wrote.
+        let mut unix_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let versioned_filename = format!("{}.{}.parquet", pa.name, unix_millis);
-        let versioned_path = format!("{path}/{versioned_filename}");
-        let pointer_path = format!("{path}/{}.current", pa.name);
-        let tmp_pointer_path = format!("{path}/{}.current.tmp", pa.name);
+        let mut versioned_path = path.join(format!("{}.{unix_millis}.parquet", pa.name));
+        while versioned_path.exists() {
+            unix_millis += 1;
+            versioned_path = path.join(format!("{}.{unix_millis}.parquet", pa.name));
+        }
+        let versioned_filename = format!("{}.{unix_millis}.parquet", pa.name);
+        let pointer_path = path.join(format!("{}.current", pa.name));
+        let tmp_pointer_path = path.join(format!("{}.current.tmp", pa.name));
+        let versioned_str = versioned_path.to_string_lossy().to_string();
 
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
                 handle.block_on(df.write_parquet(
-                    &versioned_path,
+                    &versioned_str,
                     DataFrameWriteOptions::new(),
                     None,
                 ))
@@ -340,11 +328,13 @@ impl DataModel {
                 .enable_all()
                 .build()
                 .expect("tokio runtime")
-                .block_on(df.write_parquet(&versioned_path, DataFrameWriteOptions::new(), None)),
+                .block_on(df.write_parquet(&versioned_str, DataFrameWriteOptions::new(), None)),
         }
         .map_err(|e| format!("failed to write parquet: {e}"))?;
 
-        let row_count = read_parquet_row_count(&versioned_path).unwrap_or(0);
+        // One footer read gives both the row count and the schema, so the version
+        // opens without any async schema inference.
+        let version = PreAggVersion::open(&pa.name, versioned_path)?;
 
         // Atomic pointer swap: write to tmp then rename (POSIX atomic).
         std::fs::write(&tmp_pointer_path, &versioned_filename)
@@ -352,69 +342,9 @@ impl DataModel {
         std::fs::rename(&tmp_pointer_path, &pointer_path)
             .map_err(|e| format!("failed to rename pointer: {e}"))?;
 
-        let written_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
-        if let Some(lock) = &self.0.pre_aggs {
-            let mut pre_aggs = lock.write().unwrap();
-            if let Some(entry) = pre_aggs.iter_mut().find(|p| p.name == pa.name) {
-                entry.row_count = row_count;
-                entry.written_at = Some(written_at);
-            }
-        }
-
+        store.publish(Arc::new(version));
         Ok(())
     }
-
-    /// Delete all non-current versioned parquet files for the named pre-aggregations.
-    pub fn purge_old_pre_agg_versions(&self, names: &[&str]) -> Result<(), String> {
-        let path = self
-            .0
-            .pre_agg_path
-            .as_deref()
-            .ok_or("pre_agg_path not set")?;
-        for &name in names {
-            let current = resolve_pre_agg_path(path, name)
-                .ok_or_else(|| format!("no current pointer for '{name}'"))?;
-            let entries =
-                std::fs::read_dir(path).map_err(|e| format!("cannot read pre_agg_path: {e}"))?;
-            let prefix = format!("{name}.");
-            for entry in entries.flatten() {
-                let fname = entry.file_name();
-                let s = fname.to_string_lossy();
-                if s.starts_with(&prefix)
-                    && s.ends_with(".parquet")
-                    && entry.path() != std::path::Path::new(&current)
-                {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        std::fs::remove_dir_all(&p)
-                            .map_err(|e| format!("failed to delete dir '{}': {e}", s))?;
-                    } else {
-                        std::fs::remove_file(&p)
-                            .map_err(|e| format!("failed to delete '{}': {e}", s))?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-// ── Coverage helpers ──────────────────────────────────────────────────────────
-
-/// Find the best (smallest row_count) pre-agg that covers the request.
-pub fn find_best_pre_agg<'a>(
-    pre_aggs: &'a [PreAggregation],
-    non_agg_cols: &[String],
-    agg_cols: &HashMap<String, HashSet<String>>,
-) -> Option<&'a PreAggregation> {
-    pre_aggs
-        .iter()
-        .filter(|pa| pa.covers(non_agg_cols, agg_cols))
-        .min_by_key(|pa| pa.row_count)
 }
 
 #[cfg(test)]
@@ -516,29 +446,5 @@ mod tests {
             HashSet::from(["sum".to_string()]),
         )]);
         assert!(!pa.covers(&non_agg_cols, &agg_cols));
-    }
-
-    #[test]
-    fn test_find_best() {
-        let mut pa1 = sample_pre_agg();
-        pa1.row_count = 1000;
-
-        let mut pa2 = PreAggregation::new(
-            "monthly_revenue".into(),
-            vec!["orders.date".into(), "orders.region".into()],
-            HashMap::from([("orders.amount".into(), vec!["sum".into()])]),
-        )
-        .unwrap();
-        pa2.row_count = 100; // smaller
-
-        let pre_aggs = vec![pa1, pa2];
-        let non_agg_cols = vec!["orders.date".into()];
-        let agg_cols = HashMap::from([(
-            "orders.amount".to_string(),
-            HashSet::from(["sum".to_string()]),
-        )]);
-
-        let best = find_best_pre_agg(&pre_aggs, &non_agg_cols, &agg_cols);
-        assert_eq!(best.unwrap().name, "monthly_revenue");
     }
 }

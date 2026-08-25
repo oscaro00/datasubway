@@ -103,9 +103,21 @@ With a `git` dependency, Cargo pins to a specific commit in `Cargo.lock`. To pul
 
 To see logs, consumers just add `tracing_subscriber::fmt().with_env_filter("datasubway=debug").init()` in their binary, then control verbosity with `RUST_LOG=datasubway=debug` (or `trace` for recorder-level detail).
 
+## Pre-aggregation versions
+
+Each rebuild writes a new immutable `<name>.<unix_millis>.parquet` and atomically
+swaps a `<name>.current` pointer, so a running query keeps reading the version it
+resolved. Superseded versions are reference counted rather than kept on a timer:
+`write_pre_aggs` reclaims on its way out, and `reclaim_pre_agg_versions()` is
+public for a scheduled sweep. A version is unlinked only once no in-flight query
+holds it and it is past `set_pre_agg_retired_grace` (default 60s). That floor is
+headroom for readers the reference count cannot see — a raw `DataFrame` collected
+outside `execute()`, or another process sharing the directory — and is safe to set
+to zero for a single-process deployment. Untracked leftovers from a crash are swept
+separately, after `set_pre_agg_orphan_grace` (default 1h).
+
 ## TO DO
 
-- When a pre agg updates, delete the old copy
 - More aggregation algorithms like KLL or t-digest for percentiles
 - Docs
 - Tests

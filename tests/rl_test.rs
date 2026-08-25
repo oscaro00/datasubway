@@ -1082,6 +1082,144 @@ async fn test_pre_agg_derived_stats_match_direct_computation() {
     }
 }
 
+// ── Pre-aggregation version lifecycle ─────────────────────────────────────────
+
+/// Every `<name>.<millis>.parquet` currently on disk for a pre-agg.
+fn version_files(base: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let prefix = format!("{name}.");
+    let mut out: Vec<_> = std::fs::read_dir(base)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let Some(f) = p.file_name().and_then(|f| f.to_str()) else {
+                return false;
+            };
+            f.strip_prefix(&prefix)
+                .and_then(|r| r.strip_suffix(".parquet"))
+                .is_some_and(|v| v.parse::<u128>().is_ok())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The property the version registry exists to provide: a query that bound a
+/// pre-agg version at plan-build time still reads correct data even though the
+/// pre-agg is rebuilt — and reclaimed — before that query executes. DataFusion
+/// opens the file lazily at execution time, so unlinking it in between used to
+/// break the in-flight read.
+///
+/// Here the pending plan holds the version through its `TableProvider` `Arc`
+/// (each version is its own provider), which is what stops the rebuild's reclaim
+/// from unlinking it. `DataModel::execute` additionally takes an explicit lease
+/// that outlives physical planning — covered by the unit tests in
+/// `data_model::tests`, since the reference count is not observable from here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rebuild_and_reclaim_do_not_disturb_an_in_flight_query() {
+    let (dm, tmp) = build_dm_with_pre_agg().await;
+    dm.set_pre_agg_retired_grace(std::time::Duration::ZERO);
+
+    let original = version_files(tmp.path(), "player_goals_by_player");
+    assert_eq!(original.len(), 1, "expected one version after setup");
+
+    let qc = AggContext::new(
+        vec!["player_goals".to_string()],
+        None,
+        Some(vec!["players.player_name".to_string()]),
+        None,
+        None,
+        None,
+        None,
+        Some(true),
+        None,
+    )
+    .unwrap();
+
+    // Baseline, before anything is rebuilt.
+    let expected = match dm.execute(&DataQuery::Agg(qc.clone())).await.unwrap() {
+        DataOutput::Data(batches) => sorted_select(
+            batches,
+            "players.player_name",
+            &["players.player_name", "player_stats.goals"],
+        ),
+        other => panic!("expected data, got {other:?}"),
+    };
+
+    // Bind a plan now, but do not execute it yet — this is the window that used
+    // to be unsafe. `normalize_schema` matches what `execute` does to a measure
+    // frame, so the output schema lines up with the baseline above.
+    let pinned = normalize_schema(player_goals(&dm, &qc).unwrap()).unwrap();
+
+    dm.write_pre_aggs(&["player_goals_by_player"]).unwrap();
+
+    let after_rebuild = version_files(tmp.path(), "player_goals_by_player");
+    assert_eq!(
+        after_rebuild.len(),
+        2,
+        "the version the pending query is pinned to must survive the rebuild's reclaim: {after_rebuild:?}"
+    );
+    assert!(original[0].exists());
+
+    // The pinned plan still reads the version it bound to, and gets the right answer.
+    let actual = sorted_select(
+        pinned.collect().await.unwrap(),
+        "players.player_name",
+        &["players.player_name", "player_stats.goals"],
+    );
+    assert_eq!(actual, expected, "in-flight query returned wrong data");
+
+    // Nothing holds it now, so the next sweep reclaims it.
+    drop(actual);
+    let report = dm.reclaim_pre_agg_versions().unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        version_files(tmp.path(), "player_goals_by_player").len(),
+        1,
+        "superseded version should be reclaimed once unreferenced"
+    );
+    assert!(!original[0].exists());
+}
+
+/// `AggContext::pre_agg_valid_secs` used to be dropped on the floor for measure
+/// queries (only the column-values path honoured it), so a stale pre-agg was
+/// still used. It now bounds the agg path too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_agg_query_respects_pre_agg_valid_secs() {
+    let (dm, _tmp) = build_dm_with_pre_agg().await;
+
+    let make_qc = |valid_secs: Option<u64>| {
+        AggContext::new(
+            vec!["player_goals".to_string()],
+            None,
+            Some(vec!["players.player_name".to_string()]),
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            valid_secs,
+        )
+        .unwrap()
+    };
+
+    let plan_fresh = dm
+        .display_graphviz(&DataQuery::Agg(make_qc(Some(3600))))
+        .unwrap();
+    assert!(
+        plan_fresh.contains("player_goals_by_player"),
+        "a just-written pre-agg is well inside an hour, got:\n{plan_fresh}"
+    );
+
+    let plan_stale = dm
+        .display_graphviz(&DataQuery::Agg(make_qc(Some(0))))
+        .unwrap();
+    assert!(
+        !plan_stale.contains("player_goals_by_player"),
+        "max_age of 0 must reject the pre-agg and fall back to the raw tables, got:\n{plan_stale}"
+    );
+}
+
 // ── Projection pushdown through AggregateWithMetadata ─────────────────────────
 
 /// Extracts the `projection=[...]` list for the named table from a plan string.
