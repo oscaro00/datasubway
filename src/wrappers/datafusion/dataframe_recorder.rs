@@ -307,7 +307,7 @@ impl DataFrameRecorder {
                         aggr_expr
                             .into_iter()
                             .map(|e| rewrite_for_pre_agg(e, &alias_map, &pre_agg_name))
-                            .collect()
+                            .collect::<datafusion::common::Result<Vec<_>>>()?
                     } else {
                         aggr_expr
                     };

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use datafusion::common::Column;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::prelude::{Expr, col};
 
@@ -19,24 +19,30 @@ pub(crate) fn qualified_name(c: &Column) -> String {
 
 /// Walk a DataFusion `Expr` and return every `(source_column, agg_function_name)`
 /// pair found in it. Pattern-matches the Expr tree directly — no JSON round-trip.
+///
+/// Uses `TreeNode::apply` rather than hand-enumerating `Expr` variants, for the same
+/// reason `rewrite_expr_for_pre_agg` does: a measure is free to wrap an aggregate in
+/// anything (`cast(sum(x), Float64)`, `nullif(sum(x), lit(0))`, a `CASE`), and a
+/// hand-written recursion silently returns no pair for a shape it doesn't know. That
+/// is not a harmless miss — `DataFrameRecorder::aggregate` files every column *not*
+/// named here into `non_agg_cols`, so an unrecognised wrapper makes `covers()` fail
+/// and quietly costs the measure its pre-aggregation.
+///
+/// Aggregates cannot nest, so a whole-tree walk cannot double-count.
 pub fn extract_agg_exprs(expr: &Expr) -> Vec<(String, String)> {
-    match expr {
-        Expr::AggregateFunction(AggregateFunction { func, params, .. }) => {
-            let agg_name = func.name().to_lowercase();
-            let col_name = params.args.first().and_then(extract_col_name);
-            match col_name {
-                Some(c) => vec![(c, agg_name)],
-                None => vec![],
-            }
+    let mut pairs = Vec::new();
+    // The closure never fails, so the `Result` carries no information. Keeping the
+    // signature infallible avoids rippling `Result` into `DataFrameRecorder::aggregate`,
+    // which returns `Self`.
+    let _ = expr.apply(|e| {
+        if let Expr::AggregateFunction(AggregateFunction { func, params, .. }) = e
+            && let Some(c) = params.args.first().and_then(extract_col_name)
+        {
+            pairs.push((c, func.name().to_lowercase()));
         }
-        Expr::Alias(a) => extract_agg_exprs(&a.expr),
-        Expr::BinaryExpr(b) => {
-            let mut v = extract_agg_exprs(&b.left);
-            v.extend(extract_agg_exprs(&b.right));
-            v
-        }
-        _ => vec![],
-    }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    pairs
 }
 
 /// Recursively find the first plain column name in an expression,
@@ -107,42 +113,38 @@ pub fn rewrite_group_for_pre_agg(
 /// Rewrite an aggregation expression to operate on pre-aggregated component
 /// columns instead of the raw source column.
 ///
-/// Only single-agg expressions (possibly wrapped in an alias) are rewritten.
-/// Complex binary expressions are recursed into, but the pre-agg formula for
-/// each leaf agg is substituted independently.
+/// Every `AggregateFunction` anywhere in the tree is substituted for its pre-agg
+/// formula; everything around it — aliases, arithmetic, casts, scalar functions,
+/// `CASE` — is carried through untouched. That matters because the surrounding
+/// nodes are load-bearing: a measure written as
+/// `cast(sum(a), Float64) / nullif(sum(b), lit(0))` is float division with a null
+/// guard, and dropping the cast on the way to the pre-agg would silently turn it
+/// back into integer division.
+///
+/// `transform_up` maps children before the parent and does not re-traverse what the
+/// closure returns, so the `sum(...)` calls that `build_pre_agg_expr` emits are not
+/// themselves rewritten. `transform_down` would loop.
 pub fn rewrite_for_pre_agg(
     expr: Expr,
     alias_map: &HashMap<String, String>,
     pre_agg_name: &str,
-) -> Expr {
-    match expr {
-        Expr::Alias(a) => {
-            let rewritten = rewrite_for_pre_agg(*a.expr, alias_map, pre_agg_name);
-            rewritten.alias(a.name.as_str())
+) -> datafusion::common::Result<Expr> {
+    expr.transform_up(|e| {
+        let Expr::AggregateFunction(ref agg) = e else {
+            return Ok(Transformed::no(e));
+        };
+        let agg_name = agg.func.name().to_lowercase();
+        let col_name = agg
+            .params
+            .args
+            .first()
+            .and_then(|a| extract_col_name(a).map(|n| resolve_source_col(&n, alias_map)));
+        match col_name.and_then(|c| build_pre_agg_expr(&c, &agg_name, pre_agg_name)) {
+            Some(rewritten) => Ok(Transformed::yes(rewritten)),
+            None => Ok(Transformed::no(e)),
         }
-        Expr::AggregateFunction(ref agg) => {
-            let agg_name = agg.func.name().to_lowercase();
-            let col_name = agg
-                .params
-                .args
-                .first()
-                .and_then(|a| extract_col_name(a).map(|n| resolve_source_col(&n, alias_map)));
-            match col_name {
-                Some(c) => build_pre_agg_expr(&c, &agg_name, pre_agg_name).unwrap_or(expr),
-                None => expr,
-            }
-        }
-        Expr::BinaryExpr(b) => {
-            let left = rewrite_for_pre_agg(*b.left, alias_map, pre_agg_name);
-            let right = rewrite_for_pre_agg(*b.right, alias_map, pre_agg_name);
-            Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
-                left: Box::new(left),
-                op: b.op,
-                right: Box::new(right),
-            })
-        }
-        other => other,
-    }
+    })
+    .map(|t| t.data)
 }
 
 /// Rewrite every column reference within an arbitrary expression tree (e.g. a
@@ -242,7 +244,7 @@ fn build_pre_agg_expr(col_name: &str, agg_name: &str, pre_agg_name: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::functions_aggregate::expr_fn::sum;
+    use datafusion::functions_aggregate::expr_fn::{avg, sum};
     use datafusion::prelude::col;
 
     fn single(expr: &Expr) -> (String, String) {
@@ -327,6 +329,92 @@ mod tests {
         let expr = col("amt");
         let rewritten = rewrite_expr_for_pre_agg(expr, &map, "pa").unwrap();
         assert_eq!(format!("{rewritten}"), "pa.orders__amount");
+    }
+
+    // The wrapper cases below are the ones a hand-written `match` used to miss: a
+    // measure that wraps an aggregate in a cast or a scalar function must still
+    // report its source column, or `DataFrameRecorder::aggregate` files that column
+    // into `non_agg_cols` and the measure silently loses its pre-aggregation.
+
+    #[test]
+    fn test_extract_agg_exprs_through_cast() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::prelude::cast;
+
+        let expr = cast(sum(col("orders.amount")), DataType::Float64);
+        assert_eq!(
+            extract_agg_exprs(&expr),
+            vec![("orders.amount".into(), "sum".into())]
+        );
+    }
+
+    #[test]
+    fn test_extract_agg_exprs_through_scalar_function() {
+        use datafusion::prelude::{lit, nullif};
+
+        let expr = nullif(sum(col("orders.qty")), lit(0));
+        assert_eq!(
+            extract_agg_exprs(&expr),
+            vec![("orders.qty".into(), "sum".into())]
+        );
+    }
+
+    #[test]
+    fn test_extract_agg_exprs_ratio_of_wrapped_aggs() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::prelude::{cast, lit, nullif};
+
+        // The exact shape a float-division measure takes.
+        let expr = (cast(
+            sum(col("orders.amount")) + sum(col("orders.tax")),
+            DataType::Float64,
+        ) / nullif(sum(col("orders.qty")), lit(0)))
+        .alias("orders.rate");
+
+        assert_eq!(
+            extract_agg_exprs(&expr),
+            vec![
+                ("orders.amount".into(), "sum".into()),
+                ("orders.tax".into(), "sum".into()),
+                ("orders.qty".into(), "sum".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_for_pre_agg_preserves_cast_and_nullif() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::prelude::{cast, lit, nullif};
+
+        let map = HashMap::new();
+        let expr = (cast(sum(col("orders.amount")), DataType::Float64)
+            / nullif(sum(col("orders.qty")), lit(0)))
+        .alias("orders.rate");
+
+        let rewritten = rewrite_for_pre_agg(expr, &map, "pa").unwrap();
+        let text = format!("{rewritten}");
+
+        // Both aggregates point at their component columns...
+        assert!(text.contains("pa.orders__amount__sum"), "{text}");
+        assert!(text.contains("pa.orders__qty__sum"), "{text}");
+        // ...and the wrappers that make this float division survive.
+        assert!(text.contains("CAST"), "{text}");
+        assert!(text.contains("nullif"), "{text}");
+        assert!(text.contains("AS orders.rate"), "{text}");
+    }
+
+    #[test]
+    fn test_rewrite_for_pre_agg_does_not_rewrite_its_own_output() {
+        let map = HashMap::new();
+        // `avg` expands to sum/count over component columns; those inner `sum`s must
+        // not be fed back through the rewrite (which would look for a `__sum__sum`).
+        let expr = avg(col("orders.amount")).alias("orders.avg_amount");
+        let rewritten = rewrite_for_pre_agg(expr, &map, "pa").unwrap();
+        let text = format!("{rewritten}");
+
+        assert!(text.contains("pa.orders__amount__sum"), "{text}");
+        assert!(text.contains("pa.orders__amount__count"), "{text}");
+        assert!(!text.contains("__sum__sum"), "{text}");
     }
 
     #[test]
