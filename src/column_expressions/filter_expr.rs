@@ -3,6 +3,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+use datafusion::common::Column;
 use datafusion::prelude::{Expr, col, in_list, lit};
 
 use super::column::TableColumn;
@@ -158,30 +159,57 @@ fn value_to_lit_list(arr: Vec<Value>) -> Vec<Expr> {
     arr.into_iter().map(value_to_lit_scalar).collect()
 }
 
-fn operand_to_expr(op: Operand) -> Expr {
+/// How a `{"col": "..."}` operand becomes a column reference.
+///
+/// The two callers of [`to_expr`] target differently shaped schemas, and a dotted
+/// name means opposite things in each — so the constructor is a parameter rather
+/// than a default, and every call site has to say which schema it is building
+/// against.
+type ColumnRef = fn(&str) -> Expr;
+
+/// A table-qualified reference, for filters applied *before* aggregation.
+///
+/// `col` splits on the dot: `"orders.amount"` becomes
+/// `Column { relation: Some("orders"), name: "amount" }`, which is exactly right
+/// against a joined scan, where `orders` is a real relation.
+fn qualified_column(name: &str) -> Expr {
+    col(name)
+}
+
+/// One unqualified column whose *name* contains the dot, for filters applied
+/// *after* aggregation.
+///
+/// `flatten_df` collapses the aggregate's schema to unqualified fields literally
+/// named `"orders.amount"`, so the qualified form above resolves against nothing
+/// there. `sort_exprs` builds post-aggregation references the same way.
+fn flat_column(name: &str) -> Expr {
+    Expr::Column(Column::from_name(name))
+}
+
+fn operand_to_expr(op: Operand, column: ColumnRef) -> Expr {
     match op {
-        Operand::Col { col: name } => col(&name),
+        Operand::Col { col: name } => column(&name),
         Operand::Lit { lit: value } => value_to_lit_scalar(value),
     }
 }
 
-fn to_expr(expr: FilterExpr) -> Expr {
+fn to_expr(expr: FilterExpr, column: ColumnRef) -> Expr {
     match expr {
         FilterExpr::Comparison { left, op, right } => {
-            let l = operand_to_expr(left);
+            let l = operand_to_expr(left, column);
             match op {
-                CompareOp::Eq => l.eq(operand_to_expr(right)),
-                CompareOp::Ne => l.not_eq(operand_to_expr(right)),
-                CompareOp::Gt => l.gt(operand_to_expr(right)),
-                CompareOp::Gte => l.gt_eq(operand_to_expr(right)),
-                CompareOp::Lt => l.lt(operand_to_expr(right)),
-                CompareOp::Lte => l.lt_eq(operand_to_expr(right)),
+                CompareOp::Eq => l.eq(operand_to_expr(right, column)),
+                CompareOp::Ne => l.not_eq(operand_to_expr(right, column)),
+                CompareOp::Gt => l.gt(operand_to_expr(right, column)),
+                CompareOp::Gte => l.gt_eq(operand_to_expr(right, column)),
+                CompareOp::Lt => l.lt(operand_to_expr(right, column)),
+                CompareOp::Lte => l.lt_eq(operand_to_expr(right, column)),
                 CompareOp::In => {
                     let list = match right {
                         Operand::Lit {
                             lit: Value::Array(arr),
                         } => value_to_lit_list(arr),
-                        other => vec![operand_to_expr(other)],
+                        other => vec![operand_to_expr(other, column)],
                     };
                     in_list(l, list, false)
                 }
@@ -190,7 +218,7 @@ fn to_expr(expr: FilterExpr) -> Expr {
                         Operand::Lit {
                             lit: Value::Array(arr),
                         } => value_to_lit_list(arr),
-                        other => vec![operand_to_expr(other)],
+                        other => vec![operand_to_expr(other, column)],
                     };
                     in_list(l, list, true)
                 }
@@ -198,10 +226,14 @@ fn to_expr(expr: FilterExpr) -> Expr {
         }
         FilterExpr::And { and } => and
             .into_iter()
-            .map(to_expr)
+            .map(|e| to_expr(e, column))
             .reduce(|a, b| a.and(b))
             .unwrap(),
-        FilterExpr::Or { or } => or.into_iter().map(to_expr).reduce(|a, b| a.or(b)).unwrap(),
+        FilterExpr::Or { or } => or
+            .into_iter()
+            .map(|e| to_expr(e, column))
+            .reduce(|a, b| a.or(b))
+            .unwrap(),
     }
 }
 
@@ -211,24 +243,32 @@ pub(crate) fn filter_expr_to_df(
     keep_matching: bool,
 ) -> Option<Expr> {
     let pruned = prune(expr, patterns, keep_matching)?;
-    Some(to_expr(pruned))
+    Some(to_expr(pruned, qualified_column))
 }
 
 pub fn filter_to_expr(filter: &Value, patterns: &[&str]) -> Option<Expr> {
     let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
     let pruned = prune(parsed, patterns, true)?;
-    Some(to_expr(pruned))
+    Some(to_expr(pruned, qualified_column))
 }
 
 /// Convert a JSON filter value directly to a DataFusion Expr without schema-based pruning.
 /// Use this for post-aggregation filters (havings) where columns may not exist in any
 /// table schema (e.g. measure output column aliases).
+///
+/// Column references are built flat, because by the time a having is applied
+/// `flatten_df` has already turned the aggregate's schema into unqualified
+/// fields whose names carry the dot. Building them qualified instead — which is
+/// what this did before — left every having on a dotted measure alias or group
+/// column resolving against a relation the flattened schema no longer has, and
+/// the query failed in type coercion with "No field named orders.amount ...
+/// Valid fields are "orders.amount"".
 pub fn json_to_expr(filter: &Value) -> Option<Expr> {
     if filter.is_null() || filter.as_object().is_some_and(|m| m.is_empty()) {
         return None;
     }
     let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
-    Some(to_expr(parsed))
+    Some(to_expr(parsed, flat_column))
 }
 
 /// Extract column names from a raw JSON filter value.
@@ -260,6 +300,7 @@ pub fn collect_col_names(expr: &FilterExpr) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::tree_node::TreeNode;
     use datafusion::prelude::{col, in_list, lit};
     use serde_json::json;
 
@@ -317,5 +358,98 @@ mod tests {
 
         let patterns = &["sales.*"];
         assert_eq!(filter_to_expr(&filter, patterns), None);
+    }
+
+    /// A having is applied after `flatten_df`, where `"orders.amount"` is one
+    /// unqualified field whose name contains a dot — not table `orders`, field
+    /// `amount`. Building it qualified resolves against nothing and the query
+    /// dies in type coercion, which is what every having on a dotted measure
+    /// alias or group column used to do.
+    #[test]
+    fn test_json_to_expr_builds_flat_columns_for_havings() {
+        let having = json!({"left": {"col": "orders.amount"}, "op": ">", "right": {"lit": 500}});
+        let expr = json_to_expr(&having).unwrap();
+
+        let expected = Expr::Column(Column::from_name("orders.amount")).gt(lit(500i64));
+        assert_eq!(expr, expected);
+
+        // Spelled out, because this is the whole bug: no relation, and the dot
+        // stays inside the name.
+        let Expr::BinaryExpr(binary) = &expr else {
+            panic!("expected a comparison, got {expr:?}")
+        };
+        let Expr::Column(column) = binary.left.as_ref() else {
+            panic!("expected a column on the left, got {:?}", binary.left)
+        };
+        assert_eq!(column.relation, None);
+        assert_eq!(column.name, "orders.amount");
+    }
+
+    /// The other half of the same decision: a pre-aggregation filter runs
+    /// against a joined scan, where `orders` really is a relation. Splitting the
+    /// dot is correct there, and must stay that way.
+    #[test]
+    fn test_filter_to_expr_still_builds_qualified_columns() {
+        let filter = json!({"left": {"col": "orders.amount"}, "op": ">", "right": {"lit": 500}});
+        let expr = filter_to_expr(&filter, &["orders.*"]).unwrap();
+        assert_eq!(expr, col("orders.amount").gt(lit(500i64)));
+
+        let Expr::BinaryExpr(binary) = &expr else {
+            panic!("expected a comparison, got {expr:?}")
+        };
+        let Expr::Column(column) = binary.left.as_ref() else {
+            panic!("expected a column on the left, got {:?}", binary.left)
+        };
+        assert_eq!(
+            column.relation.as_ref().map(ToString::to_string),
+            Some("orders".to_string())
+        );
+        assert_eq!(column.name, "amount");
+    }
+
+    /// A dot-free measure alias resolves either way, which is why the existing
+    /// coverage never caught this.
+    #[test]
+    fn test_a_dotless_having_column_is_unaffected() {
+        let having = json!({"left": {"col": "revenue"}, "op": ">", "right": {"lit": 500}});
+        assert_eq!(
+            json_to_expr(&having).unwrap(),
+            col("revenue").gt(lit(500i64))
+        );
+    }
+
+    /// The constructor has to reach every operand, not just the first: nested
+    /// boolean nodes, both sides of a column-to-column comparison, and the
+    /// `in`/`not_in` lists all go through separate arms.
+    #[test]
+    fn test_flat_columns_reach_every_operand_of_a_having() {
+        let having = json!({"and": [
+            {"left": {"col": "orders.amount"}, "op": ">", "right": {"col": "orders.cost"}},
+            {"or": [
+                {"left": {"col": "orders.region"}, "op": "in", "right": {"lit": ["north"]}},
+                {"left": {"col": "orders.region"}, "op": "not_in", "right": {"lit": ["south"]}}
+            ]}
+        ]});
+
+        let mut columns = Vec::new();
+        json_to_expr(&having)
+            .unwrap()
+            .apply(|e| {
+                if let Expr::Column(c) = e {
+                    columns.push((c.relation.as_ref().map(ToString::to_string), c.name.clone()));
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+
+        assert_eq!(columns.len(), 4, "{columns:?}");
+        assert!(
+            columns.iter().all(|(relation, _)| relation.is_none()),
+            "every having column must be unqualified, got {columns:?}"
+        );
+        assert!(
+            columns.iter().all(|(_, name)| name.starts_with("orders.")),
+            "the dot belongs inside the name, got {columns:?}"
+        );
     }
 }

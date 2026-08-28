@@ -154,6 +154,11 @@ async fn build_dm() -> DataModel {
         player_percent_of_team_boost_collected,
     ))
     .unwrap();
+    dm.add_measure(DfMeasure::new(
+        "player_goals_flat_alias",
+        player_goals_flat_alias,
+    ))
+    .unwrap();
     dm
 }
 
@@ -273,6 +278,28 @@ fn player_percent_of_team_boost_collected(
                     / sum(col("team_stats.amount_collected")))
                 .alias("player_percent_of_team_boost_collected"),
             ],
+        )
+        .build()
+}
+
+/// The same sum as `player_goals`, aliased without a dot.
+///
+/// Every other measure here outputs `table.column`, which is the shape that
+/// exposed the havings bug. This one is the control: a bare alias resolves
+/// under either column constructor, so a having on it must keep working —
+/// otherwise a fix for the dotted case has just moved the breakage.
+fn player_goals_flat_alias(
+    dm: &DataModel,
+    qc: &AggContext,
+) -> datafusion::common::Result<DataFrame> {
+    dm.table("player_stats", qc.use_pre_agg)
+        .aggregate(
+            allow(
+                ColumnPattern::OnePattern("*".into()),
+                ColumnContext::MultipleStrings(qc.groups.clone()),
+                ColumnInclude::None,
+            ),
+            vec![sum(col("player_stats.goals")).alias("total_goals")],
         )
         .build()
 }
@@ -1300,4 +1327,220 @@ async fn test_projection_pushdown_through_aggregate_with_metadata() {
         !plan.contains("OnePattern"),
         "raw allow_exclude JSON leaked into plan:\n{plan}"
     );
+}
+
+// ── Havings ───────────────────────────────────────────────────────────────────
+//
+// Every measure here aliases its output as `table.column`, and every group
+// column is qualified, so after `flatten_df` the aggregate's schema is
+// unqualified fields whose *names* contain dots. A having built with `col()`
+// splits that dot back into a relation the flattened schema does not have, and
+// the query fails in type coercion. These run a having end to end, which is the
+// part the unit tests around `AggContext::validate` never reached — validation
+// accepted the column and execution then could not resolve it.
+
+/// Every row of `batches`, as (group, measure) pairs, sorted.
+///
+/// Both columns are cast before reading: DataFusion hands back `Utf8View` for
+/// strings and picks its own width for a sum, and this is a test about which
+/// rows survive, not about physical types.
+fn rows_of(batches: &[RecordBatch], group: &str, measure: &str) -> Vec<(String, f64)> {
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::{DataType, Float64Type};
+
+    let mut out = Vec::new();
+    for batch in batches {
+        let names = cast(batch.column_by_name(group).unwrap(), &DataType::Utf8).unwrap();
+        let names = names.as_string::<i32>();
+        let values = cast(batch.column_by_name(measure).unwrap(), &DataType::Float64).unwrap();
+        let values = values.as_primitive::<Float64Type>();
+        for i in 0..batch.num_rows() {
+            if !names.is_null(i) && !values.is_null(i) {
+                out.push((names.value(i).to_string(), values.value(i)));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    out
+}
+
+/// A cut that provably splits `rows` into a non-empty kept set and a non-empty
+/// dropped one.
+///
+/// Derived from the fixture rather than written in: a hard-coded threshold that
+/// drifts past the data turns a real regression test into one that passes
+/// because the having matched everything.
+fn splitting_threshold(rows: &[(String, f64)]) -> f64 {
+    let mut values: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values.dedup();
+    assert!(
+        values.len() > 1,
+        "fixture needs at least two distinct values to test a having against"
+    );
+    values[values.len() / 2]
+}
+
+fn goals_by_player(havings: Option<serde_json::Value>) -> AggContext {
+    AggContext::new(
+        vec!["player_goals".to_string()],
+        None,
+        Some(vec!["players.player_name".to_string()]),
+        havings,
+        None,
+        None,
+        None,
+        Some(false),
+        None,
+    )
+    .unwrap()
+}
+
+async fn goals_rows(dm: &DataModel, havings: Option<serde_json::Value>) -> Vec<(String, f64)> {
+    rows_of(
+        &dm_query(dm, goals_by_player(havings)).await,
+        "players.player_name",
+        "player_stats.goals",
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_having_on_dotted_measure_alias() {
+    let dm = shared_dm().await;
+    let unfiltered = goals_rows(dm, None).await;
+    let threshold = splitting_threshold(&unfiltered);
+
+    let filtered = goals_rows(
+        dm,
+        Some(serde_json::json!({
+            "left": {"col": "player_stats.goals"}, "op": "gte", "right": {"lit": threshold}
+        })),
+    )
+    .await;
+
+    let expected: Vec<_> = unfiltered
+        .iter()
+        .filter(|(_, goals)| *goals >= threshold)
+        .cloned()
+        .collect();
+    assert_eq!(
+        filtered, expected,
+        "having did not match an in-process filter"
+    );
+
+    // The equality above is also satisfied by a having that matched everything,
+    // so pin both ends.
+    assert!(!filtered.is_empty(), "having kept nobody at {threshold}");
+    assert!(
+        filtered.len() < unfiltered.len(),
+        "having excluded nobody: {} of {} rows at {threshold}",
+        filtered.len(),
+        unfiltered.len()
+    );
+}
+
+/// Group columns are dotted after flattening too, so they took the same path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_having_on_dotted_group_column() {
+    let dm = shared_dm().await;
+    let unfiltered = goals_rows(dm, None).await;
+    let (name, goals) = unfiltered.first().expect("fixture has players").clone();
+    assert!(unfiltered.len() > 1, "fixture needs more than one player");
+
+    let filtered = goals_rows(
+        dm,
+        Some(serde_json::json!({
+            "left": {"col": "players.player_name"}, "op": "eq", "right": {"lit": name}
+        })),
+    )
+    .await;
+
+    assert_eq!(filtered, vec![(name, goals)]);
+}
+
+/// Both halves of one `and`, and an `in` list, to cover the recursion through
+/// boolean nodes and the separate list arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_having_combines_a_measure_and_a_group_column() {
+    let dm = shared_dm().await;
+    let unfiltered = goals_rows(dm, None).await;
+    let threshold = splitting_threshold(&unfiltered);
+
+    // Names spanning the cut, so the two clauses each exclude something.
+    let names: Vec<String> = unfiltered
+        .iter()
+        .map(|(name, _)| name.clone())
+        .take(6)
+        .collect();
+    let expected: Vec<_> = unfiltered
+        .iter()
+        .filter(|(name, goals)| *goals >= threshold && names.contains(name))
+        .cloned()
+        .collect();
+    assert!(
+        !expected.is_empty(),
+        "fixture should leave something for both clauses"
+    );
+
+    let filtered = goals_rows(
+        dm,
+        Some(serde_json::json!({"and": [
+            {"left": {"col": "player_stats.goals"}, "op": "gte", "right": {"lit": threshold}},
+            {"left": {"col": "players.player_name"}, "op": "in", "right": {"lit": names}}
+        ]})),
+    )
+    .await;
+
+    assert_eq!(filtered, expected);
+    assert!(filtered.len() < unfiltered.len(), "having excluded nobody");
+}
+
+/// A measure whose alias carries no dot resolved either way. It is here so a
+/// future change to the column constructor cannot fix the dotted case by
+/// breaking this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_having_on_a_dotless_measure_alias() {
+    let dm = shared_dm().await;
+    let ctx = |havings| {
+        AggContext::new(
+            vec!["player_goals_flat_alias".to_string()],
+            None,
+            Some(vec!["players.player_name".to_string()]),
+            havings,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+        )
+        .unwrap()
+    };
+
+    let unfiltered = rows_of(
+        &dm_query(dm, ctx(None)).await,
+        "players.player_name",
+        "total_goals",
+    );
+    let threshold = splitting_threshold(&unfiltered);
+
+    let filtered = rows_of(
+        &dm_query(
+            dm,
+            ctx(Some(serde_json::json!({
+                "left": {"col": "total_goals"}, "op": "gte", "right": {"lit": threshold}
+            }))),
+        )
+        .await,
+        "players.player_name",
+        "total_goals",
+    );
+
+    let expected: Vec<_> = unfiltered
+        .iter()
+        .filter(|(_, goals)| *goals >= threshold)
+        .cloned()
+        .collect();
+    assert_eq!(filtered, expected);
+    assert!(!filtered.is_empty() && filtered.len() < unfiltered.len());
 }
