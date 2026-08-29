@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use datafusion::prelude::{DataFrame, Expr, col};
 
 use crate::{
-    column_expressions::filter_expr::json_to_expr, model_components::select_context::SelectContext,
+    column_expressions::filter_expr::json_to_expr_qualified,
+    model_components::select_context::SelectContext,
 };
 
 use super::DataModel;
@@ -38,7 +39,10 @@ impl DataModel {
             .map_err(|e| e.to_string())?
             .inner;
 
-        if let Some(filter_expr) = json_to_expr(&vc.filters) {
+        // Qualified, not flat: this filters the joined scan, whose fields are
+        // still qualified by their table. The flat form is for havings, which run
+        // after `flatten_df`.
+        if let Some(filter_expr) = json_to_expr_qualified(&vc.filters) {
             df = df.filter(filter_expr).map_err(|e| e.to_string())?;
         }
 

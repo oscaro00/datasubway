@@ -22,6 +22,7 @@ use datasubway::model_components::{
     joins::{Join, JoinDirection, JoinGraph, JoinHow},
     measures::DfMeasure,
     pre_aggregations::PreAggregation,
+    select_context::SelectContext,
 };
 
 static SHARED_CTX: tokio::sync::OnceCell<SessionContext> = tokio::sync::OnceCell::const_new();
@@ -1543,4 +1544,175 @@ async fn test_having_on_a_dotless_measure_alias() {
         .collect();
     assert_eq!(filtered, expected);
     assert!(!filtered.is_empty() && filtered.len() < unfiltered.len());
+}
+
+// A select filter is the mirror image of a having: `build_select_frame` filters
+// the joined scan *before* it projects, so `games` there is still a real
+// relation and `"games.date"` has to split on the dot. Sharing the having's
+// flat constructor broke every filtered select with "No field named
+// "games.date"", while unfiltered selects kept working — which is why nothing
+// below the API noticed.
+
+fn select_ctx(columns: &[&str], filters: Option<serde_json::Value>) -> SelectContext {
+    SelectContext::new(
+        columns.iter().map(|c| (*c).to_string()).collect(),
+        filters,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+async fn select_rows(
+    dm: &DataModel,
+    columns: &[&str],
+    filters: Option<serde_json::Value>,
+) -> Vec<Vec<String>> {
+    let batches = match dm
+        .execute(&DataQuery::View(select_ctx(columns, filters)))
+        .await
+        .unwrap()
+    {
+        DataOutput::Data(batches) => batches,
+        _ => panic!("expected Data"),
+    };
+    string_rows(&batches, columns)
+}
+
+/// Every row of `batches` as text, one `Vec<String>` per row.
+///
+/// Cast to `Utf8` first: parquet strings arrive as `Utf8View` and the point here
+/// is which rows came back, not how they are laid out.
+fn string_rows(batches: &[RecordBatch], columns: &[&str]) -> Vec<Vec<String>> {
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::DataType;
+
+    let mut out = Vec::new();
+    for batch in batches {
+        let cast_cols: Vec<_> = columns
+            .iter()
+            .map(|c| cast(batch.column_by_name(c).unwrap(), &DataType::Utf8).unwrap())
+            .collect();
+        for i in 0..batch.num_rows() {
+            out.push(
+                cast_cols
+                    .iter()
+                    .map(|c| {
+                        let c = c.as_string::<i32>();
+                        if c.is_null(i) {
+                            String::new()
+                        } else {
+                            c.value(i).to_string()
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A value the fixture holds in `column`, and which does not fill it — so a
+/// filter for it provably keeps some rows and drops others.
+///
+/// Nulls (empty, per [`string_rows`]) are skipped: `= null` matches nothing, so
+/// picking one would make the filter look broken in exactly the way this file
+/// is testing for.
+fn splitting_value(rows: &[Vec<String>], column: usize) -> String {
+    let mut values: Vec<&String> = rows
+        .iter()
+        .map(|r| &r[column])
+        .filter(|v| !v.is_empty())
+        .collect();
+    values.sort();
+    values.dedup();
+    assert!(
+        values.len() > 1,
+        "fixture needs at least two distinct non-null values in column {column} to filter on"
+    );
+    values[0].clone()
+}
+
+/// The failing case: the filter column comes from a table joined onto the base.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_select_filter_on_a_joined_table_column() {
+    let dm = shared_dm().await;
+    let columns = &[
+        "team_stats.game_id",
+        "team_stats.team_name",
+        "games.map_name",
+    ];
+
+    let unfiltered = select_rows(dm, columns, None).await;
+    let map = splitting_value(&unfiltered, 2);
+
+    let filtered = select_rows(
+        dm,
+        columns,
+        Some(serde_json::json!({
+            "left": {"col": "games.map_name"}, "op": "eq", "right": {"lit": map}
+        })),
+    )
+    .await;
+
+    let expected: Vec<_> = unfiltered
+        .iter()
+        .filter(|row| row[2] == map)
+        .cloned()
+        .collect();
+    assert_eq!(filtered, expected);
+    assert!(!filtered.is_empty(), "filter kept nothing for map {map}");
+    assert!(
+        filtered.len() < unfiltered.len(),
+        "filter excluded nothing: {} of {} rows",
+        filtered.len(),
+        unfiltered.len()
+    );
+}
+
+/// The base table's own columns take the same path, and a nested tree has to
+/// reach every operand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_select_filter_on_the_base_table_and_through_a_boolean_node() {
+    let dm = shared_dm().await;
+    let columns = &[
+        "team_stats.game_id",
+        "team_stats.team_name",
+        "games.map_name",
+    ];
+
+    let unfiltered = select_rows(dm, columns, None).await;
+    let team = splitting_value(&unfiltered, 1);
+    let maps: Vec<String> = {
+        let mut maps: Vec<String> = unfiltered
+            .iter()
+            .filter(|row| row[1] == team)
+            .map(|row| row[2].clone())
+            .collect();
+        maps.sort();
+        maps.dedup();
+        maps
+    };
+
+    let filtered = select_rows(
+        dm,
+        columns,
+        Some(serde_json::json!({"and": [
+            {"left": {"col": "team_stats.team_name"}, "op": "eq", "right": {"lit": team}},
+            {"left": {"col": "games.map_name"}, "op": "in", "right": {"lit": maps}}
+        ]})),
+    )
+    .await;
+
+    let expected: Vec<_> = unfiltered
+        .iter()
+        .filter(|row| row[1] == team && maps.contains(&row[2]))
+        .cloned()
+        .collect();
+    assert_eq!(filtered, expected);
+    assert!(!filtered.is_empty(), "filter kept nothing for team {team}");
+    assert!(filtered.len() < unfiltered.len(), "filter excluded nothing");
 }

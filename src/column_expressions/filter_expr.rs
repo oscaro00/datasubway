@@ -252,6 +252,11 @@ pub fn filter_to_expr(filter: &Value, patterns: &[&str]) -> Option<Expr> {
     Some(to_expr(pruned, qualified_column))
 }
 
+/// A filter value that carries no filter: `null`, or `{}`.
+fn is_empty_filter(filter: &Value) -> bool {
+    filter.is_null() || filter.as_object().is_some_and(|m| m.is_empty())
+}
+
 /// Convert a JSON filter value directly to a DataFusion Expr without schema-based pruning.
 /// Use this for post-aggregation filters (havings) where columns may not exist in any
 /// table schema (e.g. measure output column aliases).
@@ -264,11 +269,26 @@ pub fn filter_to_expr(filter: &Value, patterns: &[&str]) -> Option<Expr> {
 /// the query failed in type coercion with "No field named orders.amount ...
 /// Valid fields are "orders.amount"".
 pub fn json_to_expr(filter: &Value) -> Option<Expr> {
-    if filter.is_null() || filter.as_object().is_some_and(|m| m.is_empty()) {
+    if is_empty_filter(filter) {
         return None;
     }
     let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
     Some(to_expr(parsed, flat_column))
+}
+
+/// The same conversion, against a schema that has *not* been flattened.
+///
+/// `build_select_frame` filters the joined scan before it projects, so `games`
+/// there is a real relation and `"games.date"` has to split on the dot — the
+/// opposite of what a having needs. The two cases share everything but that one
+/// decision, so they are two entry points over one builder rather than a flag
+/// callers could forget to set.
+pub fn json_to_expr_qualified(filter: &Value) -> Option<Expr> {
+    if is_empty_filter(filter) {
+        return None;
+    }
+    let parsed: FilterExpr = serde_json::from_value(filter.clone()).ok()?;
+    Some(to_expr(parsed, qualified_column))
 }
 
 /// Extract column names from a raw JSON filter value.
@@ -405,6 +425,38 @@ mod tests {
             Some("orders".to_string())
         );
         assert_eq!(column.name, "amount");
+    }
+
+    /// A select filter runs before the projection, against the joined scan —
+    /// the same shape a pre-aggregation filter sees, and the opposite of a
+    /// having. It must keep splitting the dot.
+    #[test]
+    fn test_json_to_expr_qualified_builds_qualified_columns_for_select_filters() {
+        let filter = json!({"left": {"col": "orders.amount"}, "op": ">", "right": {"lit": 500}});
+        let expr = json_to_expr_qualified(&filter).unwrap();
+        assert_eq!(expr, col("orders.amount").gt(lit(500i64)));
+
+        let Expr::BinaryExpr(binary) = &expr else {
+            panic!("expected a comparison, got {expr:?}")
+        };
+        let Expr::Column(column) = binary.left.as_ref() else {
+            panic!("expected a column on the left, got {:?}", binary.left)
+        };
+        assert_eq!(
+            column.relation.as_ref().map(ToString::to_string),
+            Some("orders".to_string())
+        );
+        assert_eq!(column.name, "amount");
+    }
+
+    /// Both entry points share the empty guard, so an absent filter stays absent
+    /// rather than becoming a filter that matches nothing.
+    #[test]
+    fn test_an_empty_filter_yields_no_expression_either_way() {
+        for filter in [json!(null), json!({})] {
+            assert_eq!(json_to_expr(&filter), None);
+            assert_eq!(json_to_expr_qualified(&filter), None);
+        }
     }
 
     /// A dot-free measure alias resolves either way, which is why the existing
