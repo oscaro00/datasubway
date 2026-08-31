@@ -25,17 +25,25 @@ use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Fields, Schema, SchemaRef};
-use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
-use datafusion::common::Constraints;
+use datafusion::catalog::{ScanArgs, ScanResult, SchemaProvider, Session, TableProvider};
+use datafusion::common::{Constraints, DataFusionError};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::sql::TableReference;
 use tracing::debug;
 
-use crate::model_components::pre_aggregations::PreAggregation;
+use crate::model_components::pre_aggregations::{
+    META_COMPONENT, META_LOGICAL_COL, PreAggregation, physical_col_name,
+};
+
+/// The schema every pre-aggregation is registered under, keeping them in a
+/// namespace of their own: a pre-agg named `orders` is `pre_agg.orders`, which
+/// cannot collide with a source table named `orders` in the default schema.
+pub const PRE_AGG_SCHEMA: &str = "pre_agg";
 
 /// Default time a superseded version is kept even once its refcount says it is
 /// unreferenced. Safe to set to zero for a single-process deployment — the
@@ -46,6 +54,75 @@ pub const DEFAULT_RETIRED_GRACE: Duration = Duration::from_secs(60);
 /// Default time an untracked versioned file (left by a crash, or written by
 /// another process) is kept before being swept.
 pub const DEFAULT_ORPHAN_GRACE: Duration = Duration::from_secs(3600);
+
+// ── PreAggColumns ─────────────────────────────────────────────────────────────
+
+/// The mapping from a logical column (plus an optional aggregate component) to
+/// the physical field that holds it in one pre-aggregation file.
+///
+/// Built from the Arrow field metadata written by `write_pre_agg`, so a read is
+/// a lookup rather than a re-derivation of the dunder encoding. That encoding is
+/// still what the fields are *named* — an EXPLAIN over a pre-agg stays readable —
+/// but it is lossy, and reconstructing a logical column from it can land on the
+/// wrong field (see the naming notes in `pre_aggregations.rs`).
+#[derive(Debug, Default)]
+pub struct PreAggColumns {
+    /// (logical qualified column, component) → physical field name.
+    by_logical: HashMap<(String, Option<String>), String>,
+}
+
+impl PreAggColumns {
+    /// Read the identity metadata off a pre-agg file's Arrow schema.
+    fn from_schema(schema: &Schema) -> Self {
+        let by_logical = schema
+            .fields()
+            .iter()
+            .filter_map(|f| {
+                let logical = f.metadata().get(META_LOGICAL_COL)?;
+                let component = f.metadata().get(META_COMPONENT).cloned();
+                Some(((logical.clone(), component), f.name().clone()))
+            })
+            .collect();
+        PreAggColumns { by_logical }
+    }
+
+    /// The physical field holding `qualified_col` (its `component`, if given).
+    ///
+    /// Falls back to the dunder derivation when the file carries no metadata for
+    /// the column, so pre-agg files written before identity metadata existed keep
+    /// resolving exactly as they did. Those files retain the ambiguity the
+    /// metadata removes; rewriting them fixes it.
+    pub fn physical(&self, qualified_col: &str, component: Option<&str>) -> String {
+        let key = (qualified_col.to_string(), component.map(str::to_string));
+        match self.by_logical.get(&key) {
+            Some(name) => name.clone(),
+            None => physical_col_name(qualified_col, component),
+        }
+    }
+}
+
+/// One pre-aggregation as a rewrite target: where its `TableScan` sits, and how
+/// to name a physical column on it.
+///
+/// Column references are built with `Column::new` and never from a dotted string.
+/// The relation here is a two-part `pre_agg.<name>` and the physical field names
+/// contain `__`, so `"pre_agg.daily.orders__amount__sum"` fed through
+/// `from_qualified_name` would split in the wrong places.
+pub struct PreAggTarget<'a> {
+    pub table: TableReference,
+    pub columns: &'a PreAggColumns,
+}
+
+impl PreAggTarget<'_> {
+    /// A reference to the physical field holding `qualified_col` (its `component`,
+    /// if given) on this pre-agg's scan.
+    pub fn col_expr(&self, qualified_col: &str, component: Option<&str>) -> Expr {
+        Expr::Column(datafusion::common::Column::new(
+            Some(self.table.clone()),
+            self.columns.physical(qualified_col, component),
+        ))
+    }
+}
 
 // ── PreAggVersion ─────────────────────────────────────────────────────────────
 
@@ -61,6 +138,8 @@ pub struct PreAggVersion {
     pub path: PathBuf,
     pub row_count: u64,
     pub written_at: SystemTime,
+    /// Logical column → physical field, read from the file's own schema.
+    columns: PreAggColumns,
     inner: ListingTable,
 }
 
@@ -80,10 +159,16 @@ impl PreAggVersion {
     /// count and the Arrow schema, so the `ListingTable` is built without schema
     /// inference — no async, no blocking listing on the query path.
     pub(crate) fn open(name: &str, path: PathBuf) -> Result<Self, String> {
-        let (row_count, schema) = read_footer(&path)?;
+        let (row_count, file_schema) = read_footer(&path)?;
         let written_at = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .unwrap_or_else(|_| SystemTime::now());
+
+        // Read the identity metadata before it is stripped: `ListingTable` must be
+        // handed a schema that matches what `ParquetFormat` infers at scan time,
+        // and that inference defaults to `skip_metadata = true`.
+        let columns = PreAggColumns::from_schema(&file_schema);
+        let schema = strip_field_metadata(&file_schema);
 
         let url = ListingTableUrl::parse(path.to_string_lossy())
             .map_err(|e| format!("bad pre-agg path '{}': {e}", path.display()))?;
@@ -101,6 +186,7 @@ impl PreAggVersion {
             path,
             row_count,
             written_at,
+            columns,
             inner,
         })
     }
@@ -108,6 +194,24 @@ impl PreAggVersion {
     /// How long ago this version was written, per the file's mtime.
     pub fn age(&self) -> Duration {
         self.written_at.elapsed().unwrap_or_default()
+    }
+
+    /// The logical → physical column mapping for this file.
+    pub fn columns(&self) -> &PreAggColumns {
+        &self.columns
+    }
+
+    /// How this version is addressed in a plan: `pre_agg.<name>`.
+    pub fn table_ref(&self) -> TableReference {
+        TableReference::partial(PRE_AGG_SCHEMA, self.name.clone())
+    }
+
+    /// This version as a rewrite target for `rewrite_*_for_pre_agg`.
+    pub fn target(&self) -> PreAggTarget<'_> {
+        PreAggTarget {
+            table: self.table_ref(),
+            columns: &self.columns,
+        }
     }
 }
 
@@ -180,12 +284,22 @@ pub(crate) fn version_of_filename(name: &str, filename: &str) -> Option<u128> {
         .ok()
 }
 
+/// Drop every field's metadata, matching `ParquetFormat`'s own inference, which
+/// defaults to `skip_metadata = true`. Handing `ListingTable` a schema that still
+/// carried metadata would make it disagree with the file schema seen at scan time.
+fn strip_field_metadata(schema: &Schema) -> SchemaRef {
+    Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_metadata(Default::default()))
+            .collect::<Fields>(),
+    ))
+}
+
 /// Reads a parquet file's (or directory of parquet parts') footer to return the
-/// total row count and the Arrow schema.
-///
-/// Field metadata is cleared to match `ParquetFormat`'s own inference, which
-/// defaults to `skip_metadata = true`; leaving it on would make the schema we
-/// hand `ListingTable` disagree with the file schema it sees at scan time.
+/// total row count and the Arrow schema, field metadata intact — the pre-agg
+/// identity tags live there and are read out before the schema is stripped.
 fn read_footer(path: &Path) -> Result<(u64, SchemaRef), String> {
     // Via DataFusion's re-export rather than a direct `parquet` dependency:
     // a separately-versioned parquet crate pulls in its own arrow stack, and
@@ -220,14 +334,7 @@ fn read_footer(path: &Path) -> Result<(u64, SchemaRef), String> {
         read_one(path)?
     };
 
-    let cleared = Schema::new(
-        schema
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone().with_metadata(Default::default()))
-            .collect::<Fields>(),
-    );
-    Ok((rows.max(0) as u64, Arc::new(cleared)))
+    Ok((rows.max(0) as u64, schema))
 }
 
 /// Reads the pointer file for a pre-agg and returns the full path to the current
@@ -501,6 +608,54 @@ impl PreAggStore {
     }
 }
 
+// ── SchemaProvider ────────────────────────────────────────────────────────────
+
+/// Exposes the store's currently-published versions as the tables of a `pre_agg`
+/// schema, so `SELECT * FROM pre_agg.daily_revenue` and `SHOW TABLES` see what
+/// the optimizer is substituting. Resolution is always to whatever version is
+/// current at the moment of the lookup.
+///
+/// Only `covering_versions` picks a *specific* version for a rewritten measure —
+/// that path cannot go through name resolution, because it chooses between
+/// candidates on coverage and row count. This provider is the by-name door in.
+pub(crate) struct PreAggSchemaProvider(pub(crate) Arc<PreAggStore>);
+
+impl fmt::Debug for PreAggSchemaProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreAggSchemaProvider")
+            .field("tables", &self.table_names())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for PreAggSchemaProvider {
+    /// Only definitions with a version actually on disk. A registered pre-agg
+    /// that has never been written is not a table you can select from.
+    fn table_names(&self) -> Vec<String> {
+        let state = self.0.state.read().unwrap();
+        let mut names: Vec<String> = state.current.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        let version = self.0.state.read().unwrap().current.get(name).cloned();
+        Ok(version.map(|v| {
+            // Pins the version if a `LeaseScope` is open on this thread. SQL
+            // planning is async and generally is not inside one, so `DataModel::sql`
+            // pins from the finished plan instead — this covers a resolution that
+            // does happen during synchronous plan building.
+            record_lease(&v);
+            v as Arc<dyn TableProvider>
+        }))
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.0.state.read().unwrap().current.contains_key(name)
+    }
+}
+
 // ── Query lease scope ─────────────────────────────────────────────────────────
 //
 // Measures are `fn(&DataModel, &AggContext) -> Result<DataFrame>` and call
@@ -580,4 +735,69 @@ pub(crate) fn record_lease(version: &Arc<PreAggVersion>) {
 /// The staleness bound the active query asked for, if any.
 pub(crate) fn active_max_age() -> Option<u64> {
     ACTIVE.with(|cell| cell.borrow().as_ref().and_then(|a| a.max_age))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use std::collections::BTreeMap;
+
+    fn tagged(name: &str, logical: &str, component: Option<&str>) -> Field {
+        let mut meta = BTreeMap::from([(META_LOGICAL_COL.to_string(), logical.to_string())]);
+        if let Some(c) = component {
+            meta.insert(META_COMPONENT.to_string(), c.to_string());
+        }
+        Field::new(name, DataType::Int64, true).with_metadata(meta.into_iter().collect())
+    }
+
+    #[test]
+    fn columns_resolve_from_metadata_not_from_the_name() {
+        // Physical names deliberately unrelated to the dunder derivation: if the
+        // lookup were still deriving them, neither of these would be found.
+        let schema = Schema::new(vec![
+            tagged("c0", "players.player_name", None),
+            tagged("c1", "player_stats.goals", Some("sum")),
+        ]);
+        let cols = PreAggColumns::from_schema(&schema);
+
+        assert_eq!(cols.physical("players.player_name", None), "c0");
+        assert_eq!(cols.physical("player_stats.goals", Some("sum")), "c1");
+    }
+
+    #[test]
+    fn columns_distinguish_a_component_from_a_same_named_group_by_key() {
+        // `t.goals__sum` as a group-by key and the `sum` component of `t.goals`
+        // both derive to `t__goals__sum`; the metadata keeps them apart.
+        let schema = Schema::new(vec![
+            tagged("key", "t.goals__sum", None),
+            tagged("comp", "t.goals", Some("sum")),
+        ]);
+        let cols = PreAggColumns::from_schema(&schema);
+
+        assert_eq!(cols.physical("t.goals__sum", None), "key");
+        assert_eq!(cols.physical("t.goals", Some("sum")), "comp");
+    }
+
+    #[test]
+    fn columns_fall_back_to_the_dunder_derivation_when_untagged() {
+        // A file written before identity metadata existed carries none, and must
+        // keep resolving exactly as it did.
+        let schema = Schema::new(vec![
+            Field::new("players__player_name", DataType::Utf8, true),
+            Field::new("player_stats__goals__sum", DataType::Int64, true),
+        ]);
+        let cols = PreAggColumns::from_schema(&schema);
+
+        assert_eq!(
+            cols.physical("players.player_name", None),
+            "players__player_name"
+        );
+        assert_eq!(
+            cols.physical("player_stats.goals", Some("sum")),
+            "player_stats__goals__sum"
+        );
+    }
 }

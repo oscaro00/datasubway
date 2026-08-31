@@ -4,11 +4,12 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
-use datafusion::datasource::provider_as_source;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::datasource::{provider_as_source, source_as_provider};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::ExplainOption;
-use datafusion::logical_expr::{JoinType, LogicalPlanBuilder};
-use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::logical_expr::{JoinType, LogicalPlan, LogicalPlanBuilder};
+use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use tracing::debug;
 
 use crate::model_components::{
@@ -18,7 +19,10 @@ use crate::model_components::{
     measures::{
         DfMeasure, MeasureMetadata, extract_df_measure_metadata, validate_df_measure_structure,
     },
-    pre_agg_store::{LeaseScope, PreAggStore, PreAggVersion, active_max_age, record_lease},
+    pre_agg_store::{
+        LeaseScope, PRE_AGG_SCHEMA, PreAggSchemaProvider, PreAggStore, PreAggVersion,
+        active_max_age, record_lease,
+    },
     pre_aggregations::{PreAggregation, agg_needed_components},
     select_context::SelectContext,
 };
@@ -84,6 +88,10 @@ impl DataModel {
     ) -> DataModel {
         let state = SessionStateBuilder::new_with_default_features()
             .with_query_planner(Arc::new(AggregateWithMetadataPlanner))
+            // So `information_schema.tables` and `SHOW TABLES` can see what is
+            // registered — the point of giving pre-aggs a schema of their own is
+            // being able to enumerate and query them.
+            .with_config(SessionConfig::new().with_information_schema(true))
             .build();
         let ctx = SessionContext::new_with_state(state);
 
@@ -105,6 +113,23 @@ impl DataModel {
             (false, Some(path)) => Some(Arc::new(PreAggStore::load(path.into(), pre_aggs))),
             _ => None,
         };
+
+        // Pre-aggs get a schema of their own rather than sitting alongside the
+        // source tables, so a pre-agg and a table may share a name without their
+        // `TableScan`s sharing a qualifier. It also makes them addressable:
+        // `SELECT * FROM pre_agg.<name>` returns whatever version is current.
+        if let Some(store) = &pre_agg_store {
+            let default_catalog = ctx.state().config_options().catalog.default_catalog.clone();
+            let catalog = ctx
+                .catalog(&default_catalog)
+                .unwrap_or_else(|| panic!("default catalog '{default_catalog}' not registered"));
+            catalog
+                .register_schema(
+                    PRE_AGG_SCHEMA,
+                    Arc::new(PreAggSchemaProvider(Arc::clone(store))),
+                )
+                .unwrap_or_else(|e| panic!("failed to register '{PRE_AGG_SCHEMA}' schema: {e}"));
+        }
 
         DataModel(Arc::new(DataModelInner {
             ctx,
@@ -198,6 +223,33 @@ impl DataModel {
             .map_err(|e| format!("execution failed: {e}"))
     }
 
+    /// Run SQL against this model's session.
+    ///
+    /// Source tables are addressable by their registered name; pre-aggregations
+    /// live in the `pre_agg` schema (`SELECT * FROM pre_agg.daily_revenue`) and
+    /// resolve to whichever version is current, over the physical column names.
+    /// Mainly a window onto what the optimizer is substituting — the measure path
+    /// does not go through here.
+    pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>, String> {
+        let df = self
+            .0
+            .ctx
+            .sql(query)
+            .await
+            .map_err(|e| format!("sql failed: {e}"))?;
+
+        // Planning is async here, so the thread-local `LeaseScope` the DataFrame
+        // path relies on cannot span it. Pin the versions straight out of the plan
+        // that resolution just built instead, and hold them across `collect()` —
+        // the physical plan carries file paths, not providers, so past this point
+        // nothing else keeps the files from being reclaimed.
+        let _leases = pre_agg_providers(df.logical_plan());
+
+        df.collect()
+            .await
+            .map_err(|e| format!("execution failed: {e}"))
+    }
+
     pub fn explain(&self, q: &DataQuery, options: ExplainOption) -> Result<DataFrame, String> {
         let scope = LeaseScope::enter(query_max_age(q));
         let df = self.build_frame(q);
@@ -269,8 +321,7 @@ impl DataModel {
                     Ok(df) => {
                         return Ok(DataFrameWrapper {
                             inner: df,
-                            from_pre_agg: true,
-                            pre_agg_name: Some(version.name.clone()),
+                            pre_agg: Some(version),
                         });
                     }
                     Err(e) => {
@@ -317,24 +368,25 @@ impl DataModel {
 
         Ok(DataFrameWrapper {
             inner: df,
-            from_pre_agg: false,
-            pre_agg_name: None,
+            pre_agg: None,
         })
     }
 
     /// Scan one pinned pre-aggregation version, pinning it for the active query.
     ///
-    /// The version is its own `TableProvider`, so this produces a `TableScan`
-    /// qualified by the pre-agg name over the dunder-encoded physical columns —
-    /// the same schema shape the old `SubqueryAlias(read_parquet(..), name)`
-    /// splice produced, which is what `rewrite_*_for_pre_agg` expects.
+    /// Scans the version directly rather than resolving `pre_agg.<name>` through
+    /// the schema provider: `covering_versions` has already chosen between
+    /// candidates on coverage and row count, and name resolution would only ever
+    /// hand back the current one. The `TableScan` still carries the `pre_agg.<name>`
+    /// qualifier that resolution would produce, so a column reference reads the
+    /// same either way — and `rewrite_*_for_pre_agg` builds exactly that.
     pub(crate) fn scan_pre_agg(
         &self,
         version: &Arc<PreAggVersion>,
     ) -> datafusion::common::Result<DataFrame> {
         record_lease(version);
         let source = provider_as_source(Arc::clone(version) as Arc<dyn TableProvider>);
-        let plan = LogicalPlanBuilder::scan(version.name.as_str(), source, None)?.build()?;
+        let plan = LogicalPlanBuilder::scan(version.table_ref(), source, None)?.build()?;
         Ok(DataFrame::new(self.0.ctx.state(), plan))
     }
 
@@ -349,6 +401,23 @@ impl DataModel {
         let plan = LogicalPlanBuilder::scan(table_name, source, None)?.build()?;
         Ok(DataFrame::new(self.0.ctx.state(), plan))
     }
+}
+
+/// Every pre-aggregation version a plan scans, as `Arc`s that pin the underlying
+/// files: `PreAggStore::reclaim` deletes a retired version only once its strong
+/// count proves nobody holds it, so holding these is holding the files.
+fn pre_agg_providers(plan: &LogicalPlan) -> Vec<Arc<dyn TableProvider>> {
+    let mut out = Vec::new();
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && provider.as_ref().downcast_ref::<PreAggVersion>().is_some()
+        {
+            out.push(provider);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    out
 }
 
 /// The staleness bound a query places on any pre-aggregation it accepts.

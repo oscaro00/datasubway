@@ -1,31 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use datafusion::common::Column;
 use datafusion::functions_aggregate::expr_fn::{max, min};
-use datafusion::logical_expr::Expr;
 use datafusion::prelude::{DataFrame, col};
-use datafusion::sql::TableReference;
 use tracing::{debug, trace};
 
 use crate::model_components::column_values_context::{ColumnValuesContext, ColumnValuesMode};
 use crate::model_components::pre_agg_store::PreAggVersion;
-use crate::model_components::pre_aggregations::{pre_agg_component_col_name, to_pre_agg_col_name};
 
 use super::DataModel;
-
-/// Reference a physical pre-agg column on a scan of `version`.
-///
-/// The scan is a `TableScan` qualified by the pre-agg name, so the dunder-encoded
-/// physical field must be addressed as `<pre_agg>.<physical>`. Built through
-/// `Column::new` rather than a dotted string because the physical names contain
-/// `__`, not `.`, and string parsing would split on the wrong separator.
-fn pre_agg_col(version: &PreAggVersion, physical: &str) -> Expr {
-    Expr::Column(Column::new(
-        Some(TableReference::bare(version.name.clone())),
-        physical,
-    ))
-}
 
 impl DataModel {
     pub(super) fn build_column_values_frame(
@@ -90,15 +73,12 @@ impl DataModel {
                 continue 'candidates;
             };
 
-            // Group-by columns are stored dunder-encoded on disk (write_pre_agg
-            // aliases via to_pre_agg_col_name). Select the physical column, then
+            // Select the physical field the version says holds this column, then
             // alias back to the logical dotted name so pre-agg- and raw-table-
             // sourced output share an identical output schema.
-            let physical = to_pre_agg_col_name(&ctx.column);
+            let stored = version.target().col_expr(&ctx.column, None);
             if let Ok(df) = df
-                .select(vec![
-                    pre_agg_col(&version, &physical).alias(ctx.column.as_str()),
-                ])
+                .select(vec![stored.alias(ctx.column.as_str())])
                 .and_then(|d| d.distinct())
             {
                 return Some(df);
@@ -151,28 +131,25 @@ impl DataModel {
                 continue 'candidates;
             };
 
+            let target = version.target();
             let agg_result = match source {
+                // A group-by key holds raw values, so min/max are taken over the
+                // stored column itself; an aggregation entry already holds the
+                // per-group extremes, so they are rolled up component-wise.
                 Source::GroupBy => {
-                    let physical = to_pre_agg_col_name(&ctx.column);
+                    let stored = target.col_expr(&ctx.column, None);
                     df.aggregate(
                         vec![],
-                        vec![
-                            min(pre_agg_col(&version, &physical)).alias("min"),
-                            max(pre_agg_col(&version, &physical)).alias("max"),
-                        ],
+                        vec![min(stored.clone()).alias("min"), max(stored).alias("max")],
                     )
                 }
-                Source::Aggregation => {
-                    let min_col = pre_agg_component_col_name(&ctx.column, "min");
-                    let max_col = pre_agg_component_col_name(&ctx.column, "max");
-                    df.aggregate(
-                        vec![],
-                        vec![
-                            min(pre_agg_col(&version, &min_col)).alias("min"),
-                            max(pre_agg_col(&version, &max_col)).alias("max"),
-                        ],
-                    )
-                }
+                Source::Aggregation => df.aggregate(
+                    vec![],
+                    vec![
+                        min(target.col_expr(&ctx.column, Some("min"))).alias("min"),
+                        max(target.col_expr(&ctx.column, Some("max"))).alias("max"),
+                    ],
+                ),
             };
 
             if let Ok(df) = agg_result {

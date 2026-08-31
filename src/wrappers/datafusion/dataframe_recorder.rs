@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use datafusion::common::Column;
 use datafusion::logical_expr::{JoinType, SortExpr};
 use datafusion::prelude::{DataFrame, Expr};
 
@@ -253,8 +254,10 @@ impl DataFrameRecorder {
             self.pre_agg_allowed,
         )?;
 
-        let from_pre_agg = base.from_pre_agg;
-        let pre_agg_name = base.pre_agg_name.clone().unwrap_or_default();
+        // Borrowed for the length of the rewrite; `base.inner` is moved into the
+        // frame below, but the version itself stays alive here (and its `Arc` keeps
+        // the file from being reclaimed).
+        let target = base.pre_agg.as_ref().map(|v| v.target());
         let alias_map = self.alias_map.clone();
         let allow_exclude_records = self.allow_exclude_records.clone();
 
@@ -263,10 +266,9 @@ impl DataFrameRecorder {
         for op in self.ops {
             mdf = match op {
                 DataFrameOp::Filter(pred) => {
-                    let pred = if from_pre_agg {
-                        rewrite_expr_for_pre_agg(pred, &alias_map, &pre_agg_name)?
-                    } else {
-                        pred
+                    let pred = match &target {
+                        Some(t) => rewrite_expr_for_pre_agg(pred, &alias_map, t)?,
+                        None => pred,
                     };
                     mdf.filter(pred)?
                 }
@@ -284,7 +286,7 @@ impl DataFrameRecorder {
                 }
 
                 DataFrameOp::WithColumns(exprs) => {
-                    if from_pre_agg {
+                    if target.is_some() {
                         mdf
                     } else {
                         mdf.with_columns(exprs)?
@@ -295,21 +297,18 @@ impl DataFrameRecorder {
                     group_expr,
                     aggr_expr,
                 } => {
-                    let final_group = if from_pre_agg {
-                        group_expr
-                            .into_iter()
-                            .map(|e| rewrite_group_for_pre_agg(e, &alias_map, &pre_agg_name))
-                            .collect()
-                    } else {
-                        group_expr
-                    };
-                    let final_aggr = if from_pre_agg {
-                        aggr_expr
-                            .into_iter()
-                            .map(|e| rewrite_for_pre_agg(e, &alias_map, &pre_agg_name))
-                            .collect::<datafusion::common::Result<Vec<_>>>()?
-                    } else {
-                        aggr_expr
+                    let (final_group, final_aggr) = match &target {
+                        Some(t) => (
+                            group_expr
+                                .into_iter()
+                                .map(|e| rewrite_group_for_pre_agg(e, &alias_map, t))
+                                .collect(),
+                            aggr_expr
+                                .into_iter()
+                                .map(|e| rewrite_for_pre_agg(e, &alias_map, t))
+                                .collect::<datafusion::common::Result<Vec<_>>>()?,
+                        ),
+                        None => (group_expr, aggr_expr),
                     };
 
                     let ae_json = serde_json::to_string(&allow_exclude_records).unwrap_or_default();
@@ -334,30 +333,31 @@ impl DataFrameRecorder {
                     select_expr,
                     sort_expr,
                 } => {
-                    let (on_expr, select_expr) = if from_pre_agg {
-                        (
+                    let (on_expr, select_expr) = match &target {
+                        Some(t) => (
                             on_expr
                                 .into_iter()
-                                .map(|e| rewrite_expr_for_pre_agg(e, &alias_map, &pre_agg_name))
+                                .map(|e| rewrite_expr_for_pre_agg(e, &alias_map, t))
                                 .collect::<datafusion::common::Result<Vec<_>>>()?,
                             select_expr
                                 .into_iter()
-                                .map(|e| rewrite_expr_for_pre_agg(e, &alias_map, &pre_agg_name))
+                                .map(|e| rewrite_expr_for_pre_agg(e, &alias_map, t))
                                 .collect::<datafusion::common::Result<Vec<_>>>()?,
-                        )
-                    } else {
-                        (on_expr, select_expr)
+                        ),
+                        None => (on_expr, select_expr),
                     };
                     mdf.distinct_on(on_expr, select_expr, sort_expr)?
                 }
 
                 DataFrameOp::DropColumns(cols) => {
-                    let cols = if from_pre_agg {
-                        cols.iter()
-                            .map(|c| rewrite_col_name_for_pre_agg(c, &alias_map, &pre_agg_name))
-                            .collect()
-                    } else {
-                        cols
+                    let cols: Vec<Column> = match &target {
+                        Some(t) => cols
+                            .iter()
+                            .map(|c| rewrite_col_name_for_pre_agg(c, &alias_map, t))
+                            .collect(),
+                        // `Column::from` on a `String` is `from_qualified_name`,
+                        // which is what `DataFrame::drop_columns` applied anyway.
+                        None => cols.into_iter().map(Column::from).collect(),
                     };
                     mdf.drop_columns(cols)?
                 }

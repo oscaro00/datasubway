@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DFSchemaRef, Result};
+use datafusion::common::{Column, DFSchemaRef, Result};
 use datafusion::execution::context::{QueryPlanner, SessionState};
 use datafusion::logical_expr::{
     Extension, LogicalPlan, LogicalPlanBuilder, SortExpr, UserDefinedLogicalNode,
@@ -282,7 +282,7 @@ impl MetadataDataFrame {
         Ok(Self(self.0.distinct_on(on_expr, select_expr, sort_expr)?))
     }
 
-    pub fn drop_columns(self, columns: Vec<String>) -> Result<Self> {
+    pub fn drop_columns(self, columns: Vec<Column>) -> Result<Self> {
         Ok(Self(self.0.drop_columns(&columns)?))
     }
 

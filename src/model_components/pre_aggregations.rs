@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use datafusion::common::metadata::FieldMetadata;
 use datafusion::prelude::col;
 
 use crate::data_model::DataModel;
@@ -47,11 +48,28 @@ pub fn agg_expansion(agg_name: &str) -> Result<Vec<&'static str>, String> {
     Ok(kind.components().to_vec())
 }
 
-/// Returns the column name for a pre-agg component stored in parquet.
-/// e.g. ("orders.amount", "sum") → "orders.amount-sum"
-pub fn component_col_name(col: &str, component: &str) -> String {
-    format!("{col}-{component}")
-}
+// ── Physical column naming ────────────────────────────────────────────────────
+//
+// A pre-agg is one denormalized post-join parquet file, so every column it holds
+// shares a single scan qualifier and the source table has to live inside the
+// column *name*. The dunder encoding below does that, and it is what an EXPLAIN
+// shows — but it is deliberately no longer the authoritative mapping back to the
+// logical column. That lives in Arrow field metadata (see [`identity_metadata`]),
+// because the encoding is not injective: table `a` column `b__c` and table `a__b`
+// column `c` both render as `a__b__c`, and a source column literally named
+// `goals__sum` is indistinguishable from the `sum` component of `goals`.
+//
+// [`PreAggregation::new`] rejects a definition whose physical names collide, so a
+// file is never written with an ambiguity in it; the metadata then makes reads
+// exact rather than re-derived.
+
+/// Arrow field metadata key holding the qualified logical column a pre-agg field
+/// came from, e.g. `players.player_name`.
+pub const META_LOGICAL_COL: &str = "datasubway.col";
+
+/// Arrow field metadata key holding the aggregate component a pre-agg field
+/// stores (`sum`, `count`, `min`, `max`, `sumsq`). Absent on group-by fields.
+pub const META_COMPONENT: &str = "datasubway.component";
 
 /// Convert a qualified column name to a parquet-safe dunder name.
 /// Replaces `.` with `__` to avoid clashing with DataFusion's `table.column` separator.
@@ -64,6 +82,27 @@ pub fn to_pre_agg_col_name(qualified: &str) -> String {
 /// e.g. ("player_stats.goals", "sum") → "player_stats__goals__sum"
 pub fn pre_agg_component_col_name(qualified_col: &str, component: &str) -> String {
     format!("{}__{component}", to_pre_agg_col_name(qualified_col))
+}
+
+/// The physical field name for a logical column, with `component` set for an
+/// aggregate component field and `None` for a group-by key.
+pub fn physical_col_name(qualified_col: &str, component: Option<&str>) -> String {
+    match component {
+        Some(c) => pre_agg_component_col_name(qualified_col, c),
+        None => to_pre_agg_col_name(qualified_col),
+    }
+}
+
+/// The Arrow field metadata recording which logical column (and which component
+/// of it) a physical pre-agg field holds. Written by `write_pre_agg` and read
+/// back by `PreAggVersion::open`, so the mapping survives the round trip through
+/// parquet instead of being re-derived from the field name.
+pub fn identity_metadata(qualified_col: &str, component: Option<&str>) -> FieldMetadata {
+    let mut m = BTreeMap::from([(META_LOGICAL_COL.to_string(), qualified_col.to_string())]);
+    if let Some(c) = component {
+        m.insert(META_COMPONENT.to_string(), c.to_string());
+    }
+    FieldMetadata::new(m)
 }
 
 /// Maps a DataFusion aggregate function name to the pre-agg components it requires.
@@ -122,11 +161,46 @@ impl PreAggregation {
             aggregations.insert(col.clone(), sorted);
         }
 
-        Ok(PreAggregation {
+        let pre_agg = PreAggregation {
             name,
             group_by,
             aggregations,
-        })
+        };
+        pre_agg.validate_physical_names()?;
+        Ok(pre_agg)
+    }
+
+    /// Reject a definition whose columns do not map to distinct physical field
+    /// names. The dunder encoding is lossy (`a.b__c` and `a__b.c` both give
+    /// `a__b__c`; `t.goals__sum` collides with the `sum` component of `t.goals`),
+    /// and two logical columns sharing one parquet field would silently return
+    /// the wrong values. Cheap to check here, impossible to detect on read.
+    fn validate_physical_names(&self) -> Result<(), String> {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let logical_fields = self.group_by.iter().map(|c| (c.clone(), None)).chain(
+            self.aggregations.iter().flat_map(|(c, comps)| {
+                comps
+                    .iter()
+                    .map(move |comp| (c.clone(), Some(comp.clone())))
+            }),
+        );
+
+        for (qcol, component) in logical_fields {
+            let physical = physical_col_name(&qcol, component.as_deref());
+            let logical = match &component {
+                Some(c) => format!("{qcol} ({c})"),
+                None => qcol.clone(),
+            };
+            if let Some(prev) = seen.insert(physical.clone(), logical.clone()) {
+                return Err(format!(
+                    "pre-aggregation '{}': '{prev}' and '{logical}' both encode to the physical \
+                     column '{physical}'. Rename one of the source columns — a '__' in a column \
+                     name collides with the pre-agg table/component separator.",
+                    self.name
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Check if this pre-agg covers the requested column requirements.
@@ -273,26 +347,36 @@ impl DataModel {
             .map_err(|e| e.to_string())?
             .inner;
 
+        // Each output field is aliased to its dunder name *and* tagged with the
+        // logical column it came from, so `PreAggVersion::open` can rebuild the
+        // mapping by lookup rather than by parsing the name back apart.
         let group_by_exprs: Vec<Expr> = pa
             .group_by
             .iter()
-            .map(|c| col(c.as_str()).alias(to_pre_agg_col_name(c).as_str()))
+            .map(|c| {
+                col(c.as_str()).alias_with_metadata(
+                    physical_col_name(c, None),
+                    Some(identity_metadata(c, None)),
+                )
+            })
             .collect();
 
         let mut agg_exprs: Vec<Expr> = Vec::new();
         for (qcol, components) in &pa.aggregations {
             for component in components {
-                let alias = pre_agg_component_col_name(qcol, component);
                 let qcol_expr = || col(qcol.as_str());
                 let expr = match component.as_str() {
-                    "sum" => sum(qcol_expr()).alias(&alias),
-                    "count" => count(qcol_expr()).alias(&alias),
-                    "min" => min(qcol_expr()).alias(&alias),
-                    "max" => max(qcol_expr()).alias(&alias),
-                    "sumsq" => sum(qcol_expr() * qcol_expr()).alias(&alias),
+                    "sum" => sum(qcol_expr()),
+                    "count" => count(qcol_expr()),
+                    "min" => min(qcol_expr()),
+                    "max" => max(qcol_expr()),
+                    "sumsq" => sum(qcol_expr() * qcol_expr()),
                     other => return Err(format!("unknown pre-agg component '{other}'")),
                 };
-                agg_exprs.push(expr);
+                agg_exprs.push(expr.alias_with_metadata(
+                    physical_col_name(qcol, Some(component)),
+                    Some(identity_metadata(qcol, Some(component))),
+                ));
             }
         }
 
@@ -378,6 +462,60 @@ mod tests {
         assert!(pa.aggregations["orders.amount"].contains(&"sum".to_string()));
         assert!(pa.aggregations["orders.amount"].contains(&"count".to_string()));
         assert_eq!(pa.aggregations["orders.quantity"], vec!["sum".to_string()]);
+    }
+
+    #[test]
+    fn test_physical_name_collision_between_group_by_cols_rejected() {
+        // `a.b__c` and `a__b.c` both encode to `a__b__c`.
+        let err = PreAggregation::new(
+            "colliding".into(),
+            vec!["a.b__c".into(), "a__b.c".into()],
+            HashMap::from([("orders.amount".into(), vec!["sum".into()])]),
+        )
+        .unwrap_err();
+        assert!(err.contains("a__b__c"), "{err}");
+        assert!(err.contains("colliding"), "{err}");
+    }
+
+    #[test]
+    fn test_physical_name_collision_between_group_by_and_component_rejected() {
+        // The `sum` component of `t.goals` is `t__goals__sum`, which is also what
+        // a source column literally named `goals__sum` on `t` encodes to.
+        let err = PreAggregation::new(
+            "colliding".into(),
+            vec!["t.goals__sum".into()],
+            HashMap::from([("t.goals".into(), vec!["sum".into()])]),
+        )
+        .unwrap_err();
+        assert!(err.contains("t__goals__sum"), "{err}");
+    }
+
+    #[test]
+    fn test_distinct_physical_names_accepted() {
+        assert!(
+            PreAggregation::new(
+                "fine".into(),
+                vec!["orders.date".into(), "orders.region".into()],
+                HashMap::from([("orders.amount".into(), vec!["mean".into()])]),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_identity_metadata() {
+        let group = identity_metadata("players.player_name", None);
+        assert_eq!(
+            group.inner().get(META_LOGICAL_COL).map(String::as_str),
+            Some("players.player_name")
+        );
+        assert_eq!(group.inner().get(META_COMPONENT), None);
+
+        let component = identity_metadata("player_stats.goals", Some("sum"));
+        assert_eq!(
+            component.inner().get(META_COMPONENT).map(String::as_str),
+            Some("sum")
+        );
     }
 
     #[test]

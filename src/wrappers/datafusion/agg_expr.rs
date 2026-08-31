@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::expr::AggregateFunction;
-use datafusion::prelude::{Expr, col};
+use datafusion::prelude::Expr;
 
-use crate::model_components::pre_aggregations::{pre_agg_component_col_name, to_pre_agg_col_name};
+use crate::model_components::pre_agg_store::PreAggTarget;
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
@@ -78,9 +78,9 @@ pub fn resolve_source_col(name: &str, alias_map: &HashMap<String, String>) -> St
 
 /// Rewrite a group-by column expression to reference the pre-aggregation table.
 ///
-/// References the dunder column in the aliased pre-agg table and aliases the result
-/// back to the original qualified name — using a *qualified* alias so the output
-/// field is `(Some("players"), "player_name")`, structurally identical to what a
+/// References the stored column on the pre-agg's scan and aliases the result back
+/// to the original qualified name — using a *qualified* alias so the output field
+/// is `(Some("players"), "player_name")`, structurally identical to what a
 /// raw-table-sourced group-by column produces (a bare `col("players.player_name")`
 /// keeps its table's real qualifier). This keeps the aggregate output schema
 /// consistent with the non-pre-agg path regardless of source, so downstream code
@@ -88,17 +88,17 @@ pub fn resolve_source_col(name: &str, alias_map: &HashMap<String, String>) -> St
 /// special-case "did this measure come from a pre-agg or a raw table".
 ///
 /// e.g. `col("players.player_name")` →
-///      `col("player_goals_by_player.players__player_name").alias_qualified(Some("players"), "player_name")`
+///      `pre_agg.goals_by_player.players__player_name AS players.player_name`
 pub fn rewrite_group_for_pre_agg(
     expr: Expr,
     alias_map: &HashMap<String, String>,
-    pre_agg_name: &str,
+    target: &PreAggTarget<'_>,
 ) -> Expr {
     match expr {
         Expr::Column(c) => {
             let flat = qualified_name(&c);
             let resolved = resolve_source_col(&flat, alias_map);
-            let source = col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved)).as_str());
+            let source = target.col_expr(&resolved, None);
             match flat.split_once('.') {
                 Some((table, col_name)) => {
                     source.alias_qualified(Some(table.to_string()), col_name.to_string())
@@ -127,7 +127,7 @@ pub fn rewrite_group_for_pre_agg(
 pub fn rewrite_for_pre_agg(
     expr: Expr,
     alias_map: &HashMap<String, String>,
-    pre_agg_name: &str,
+    target: &PreAggTarget<'_>,
 ) -> datafusion::common::Result<Expr> {
     expr.transform_up(|e| {
         let Expr::AggregateFunction(ref agg) = e else {
@@ -139,7 +139,7 @@ pub fn rewrite_for_pre_agg(
             .args
             .first()
             .and_then(|a| extract_col_name(a).map(|n| resolve_source_col(&n, alias_map)));
-        match col_name.and_then(|c| build_pre_agg_expr(&c, &agg_name, pre_agg_name)) {
+        match col_name.and_then(|c| build_pre_agg_expr(&c, &agg_name, target)) {
             Some(rewritten) => Ok(Transformed::yes(rewritten)),
             None => Ok(Transformed::no(e)),
         }
@@ -164,14 +164,13 @@ pub fn rewrite_for_pre_agg(
 pub fn rewrite_expr_for_pre_agg(
     expr: Expr,
     alias_map: &HashMap<String, String>,
-    pre_agg_name: &str,
+    target: &PreAggTarget<'_>,
 ) -> datafusion::common::Result<Expr> {
     expr.transform(|e| {
         if let Expr::Column(c) = &e {
             let flat = qualified_name(c);
             let resolved = resolve_source_col(&flat, alias_map);
-            let rewritten =
-                col(format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved)).as_str());
+            let rewritten = target.col_expr(&resolved, None);
             Ok(Transformed::yes(rewritten))
         } else {
             Ok(Transformed::no(e))
@@ -181,31 +180,26 @@ pub fn rewrite_expr_for_pre_agg(
 }
 
 /// Rewrite a plain column name (e.g. for `drop_columns`) to the pre-aggregation's
-/// physical dunder-encoded name. Companion to `rewrite_expr_for_pre_agg` for ops
+/// physical column reference. Companion to `rewrite_expr_for_pre_agg` for ops
 /// that carry column references as `String`s rather than `Expr` trees.
 pub fn rewrite_col_name_for_pre_agg(
     name: &str,
     alias_map: &HashMap<String, String>,
-    pre_agg_name: &str,
-) -> String {
+    target: &PreAggTarget<'_>,
+) -> Column {
     let resolved = resolve_source_col(name, alias_map);
-    format!("{pre_agg_name}.{}", to_pre_agg_col_name(&resolved))
+    match target.col_expr(&resolved, None) {
+        Expr::Column(c) => c,
+        other => unreachable!("col_expr returned a non-column: {other}"),
+    }
 }
 
-fn build_pre_agg_expr(col_name: &str, agg_name: &str, pre_agg_name: &str) -> Option<Expr> {
+fn build_pre_agg_expr(col_name: &str, agg_name: &str, target: &PreAggTarget<'_>) -> Option<Expr> {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::functions_aggregate::expr_fn::{max, min, sum};
     use datafusion::logical_expr::expr::Cast;
 
-    // col("pre_agg_name.table__col__component") — DataFusion splits at the first dot,
-    // yielding Column{relation: Some(pre_agg_name), name: "table__col__component"}.
-    let c = |component: &str| {
-        col(format!(
-            "{pre_agg_name}.{}",
-            pre_agg_component_col_name(col_name, component)
-        )
-        .as_str())
-    };
+    let c = |component: &str| target.col_expr(col_name, Some(component));
 
     // Rolling a stored component back up preserves its type: `sum`, `count` and
     // `sumsq` over an integer source column are all Int64. Dividing two Int64
@@ -244,8 +238,21 @@ fn build_pre_agg_expr(col_name: &str, agg_name: &str, pre_agg_name: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_components::pre_agg_store::{PRE_AGG_SCHEMA, PreAggColumns};
     use datafusion::functions_aggregate::expr_fn::{avg, sum};
     use datafusion::prelude::col;
+    use datafusion::sql::TableReference;
+
+    /// A rewrite target over an empty column map, so every lookup falls through
+    /// to the dunder derivation — the shape a pre-agg file written before identity
+    /// metadata existed presents. The metadata-driven lookups are covered in
+    /// `pre_agg_store`; what matters here is the expression each rewrite builds.
+    fn target<'a>(name: &str, columns: &'a PreAggColumns) -> PreAggTarget<'a> {
+        PreAggTarget {
+            table: TableReference::partial(PRE_AGG_SCHEMA, name.to_string()),
+            columns,
+        }
+    }
 
     fn single(expr: &Expr) -> (String, String) {
         let mut v = extract_agg_exprs(expr);
@@ -282,10 +289,12 @@ mod tests {
     fn test_rewrite_expr_for_pre_agg_bare_column() {
         let map = HashMap::new();
         let expr = col("players.player_name");
-        let rewritten = rewrite_expr_for_pre_agg(expr, &map, "goals_by_player").unwrap();
+        let cols = PreAggColumns::default();
+        let rewritten =
+            rewrite_expr_for_pre_agg(expr, &map, &target("goals_by_player", &cols)).unwrap();
         assert_eq!(
             format!("{rewritten}"),
-            "goals_by_player.players__player_name"
+            "pre_agg.goals_by_player.players__player_name"
         );
     }
 
@@ -295,10 +304,12 @@ mod tests {
 
         let map = HashMap::new();
         let expr = col("players.player_name").eq(lit("Nwpo"));
-        let rewritten = rewrite_expr_for_pre_agg(expr, &map, "goals_by_player").unwrap();
+        let cols = PreAggColumns::default();
+        let rewritten =
+            rewrite_expr_for_pre_agg(expr, &map, &target("goals_by_player", &cols)).unwrap();
         assert_eq!(
             format!("{rewritten}"),
-            "goals_by_player.players__player_name = Utf8(\"Nwpo\")"
+            "pre_agg.goals_by_player.players__player_name = Utf8(\"Nwpo\")"
         );
     }
 
@@ -312,11 +323,12 @@ mod tests {
             .eq(lit("Nwpo"))
             .and(col("orders.amount").gt(lit(0.0f64)))
             .or(col("orders.region").eq(lit("north")));
-        let rewritten = rewrite_expr_for_pre_agg(expr, &map, "pa").unwrap();
+        let cols = PreAggColumns::default();
+        let rewritten = rewrite_expr_for_pre_agg(expr, &map, &target("pa", &cols)).unwrap();
         let text = format!("{rewritten}");
-        assert!(text.contains("pa.players__player_name"));
-        assert!(text.contains("pa.orders__amount"));
-        assert!(text.contains("pa.orders__region"));
+        assert!(text.contains("pre_agg.pa.players__player_name"));
+        assert!(text.contains("pre_agg.pa.orders__amount"));
+        assert!(text.contains("pre_agg.pa.orders__region"));
         // Structure (AND/OR, comparisons) must be preserved, not just column names.
         assert!(text.contains("AND"));
         assert!(text.contains("OR"));
@@ -327,8 +339,9 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("amt".to_string(), "orders.amount".to_string());
         let expr = col("amt");
-        let rewritten = rewrite_expr_for_pre_agg(expr, &map, "pa").unwrap();
-        assert_eq!(format!("{rewritten}"), "pa.orders__amount");
+        let cols = PreAggColumns::default();
+        let rewritten = rewrite_expr_for_pre_agg(expr, &map, &target("pa", &cols)).unwrap();
+        assert_eq!(format!("{rewritten}"), "pre_agg.pa.orders__amount");
     }
 
     // The wrapper cases below are the ones a hand-written `match` used to miss: a
@@ -391,12 +404,13 @@ mod tests {
             / nullif(sum(col("orders.qty")), lit(0)))
         .alias("orders.rate");
 
-        let rewritten = rewrite_for_pre_agg(expr, &map, "pa").unwrap();
+        let cols = PreAggColumns::default();
+        let rewritten = rewrite_for_pre_agg(expr, &map, &target("pa", &cols)).unwrap();
         let text = format!("{rewritten}");
 
         // Both aggregates point at their component columns...
-        assert!(text.contains("pa.orders__amount__sum"), "{text}");
-        assert!(text.contains("pa.orders__qty__sum"), "{text}");
+        assert!(text.contains("pre_agg.pa.orders__amount__sum"), "{text}");
+        assert!(text.contains("pre_agg.pa.orders__qty__sum"), "{text}");
         // ...and the wrappers that make this float division survive.
         assert!(text.contains("CAST"), "{text}");
         assert!(text.contains("nullif"), "{text}");
@@ -409,20 +423,27 @@ mod tests {
         // `avg` expands to sum/count over component columns; those inner `sum`s must
         // not be fed back through the rewrite (which would look for a `__sum__sum`).
         let expr = avg(col("orders.amount")).alias("orders.avg_amount");
-        let rewritten = rewrite_for_pre_agg(expr, &map, "pa").unwrap();
+        let cols = PreAggColumns::default();
+        let rewritten = rewrite_for_pre_agg(expr, &map, &target("pa", &cols)).unwrap();
         let text = format!("{rewritten}");
 
-        assert!(text.contains("pa.orders__amount__sum"), "{text}");
-        assert!(text.contains("pa.orders__amount__count"), "{text}");
+        assert!(text.contains("pre_agg.pa.orders__amount__sum"), "{text}");
+        assert!(text.contains("pre_agg.pa.orders__amount__count"), "{text}");
         assert!(!text.contains("__sum__sum"), "{text}");
     }
 
     #[test]
     fn test_rewrite_col_name_for_pre_agg() {
         let map = HashMap::new();
+        let cols = PreAggColumns::default();
         assert_eq!(
-            rewrite_col_name_for_pre_agg("players.player_name", &map, "goals_by_player"),
-            "goals_by_player.players__player_name"
+            rewrite_col_name_for_pre_agg(
+                "players.player_name",
+                &map,
+                &target("goals_by_player", &cols)
+            )
+            .flat_name(),
+            "pre_agg.goals_by_player.players__player_name"
         );
     }
 }
