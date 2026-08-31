@@ -26,7 +26,7 @@ use crate::model_components::{
     pre_aggregations::{PreAggregation, agg_needed_components},
     select_context::SelectContext,
 };
-use crate::wrappers::datafusion::{
+use crate::wrappers::{
     aggregate_with_metadata::AggregateWithMetadataPlanner, dataframe_recorder::DataFrameRecorder,
     dataframe_wrapper::DataFrameWrapper,
 };

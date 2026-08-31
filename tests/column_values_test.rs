@@ -287,10 +287,11 @@ async fn test_column_values_distinct_from_group_by_pre_agg() {
         .display_graphviz(&DataQuery::ColumnValues(ctx.clone()))
         .unwrap();
     // The pre-agg version is its own TableProvider, so it shows up as a TableScan
-    // named after the pre-agg. Assert on that plus a physical column unique to its
-    // schema, confirming it (not the raw players table) was read from.
+    // qualified `pre_agg.<name>` — the same relation `SELECT * FROM pre_agg.x`
+    // resolves to. Assert on that plus a physical column unique to its schema,
+    // confirming it (not the raw players table) was read from.
     assert!(
-        plan.contains("TableScan: player_name_group_by"),
+        plan.contains("TableScan: pre_agg.player_name_group_by"),
         "expected pre-agg TableScan in plan, got:\n{plan}"
     );
     assert!(

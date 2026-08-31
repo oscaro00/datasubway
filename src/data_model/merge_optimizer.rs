@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use datafusion::logical_expr::{Aggregate, LogicalPlan};
 use datafusion::prelude::{DataFrame, SessionContext};
 
-use crate::wrappers::datafusion::aggregate_with_metadata::{
+use crate::wrappers::aggregate_with_metadata::{
     AggregateWithMetadata, fmt_exprs, root_aggregate_node,
 };
 
